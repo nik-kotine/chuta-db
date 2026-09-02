@@ -131,7 +131,7 @@ class SequentialFile:
     """
     def _find_by_record_key(self, key) -> Record | None:
         page_id = self._find_page_id_by_record_key(key)
-        if page_id is -1:
+        if page_id == -1:
             return None
 
         page = self.read_page(page_id)
@@ -151,34 +151,23 @@ class SequentialFile:
         return None
 
     """
-    Inserta un nuevo registro en la pagina page_id. Por ahora usa
+    Inserta un nuevo registro en la pagina phys_page_id. Por ahora usa
     busqueda lineal para mantener el orden, pero deberia usar
     busqueda binaria.
     """
-    def _insert_into_page(self, page_id, record) -> bool:
-        page = self._read_by_phys_page_id(page_id + 1)
+    def _insert_into_page(self, phys_page_id, record) -> bool:
+        page = self._read_by_phys_page_id(phys_page_id)
+        
+        if page.n_records == RECORDS_PER_PAGE:
+            return False
+        
         pos = 0
         while pos < page.n_records and page.records[pos].key < record.key:
             pos += 1
 
         page.records.insert(pos, record)
         page.n_records += 1
-        self._write_page_by_phys_id(page_id + 1, page)
-        return True
-
-    """
-    Inserta un nuevo registro en la pagina page_id. Por ahora usa
-    busqueda lineal para mantener el orden.
-    """
-    def _insert_into_overflow(self, record) -> bool:
-        overflow_page = self._read_by_phys_page_id(0)
-        if overflow_page.n_records >= RECORDS_PER_PAGE:
-            return False
-
-        overflow_page.records.append(record)
-        overflow_page.n_records += 1
-        self._write_page_by_phys_id(0, overflow_page)
-
+        self._write_page_by_phys_id(phys_page_id, page)
         return True
 
     """
