@@ -1,8 +1,14 @@
 import struct
 
 """
-Pag 0: overflow
-Pag 1 en adelante: paginas
+phys_page_id: uso interno para funciones privadas y auxiliares
+Pag 0: unica pagina de overflow
+Pag 1+: paginas normales
+
+page_id: uso para funciones publicas
+Equivalente a phys_page_id - 1
+
+Definimos rid = phys_page_id * PAGE_SIZE + slot_id, con rid = -1 siendo NULL
 """
 
 """
@@ -19,10 +25,10 @@ PAGE_HEADER_FORMAT = "i"
 PAGE_HEADER_SIZE = struct.calcsize(PAGE_HEADER_FORMAT)
 
 """
-int         key
-char[8]     dni
-char[32]    purchase_desc
-int         rid = page_id * RECORDS_PER_PAGE + record_id, -1 is NULL
+int         key, llave del registro
+char[8]     dni, campo de ejemplo
+char[32]    purchase_desc, campo de ejemplo
+int         rid del siguiente registro en orden
 """
 RECORD_FORMAT       = "i 8s 32s i"
 RECORD_SIZE         = struct.calcsize(RECORD_FORMAT)
@@ -55,50 +61,174 @@ class SequentialFile:
         self.filename = _filename
         self.file_ptr = open(_filename, "r+b")
 
-    def _read_file_header(self):
-
+    """
+    Retorna el header del archivo como una tupla (n_pages, overflow_id).
+    """
+    def _read_file_header(self) -> tuple[int, int]:
         self.file_ptr.seek(0)
         n_pages, overflow_id = struct.unpack(FILE_HEADER_FORMAT, self.file_ptr.read(FILE_HEADER_SIZE))
         return n_pages, overflow_id
 
-    def _read_by_page_id(self, page_id) -> Page:
-
-        self.file_ptr.seek(FILE_HEADER_SIZE + page_id * PAGE_SIZE)
+    """
+    Retorna un objeto Page con todos los registros de la pagina en phys_page_id.
+    """
+    def _read_by_phys_page_id(self, phys_page_id) -> Page:
+        self.file_ptr.seek(
+            FILE_HEADER_SIZE +
+            phys_page_id * PAGE_SIZE
+        )
         page = self.file_ptr.read(PAGE_SIZE)
-
         header = struct.unpack(PAGE_HEADER_FORMAT, page[:PAGE_HEADER_SIZE])
-        n_records, = struct.unpack(PAGE_HEADER_FORMAT, page[:PAGE_HEADER_SIZE])
+        n_records = header[0]
 
         records = []
         offset = PAGE_HEADER_SIZE
-
         for _ in range(n_records):
-            record = struct.unpack(RECORD_FORMAT, page[offset:(offset+RECORD_SIZE)])
+            temp = struct.unpack(RECORD_FORMAT, page[offset:(offset+RECORD_SIZE)])
+            record = Record(temp[0], temp[1], temp[2], temp[3])
             records.append(record)
             offset += RECORD_SIZE
-
         return Page(header, records, n_records)
 
-    def _write_file_header(self, _n_pages, _overflow_id):
+    """
+    Retorna el registro que se encuentra en rid.
+    """
+    def _read_record_at_rid(self, rid) -> Record | None:
+        if rid == -1:
+            return None
 
-        self.file_ptr.seek(0)
-        new_file_header = struct.pack(FILE_HEADER_FORMAT, _n_pages, _overflow_id)
-        self.file_ptr.write(new_file_header)
+        phys_page_id = rid // RECORDS_PER_PAGE
+        slot_id = rid % RECORDS_PER_PAGE
+        page = self._read_by_phys_page_id(phys_page_id)
+        return page.records[slot_id]
+
+    """
+    Busca el indice de la  pagina en la que se encontraria
+    un registro con llave key.
+    """
+    def _find_page_id_by_record_key(self, key) -> int:
+        n_pages, _ = self._read_file_header()
+        if n_pages == 0:
+            return -1
+
+        lo, hi = 0, n_pages-1
+        result = 0
+        while lo <= hi:
+            mid = (lo+hi)//2
+            page = self.read_page(mid)
+
+            if key < page.records[0].key:
+                hi = mid - 1
+            else:
+                result = mid
+                lo = mid + 1
+
+        return result
+
+    """
+    Busca un registro en todo el archivo por su llave.
+    Esto se puede optimizar mas, luego lo hago!!!
+    """
+    def _find_by_record_key(self, key) -> Record | None:
+        page_id = self._find_page_id_by_record_key(key)
+        if page_id is -1:
+            return None
+
+        page = self.read_page(page_id)
+        for record in page.records:
+            if record.key == key:
+                return record
+
+        for record in page.records:
+            if record.rid == -1:
+                continue
+            next_record = self._read_record_at_rid(record.rid)
+            if next_record is None:
+                continue
+            if next_record.key == key:
+                return next_record
+
+        return None
+
+    """
+    Inserta un nuevo registro en la pagina page_id. Por ahora usa
+    busqueda lineal para mantener el orden, pero deberia usar
+    busqueda binaria.
+    """
+    def _insert_into_page(self, page_id, record) -> bool:
+        page = self._read_by_phys_page_id(page_id + 1)
+        pos = 0
+        while pos < page.n_records and page.records[pos].key < record.key:
+            pos += 1
+
+        page.records.insert(pos, record)
+        page.n_records += 1
+        self._write_page_by_phys_id(page_id + 1, page)
+        return True
+
+    """
+    Inserta un nuevo registro en la pagina page_id. Por ahora usa
+    busqueda lineal para mantener el orden.
+    """
+    def _insert_into_overflow(self, record) -> bool:
+        overflow_page = self._read_by_phys_page_id(0)
+        if overflow_page.n_records >= RECORDS_PER_PAGE:
+            return False
+
+        overflow_page.records.append(record)
+        overflow_page.n_records += 1
+        self._write_page_by_phys_id(0, overflow_page)
 
         return True
 
+    """
+    Sobreescribe el header del archivo.
+    """
+    def _write_file_header(self, n_pages, overflow_id) -> bool:
+        self.file_ptr.seek(0)
+        new_file_header = struct.pack(FILE_HEADER_FORMAT, n_pages, overflow_id)
+        self.file_ptr.write(new_file_header)
+        return True
+
+    """
+    Sobreescribe la pagina entera en phys_page_id con el objeto Page page.
+    """
+    def _write_page_by_phys_id(self, phys_page_id, page) -> bool:
+        self.file_ptr.seek(
+            FILE_HEADER_SIZE +
+            phys_page_id * PAGE_SIZE
+        )
+        page_bin = struct.pack(PAGE_HEADER_FORMAT, page.n_records)
+        for record in page.records:
+            page_bin += struct.pack(RECORD_FORMAT, record.key, record.dni, record.purchase_desc, record.rid)
+        self.file_ptr.write(page_bin)
+        return True
+
+    """
+    Retorna una pagina entera especifica.
+    input:
+        page_id: numero logico de la pagina en cuestion.
+    output:
+        Un objeto Page con toda la informacion de la pagina.
+    """
     def read_page(self, page_id) -> Page:
-        return self._read_by_page_id(page_id + 1)
+        return self._read_by_phys_page_id(page_id + 1)
 
+    """
+    Retorna la pagina de overflow.
+    output:
+        Un objeto Page con toda la informacion de la pagina de overflow.
+    """
     def read_overflow(self) -> Page:
-        return self._read_by_page_id(0)
+        return self._read_by_phys_page_id(0)
 
-    def _read_by_record_id(self, record_id):
-        n_pages, overflow_id = self._read_file_header()
+    """
+    Inserta un nuevo registro en su pagina correspondiente. Si no hay
+    espacio en la pagina correcta, agrega el registro al overflow. Si no
+    hay espacio en el overflow, mergea la pagina de overflow con el resto
+    de paginas y prueba otra vez.
+    """
+    def insert_record(self, record) -> bool:
+        return True
 
-        lo, hi = 1, n_pages
-        while (lo < hi):
-            mid = (lo+hi)//2
-            mid_page = self._read_by_page_id(mid)
-            if (mid_page.records[0]
 
