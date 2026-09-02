@@ -8,7 +8,7 @@ Pag 1+: paginas normales
 page_id: uso para funciones publicas
 Equivalente a phys_page_id - 1
 
-Definimos rid = phys_page_id * PAGE_SIZE + slot_id, con rid = -1 siendo NULL
+Definimos rid = phys_page_id * RECORDS_PER_PAGE + slot_id, con rid = -1 siendo NULL
 """
 
 """
@@ -60,6 +60,8 @@ class SequentialFile:
     def __init__(self, _filename):
         self.filename = _filename
         self.file_ptr = open(_filename, "r+b")
+        
+    def _make_rid(self, phys_page_id, slot_id) 
 
     """
     Retorna el header del archivo como una tupla (n_pages, overflow_id).
@@ -117,7 +119,7 @@ class SequentialFile:
             mid = (lo+hi)//2
             page = self.read_page(mid)
 
-            if key < page.records[0].key:
+            if page.n_records == 0 or key < page.records[0].key:
                 hi = mid - 1
             else:
                 result = mid
@@ -129,7 +131,7 @@ class SequentialFile:
     Busca un registro en todo el archivo por su llave.
     Esto se puede optimizar mas, luego lo hago!!!
     """
-    def _find_by_record_key(self, key) -> Record | None:
+    def _find_record_by_record_key(self, key) -> Record | None:
         page_id = self._find_page_id_by_record_key(key)
         if page_id == -1:
             return None
@@ -149,6 +151,18 @@ class SequentialFile:
                 return next_record
 
         return None
+
+    def _find_insert_position(self, page, key):
+        lo, hi = 0, page.n_records
+
+        while lo < hi:
+            mid = (lo+hi)//2
+            if page.records[mid].key < key:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        return lo
 
     """
     Inserta un nuevo registro en la pagina phys_page_id. Por ahora usa
