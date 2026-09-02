@@ -9,13 +9,13 @@ Equivalente a phys_page_id - 1
 Definimos rid = phys_page_id * RECORDS_PER_PAGE + slot_id, con rid = -1 siendo NULL
 """
 
-class SequentialFileManager:
+class FileManager:
 
     def __init__(self, filename: str, page_size: int, file_header_size: int):
-        self.filename = filename
-        self.page_size = page_size
-        self.file_header_size = file_header_size
-        self.file_ptr = open(filename, "r+b")
+        self.filename: str              = filename
+        self.page_size: int             = page_size
+        self.file_header_size: int      = file_header_size
+        self.file_ptr                   = open(filename, "r+b")
 
     def _calc_page_offset(self, phys_page_id: int) -> int:
         """Calcula el offset a partir del indice fisico de la pagina."""
@@ -28,7 +28,7 @@ class SequentialFileManager:
         self.file_ptr.seek(self._calc_page_offset(phys_page_id))
         return self.file_ptr.read(self.page_size)
 
-    def write_page(self, phys_page_id: int, page_bin: bytes) -> bool:
+    def write_page(self, phys_page_id: int, page_bin: bytes | bytearray) -> bool:
         """
         Sobreescribe toda una pagina con datos binarios.
         """
@@ -63,5 +63,4 @@ class SequentialFileManager:
         self.file_ptr.truncate(size)
 
     def close(self):
-        """Cierra el archivo."""
         self.file_ptr.close()
