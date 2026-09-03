@@ -295,15 +295,15 @@ class SequentialFile:
 
     def _find_page_for_key(self, key):
         """
-        Busca mediante busqueda binaria la pagina principal que puede
-        contener la clave.
+        Busca mediante busqueda binaria la ultima pagina principal cuyo primer
+        registro tiene una clave menor o igual a key.
         """
         if self.n_pages == 0:
             return None
 
         low = 1
         high = self.n_pages
-        result = self.n_pages
+        result = 1
 
         while low <= high:
             mid = (low + high) // 2
@@ -315,49 +315,38 @@ class SequentialFile:
                     continue
 
                 first_record = page.get_by_slot_id(0)
-
-                if first_record.deleted:
-                    high = mid - 1
-                    continue
-
                 first_key = first_record.params[self.key_index]
 
-                if first_key >= key:
+                if first_key <= key:
                     result = mid
-                    high = mid - 1
-                else:
                     low = mid + 1
+                else:
+                    high = mid - 1
             finally:
                 self.buffer_manager.unpin_page(mid)
-
-        if result == self.n_pages:
-            return result
 
         return result
 
     def _find_neighbors(self, key):
         """
-        Busca los registros inmediatamente anterior y posterior a una
-        clave recorriendo la secuencia logica.
+        Busca los registros inmediatamente anterior y posterior a una clave
+        recorriendo la secuencia logica desde first_rid.
         """
+        if self.first_rid is None:
+            return None, None
+
         previous_rid = None
-        current_rid = self.first_rid
 
-        while current_rid is not None:
-            record = self._get_record(current_rid)
+        for current_rid, record in self._iter_records(self.first_rid):
+            if record.deleted:
+                continue
 
-            if record is None:
-                break
+            current_key = record.params[self.key_index]
 
-            if not record.deleted:
-                current_key = record.params[self.key_index]
+            if current_key >= key:
+                return previous_rid, current_rid
 
-                if current_key >= key:
-                    return previous_rid, current_rid
-
-                previous_rid = current_rid
-
-            current_rid = record.next_rid
+            previous_rid = current_rid
 
         return previous_rid, None
 
@@ -394,6 +383,22 @@ class SequentialFile:
 
         finally:
             self.buffer_manager.unpin_page(0)
+            
+    def _iter_records(self, start_rid = None):
+        """
+        Recorre la secuencia logica desde start_rid y retorna cada RID junto
+        con su registro.
+        """
+        current_rid = self.first_rid if start_rid is None else start_rid
+
+        while current_rid is not None:
+            record = self._get_record(current_rid)
+
+            if record is None:
+                break
+
+            yield current_rid, record
+            current_rid = record.next_rid
 
     def insert(self, params):
         """
@@ -448,20 +453,13 @@ class SequentialFile:
         results = []
         _, current_rid = self._find_neighbors(key)
 
-        while current_rid is not None:
-            record = self._get_record(current_rid)
-
-            if record is None:
-                break
-
+        for current_rid, record in self._iter_records(current_rid):
             current_key = record.params[self.key_index]
             if current_key > key:
                 break
-
+            
             if current_key == key and not record.deleted:
                 results.append(record)
-
-            current_rid = record.next_rid
 
         return results
 
@@ -471,31 +469,25 @@ class SequentialFile:
         con key.
         """
         deleted_any = False
-        current_rid = self.first_rid
+        _, current_rid = self._find_neighbors(key)
 
-        while current_rid is not None:
-            record = self._get_record(current_rid)
+        for current_rid, record in self._iter_records(current_rid):
+            current_key = record.params[self.key_index]
 
-            if record is None:
+            if current_key > key:
                 break
 
-            next_rid = record.next_rid
-
-            if not record.deleted:
-                current_key = record.params[self.key_index]
-                if current_key == key:
-                    record.deleted = True
-                    self._set_record(current_rid, record)
-                    self.n_deleted += 1
-                    deleted_any = True
-
-                elif current_key > key:
-                    break
-
-            current_rid = next_rid
+            if current_key == key and not record.deleted:
+                record.deleted = True
+                self._set_record(current_rid, record)
+                self.n_deleted += 1
+                self.n_records -= 1
+                deleted_any = True
 
         if deleted_any and self._wasted_space_ratio() >= WASTED_RATIO:
             self.reorganize()
+
+        self._write_header()
 
         return deleted_any
 
@@ -530,18 +522,10 @@ class SequentialFile:
         marcados como deleted y vaciando el overflow.
         """
         records = []
-        current_rid = self.first_rid
 
-        while current_rid is not None:
-            record = self._get_record(current_rid)
-
-            if record is None:
-                break
-
+        for _, record in self._iter_records():
             if not record.deleted:
                 records.append(Record(record.params))
-
-            current_rid = record.next_rid
 
         records.sort(key=lambda record: record.params[self.key_index])
         required_pages = max(

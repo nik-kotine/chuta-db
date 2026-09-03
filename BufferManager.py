@@ -156,4 +156,30 @@ class BufferManager:
             frame.dirty = False
 
         return True
+    
+    def flush_all(self):
+        """
+        Escribe en disco todas las paginas modificadas que se encuentran
+        actualmente en el buffer.
+        """
+        for frame in self.frames:
+            if (
+                frame.phys_page_id != -1
+                and frame.dirty
+                and frame.page_bin is not None
+            ):
+                self.file_manager.write_page(
+                    frame.phys_page_id,
+                    frame.page_bin
+                )
+                frame.dirty = False
+
+        self.file_manager.flush()
+        
+    def close(self):
+        """
+        Persiste todas las paginas modificadas y cierra el archivo.
+        """
+        self.flush_all()
+        self.file_manager.close()
 

@@ -41,13 +41,6 @@ def close_sequential(filename, fm, bm):
     fm.flush()
     fm.close()
     os.remove(filename)
-    
-def close_file(fm, bm):
-    for phys_page_id in list(bm.page_table.keys()):
-        bm.flush_page(phys_page_id)
-
-    fm.flush()
-    fm.close()
 
 def keys(seq):
     return [record.params[0] for record in seq.search_all()]
