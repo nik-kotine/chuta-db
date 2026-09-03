@@ -2,11 +2,8 @@
 phys_page_id: uso interno para funciones privadas y auxiliares
 Pag 0: unica pagina de overflow
 Pag 1+: paginas normales
-
-page_id: uso para funciones publicas
-Equivalente a phys_page_id - 1
-
-Definimos rid = phys_page_id * RECORDS_PER_PAGE + slot_id, con rid = -1 siendo NULL
+Definimos rid = phys_page_id * records_per_page + slot_id,
+con rid = -1 siendo NULL
 """
 
 class FileManager:
@@ -28,13 +25,32 @@ class FileManager:
         self.file_ptr.seek(self._calc_page_offset(phys_page_id))
         return self.file_ptr.read(self.page_size)
 
-    def write_page(self, phys_page_id: int, page_bin: bytes | bytearray) -> bool:
+    def write_page(
+            self, phys_page_id: int, page_bin: bytes | bytearray
+        ) -> bool:
         """
         Sobreescribe toda una pagina con datos binarios.
         """
         self.file_ptr.seek(self._calc_page_offset(phys_page_id))
         self.file_ptr.write(page_bin)
         return True
+    
+    def read_header(self) -> bytes:
+        """
+        Retorna el contenido completo del header del archivo.
+        """
+        self.file_ptr.seek(0)
+        return self.file_ptr.read(self.file_header_size)
+    
+    def write_header(self, header: bytes | bytearray):
+        """
+        Sobreescribe el header completo del archivo.
+        """
+        if len(header) != self.file_header_size:
+            raise ValueError("El tamaño del header no coincide.")
+
+        self.file_ptr.seek(0)
+        self.file_ptr.write(header)
 
     def allocate_page(self) -> int:
         """

@@ -108,12 +108,15 @@ class BufferManager:
         frame.pin_count = 1
         frame.dirty = False
         frame.reference = True
+        
+        self.page_table[phys_page_id] = frame_id
 
         return frame.page_bin
 
     def unpin_page(self, phys_page_id: int) -> bool:
         """
-        Reduce el contador de referencias de una pagina.
+        Reduce el contador de cantidad de recursos ajenos que usan
+        una pagina.
         """
         if phys_page_id not in self.page_table:
             return False
