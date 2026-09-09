@@ -40,7 +40,8 @@ class FixedLengthRecordSerializer:
     def __init__(self, record_format: str):
         self.record_format = record_format
         self.record_size = struct.calcsize(record_format)
-        self.slot_size = self.record_size + RID_SIZE + DELETED_SIZE
+        self.slot_format = self.record_format + RID_FORMAT + DELETED_FORMAT
+        self.slot_size = struct.calcsize(self.slot_format)
 
     def serialize(self, params) -> bytes:
         """
@@ -107,7 +108,7 @@ class FixedPage:
 
         return PAGE_HEADER_SIZE + slot_id * self.serializer.slot_size
 
-    def get_by_slot_id(self, slot_id: int) -> Record | None:
+    def get_record_by_slot_id(self, slot_id: int) -> Record | None:
         """
         Retorna el registro ubicado en slot_id.
         """
@@ -115,70 +116,66 @@ class FixedPage:
             return None
 
         offset = self._slot_offset(slot_id)
-        record_data = bytes(
-            self.page_ba[offset : (offset + self.serializer.record_size)]
+        slot_data = struct.unpack_from(
+            self.serializer.slot_format, self.page_ba, offset
         )
-
-        offset += self.serializer.record_size
-        params = self.serializer.deserialize(record_data)
-        next_rid = struct.unpack_from(RID_FORMAT, self.page_ba, offset)
+        
+        params = slot_data[:-3]
+        next_rid = slot_data[-3:-1]
+        deleted = slot_data[-1] 
 
         if next_rid == (-1, -1):
             next_rid = None
 
-        offset += RID_SIZE
-        deleted = struct.unpack_from(DELETED_FORMAT, self.page_ba, offset)[0]
-
         return Record(params, next_rid, deleted)
 
-    def set_by_slot_id(self, slot_id: int, record: Record):
+    def set_record_in_slot_id(self, slot_id: int, record: Record):
         """
         Sobreescribe completamente un slot existente.
         """
         if slot_id < 0 or slot_id >= self.n_records:
-            raise RuntimeError("slot_id is out of range")
+            raise RuntimeError("index out of range")
 
         offset = self._slot_offset(slot_id)
-        record_data = self.serializer.serialize(record.params)
-        self.page_ba[offset : (offset + self.serializer.record_size)] = record_data
-        offset += self.serializer.record_size
         next_rid = record.next_rid
-
+        
         if next_rid is None:
             next_rid = (-1, -1)
+        
+        slot_data = record.params + next_rid + (record.deleted,)
+        
+        struct.pack_into(
+            self.serializer.slot_format, self.page_ba, offset, *slot_data
+        )
 
-        struct.pack_into(RID_FORMAT, self.page_ba, offset, *next_rid)
-        offset += RID_SIZE
-        struct.pack_into(DELETED_FORMAT, self.page_ba, offset, record.deleted)
-
-    def insert(self, record: Record) -> int:
+    def overflow_insert(self, record: Record) -> int:
         """
-        Inserta un registro en el primer slot libre al final de la
-        pagina y retorna su slot_id.
+        Inserta un registro en el primer slot libre y retorna su slot_id,
+        como se haria en un heap file. Se usa exclusivamente para el
+        overflow page.
         """
         if not self.has_space():
             return -1
 
         slot_id = self.n_records
         self.n_records += 1
-        self.set_by_slot_id(slot_id, record)
+        self.set_record_in_slot_id(slot_id, record)
 
         return slot_id
 
     def delete_slot(self, slot_id: int) -> bool:
         """
-        Marca un registro como eliminado sin liberar fisicamente su slot.
+        Marca un registro como eliminado (si es que no fue eliminado ya).
         """
-        record = self.get_by_slot_id(slot_id)
+        record = self.get_record_by_slot_id(slot_id)
 
         if record is None or record.deleted:
             return False
 
         record.deleted = True
-        self.set_by_slot_id(slot_id, record)
+        self.set_record_in_slot_id(slot_id, record)
 
         return True
-
 
 class SequentialFile:
     def __init__(
@@ -189,7 +186,7 @@ class SequentialFile:
         self.page_size = page_size
         self.key_index = 0
         self.serializer = FixedLengthRecordSerializer(record_format)
-        self.records_per_page = (
+        self.max_records_per_page = (
             page_size - PAGE_HEADER_SIZE
         ) // self.serializer.slot_size
         self.first_rid = None
@@ -239,7 +236,7 @@ class SequentialFile:
             return -1
 
         phys_page_id, slot_id = rid
-        return phys_page_id * self.records_per_page + slot_id
+        return phys_page_id * self.max_records_per_page + slot_id
 
     def _int_to_rid(self, value):
         """
@@ -248,11 +245,11 @@ class SequentialFile:
         if value == -1:
             return None
 
-        return (value // self.records_per_page, value % self.records_per_page)
+        return (value // self.max_records_per_page, value % self.max_records_per_page)
 
     def _make_rid(self, phys_page_id: int, slot_id: int):
         """
-        Construye un RID a partir de pagina fisica y slot.
+        Construye un RID a partir de indices de pagina fisica y slot.
         """
         return phys_page_id, slot_id
 
@@ -276,7 +273,7 @@ class SequentialFile:
         page = self._load_page(phys_page_id)
 
         try:
-            return page.get_by_slot_id(slot_id)
+            return page.get_record_by_slot_id(slot_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
 
@@ -288,7 +285,7 @@ class SequentialFile:
         page = self._load_page(phys_page_id)
 
         try:
-            page.set_by_slot_id(slot_id, record)
+            page.set_record_in_slot_id(slot_id, record)
             self.buffer_manager.mark_dirty(phys_page_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
@@ -314,7 +311,7 @@ class SequentialFile:
                     high = mid - 1
                     continue
 
-                first_record = page.get_by_slot_id(0)
+                first_record = page.get_record_by_slot_id(0)
                 first_key = first_record.params[self.key_index]
 
                 if first_key <= key:
@@ -368,7 +365,7 @@ class SequentialFile:
 
     def _insert_into_overflow(self, record: Record) -> tuple:
         """
-        Inserta un registro en la pagina de overflow.
+        Inserta un registro en la pagina de overflow y retorna su rid.
         """
         page = self._load_page(0)
 
@@ -376,7 +373,7 @@ class SequentialFile:
             if not page.has_space():
                 return None
 
-            slot_id = page.insert(record)
+            slot_id = page.overflow_insert(record)
             self.buffer_manager.mark_dirty(0)
 
             return self._make_rid(0, slot_id)
@@ -414,7 +411,7 @@ class SequentialFile:
             page = self._load_page(1)
 
             try:
-                rid = self._make_rid(1, page.insert(record))
+                rid = self._make_rid(1, page.overflow_insert(record))
                 self.first_rid = rid
                 self.n_records = 1
                 self.buffer_manager.mark_dirty(1)
@@ -504,7 +501,7 @@ class SequentialFile:
             try:
                 for slot_id in range(page.n_records):
                     total_slots += 1
-                    record = page.get_by_slot_id(slot_id)
+                    record = page.get_record_by_slot_id(slot_id)
                     if record.deleted:
                         deleted_slots += 1
 
@@ -529,7 +526,7 @@ class SequentialFile:
 
         records.sort(key=lambda record: record.params[self.key_index])
         required_pages = max(
-            1, (len(records) + self.records_per_page - 1) // self.records_per_page
+            1, (len(records) + self.max_records_per_page - 1) // self.max_records_per_page
         )
 
         while self.n_pages < required_pages:
@@ -552,13 +549,13 @@ class SequentialFile:
         self.first_rid = None
 
         for index, record in enumerate(records):
-            phys_page_id = index // self.records_per_page + 1
-            slot_id = index % self.records_per_page
+            phys_page_id = index // self.max_records_per_page + 1
+            slot_id = index % self.max_records_per_page
             rid = self._make_rid(phys_page_id, slot_id)
             if index + 1 < len(records):
                 next_rid = self._make_rid(
-                    ((index + 1) // self.records_per_page) + 1,
-                    (index + 1) % self.records_per_page,
+                    ((index + 1) // self.max_records_per_page) + 1,
+                    (index + 1) % self.max_records_per_page,
                 )
             else:
                 next_rid = None
@@ -568,7 +565,7 @@ class SequentialFile:
 
             try:
                 page.n_records += 1
-                page.set_by_slot_id(slot_id, record)
+                page.set_record_in_slot_id(slot_id, record)
                 self.buffer_manager.mark_dirty(phys_page_id)
             finally:
                 self.buffer_manager.unpin_page(phys_page_id)

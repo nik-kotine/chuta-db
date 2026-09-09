@@ -74,7 +74,7 @@ def primary_page_keys(seq):
             page_keys = []
 
             for slot_id in range(page.n_records):
-                record = page.get_by_slot_id(slot_id)
+                record = page.get_record_by_slot_id(slot_id)
 
                 if not record.deleted:
                     page_keys.append(record.params[0])
@@ -249,7 +249,7 @@ def test_reorganize():
         try:
             assert page.n_records == 4
             assert [
-                page.get_by_slot_id(i).params[0]
+                page.get_record_by_slot_id(i).params[0]
                 for i in range(page.n_records)
             ] == [10, 30, 50, 70]
 
