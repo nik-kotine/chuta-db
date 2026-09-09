@@ -175,28 +175,31 @@ class VariablePage:
         self.serializer = serializer
 
     def __init__(self, page_ba: bytearray, page_size: int, serializer: VariableLengthRecordSerializer) -> None:
-        self.offset = page_size
-        self.size = 0
         self.page_size = page_size
-        self.slots = []
         self.page_ba = page_ba
         self.serializer = serializer
+        self.slots = []
+        base = PAGE_HEADER_SIZE
+        for i in range(self.size):
+            data0, data1 = struct.unpack_from(">ii", self.page_ba, base)
+            self.slots.append(tuple([data0, data1]))
+            base += 8
 
     @property
     def size(self) -> int:
-        return struct.unpack_from(PAGE_HEADER_FORMAT, self.page_ba, 0)[1]
+        return struct.unpack_from(">i", self.page_ba, 4)[0]
 
     @size.setter
     def size(self, size: int):
-        struct.pack_into(PAGE_HEADER_FORMAT, self.page_ba, self.offset, size)
+        struct.pack_into(">i", self.page_ba, 4, size)
 
     @property
     def offset(self) -> int:
-        return struct.unpack_from(PAGE_HEADER_FORMAT, self.page_ba, 0)[0]
+        return struct.unpack_from(">i", self.page_ba, 0)[0]
 
     @offset.setter
     def offset(self, offset: int):
-        struct.pack_into(PAGE_HEADER_FORMAT, self.page_ba, offset, self.size)
+        struct.pack_into(">i", self.page_ba, 0, offset)
 
     #@property
     #def n_records(self) -> int:
@@ -245,9 +248,12 @@ class VariablePage:
             raise RuntimeError("slot_id is out of range")
         slot_offset = self._slot_offset(slot_id)
         offset, size = struct.unpack_from(SLOT_FORMAT, self.page_ba, slot_offset)
-        record_data = bytes(self.page_ba[offset: offset + size])
-        self.page_ba[offset: (offset + size)] = record_data
-        offset += size
+       # record_data = bytes(self.page_ba[offset: offset + size])
+        record_data = self.serializer.serialize(record.params)
+        if len(record_data) != size-RID_SIZE-DELETED_SIZE:
+            raise RuntimeError("Record calculated size and record size stored on slot do not match")
+        self.page_ba[offset: (offset + size-RID_SIZE-DELETED_SIZE)] = record_data
+        offset += size - RID_SIZE - DELETED_SIZE
         next_rid = record.next_rid
 
         if next_rid is None:
@@ -273,7 +279,10 @@ class VariablePage:
         self.size += 1
 
         self.offset -= record_size
+
+        struct.pack_into(SLOT_FORMAT, self.page_ba, PAGE_HEADER_SIZE+len(self.slots)*SLOT_SIZE, self.offset, record_size)
         self.slots.append((self.offset, record_size))
+
         self.page_ba[self.offset: self.offset + len(record_bytes)] = record_bytes
         next_rid = record.next_rid
         if next_rid is None:
@@ -404,7 +413,7 @@ class VariableSequentialFile:
 
         try:
             page.set_by_slot_id_same_size(slot_id, record)
-            self.buffer_manager.mark_dirty(phys_page_id)  # por qué en este orden? no sería el mark dirty primero?
+            self.buffer_manager.mark_dirty(phys_page_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
 
@@ -425,7 +434,7 @@ class VariableSequentialFile:
             page = self._load_page(mid)
 
             try:
-                if page.n_records == 0:
+                if page.size == 0:
                     high = mid - 1
                     continue
 
@@ -474,7 +483,8 @@ class VariableSequentialFile:
         page = self._load_page(phys_page_id)
 
         try:
-            page.n_records = 0
+            page.size = 0
+            page.offset = self.page_size
             self.buffer_manager.mark_dirty(phys_page_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
@@ -487,7 +497,7 @@ class VariableSequentialFile:
         """
         size = self.serializer.get_size_of(record.params)
         page = self._load_page(0)
-        if (not page.has_space_int(size)) and page.n_records == 0:
+        if (not page.has_space_int(size)) and page.size == 0:
             raise RuntimeError("Record is too big for insertion")
 
         try:
@@ -624,7 +634,7 @@ class VariableSequentialFile:
             page = self._load_page(phys_page_id)
 
             try:  # no deberíamos usar self.n_deleted?
-                for slot_id in range(page.n_records):
+                for slot_id in range(page.size):
                     total_slots += 1
                     record = page.get_by_slot_id(slot_id)
                     if record.deleted:
@@ -639,7 +649,7 @@ class VariableSequentialFile:
         return deleted_slots / total_slots
 
     def reorganize_variable(self):
-        if self.n_records == 0:
+        if self.n_records + self.n_deleted == 0:
             raise RuntimeError("File being reorganized with no records")
         records = []
         for _, record in self._iter_records():
@@ -662,25 +672,27 @@ class VariableSequentialFile:
         page_ba = self.buffer_manager.fetch_page(0)
         page_ba[:] = b"\x00" * self.page_size
         page = VariablePage(page_ba, self.page_size, self.serializer)
-        page.n_records = 0
+        page.size = 0
+        page.offset = self.page_size
         self.buffer_manager.mark_dirty(0)
         self.buffer_manager.unpin_page(0)
-
         pageindex = 1
         while len(records) > 0:
 
-            if self.n_pages < pageindex + 1:
+            if self.n_pages < pageindex:
                 self._append_page()
             page_ba = self.buffer_manager.fetch_page(pageindex)
             page_ba[:] = b"\x00" * self.page_size
             page = VariablePage(page_ba, self.page_size, self.serializer)
-            page.n_records = 0
+            page.size = 0
 
             record = records[-1]
-            record_size = self.serializer.get_size_of(record.params) #podría faltar verificar si un registro podría no caber en ninguna página, aunque es obsoleto
+            record_size = self.serializer.get_size_of(record.params)
             next_record = records[-2] if len(records) >= 2 else None
             next_record_size = -1 if next_record is None else self.serializer.get_size_of(next_record.params)
 
+            if not page.has_space_int(record_size): #la página actualmente está vacía, se asume el mismo tamaño para todas las páginas no overflow
+                raise RuntimeError("Record is too big for insertion")
             while page.has_space_int(record_size):
                 # rids.append(self._make_rid(pageindex, page.size))
                 next_rid = (
