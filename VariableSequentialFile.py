@@ -147,8 +147,10 @@ class VariableLengthRecordSerializer:
                     data[unpacking_index:unpacking_index + length].decode("utf-8"))
                 unpacking_index += length
             else:
-                output.append(data[unpacking_index:unpacking_index + struct_format_tuple[1]])
-                unpacking_index += struct_format_tuple[1]
+                record_size = struct_format_tuple[1]
+                record_value = struct.unpack(struct_format_tuple[0], data[unpacking_index:unpacking_index + record_size])[0]
+                output.append(record_value)
+                unpacking_index += record_size
         return output
 
 
@@ -474,6 +476,33 @@ class VariableSequentialFile:
 
         return previous_rid, None
 
+
+
+
+    def _find_neighbors_duplicates_after(self, key):
+        """
+        Busca los registros inmediatamente anterior y posterior a una clave
+        recorriendo la secuencia logica desde first_rid. Para claves duplicadas
+        (en caso se necesiten), los registros se colocan en orden de llegada.
+        """
+        if self.first_rid is None:
+            return None, None
+
+        previous_rid = None
+
+        for current_rid, record in self._iter_records(self.first_rid):
+            if record.deleted:
+                continue
+
+            current_key = record.params[self.key_index]
+
+            if current_key > key:
+                return previous_rid, current_rid
+
+            previous_rid = current_rid
+
+        return previous_rid, None
+
     def _append_page(self) -> int:
         """
         Crea una nueva pagina principal al final del archivo.
@@ -497,6 +526,10 @@ class VariableSequentialFile:
         """
         size = self.serializer.get_size_of(record.params)
         page = self._load_page(0)
+        if page.size == 0 and page.offset == 0:
+            page.offset = self.page_size
+            page.size = 0
+            self.buffer_manager.mark_dirty(0)
         if (not page.has_space_int(size)) and page.size == 0:
             raise RuntimeError("Record is too big for insertion")
 
@@ -556,7 +589,7 @@ class VariableSequentialFile:
             self._write_header()
             return rid
 
-        previous_rid, next_rid = self._find_neighbors(params[self.key_index])
+        previous_rid, next_rid = self._find_neighbors_duplicates_after(params[self.key_index])
 
         record.next_rid = next_rid
 
@@ -665,7 +698,9 @@ class VariableSequentialFile:
             self._write_header()
             return
 
-        records.sort(key=lambda record: record.params[self.key_index], reverse=True)
+        records.sort(key=lambda record: record.params[self.key_index])
+        records.reverse() #no pongo reverse=True ya que aparentemente reversed mantiene estable el orden de duplicados como si estuviera no reversed
+
         self.n_records = len(records)
 
         # Limpia página de overflow
@@ -685,6 +720,7 @@ class VariableSequentialFile:
             page_ba[:] = b"\x00" * self.page_size
             page = VariablePage(page_ba, self.page_size, self.serializer)
             page.size = 0
+            page.offset = self.page_size
 
             record = records[-1]
             record_size = self.serializer.get_size_of(record.params)
@@ -694,7 +730,6 @@ class VariableSequentialFile:
             if not page.has_space_int(record_size): #la página actualmente está vacía, se asume el mismo tamaño para todas las páginas no overflow
                 raise RuntimeError("Record is too big for insertion")
             while page.has_space_int(record_size):
-                # rids.append(self._make_rid(pageindex, page.size))
                 next_rid = (
                     None if next_record is None else (
                         self._make_rid(pageindex, page.size + 1)
