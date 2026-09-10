@@ -1,11 +1,13 @@
 import struct
 
 PAGE_SIZE = 4096
-HEADER_FORMAT = ">IHH" # (page_id, slot_count, free_space_high)
+HEADER_FORMAT = ">IHHH" # (page_id, slot_count, free_space_high, first_free_slot)
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 SLOT_FORMAT = ">HH" # (offset, length)
 SLOT_SIZE = struct.calcsize(SLOT_FORMAT)
+
+NULL_SLOT = 0xFFFF # marca "no hay ningun slot muerto que reciclar" en la free list
 
 class SlottedPage:
     def __init__(self, page_id: int, data: bytearray = None):
@@ -14,16 +16,17 @@ class SlottedPage:
             self.page_id = page_id
             self.slot_count = 0
             self.free_space_high = PAGE_SIZE # porque está vacía
+            self.first_free_slot = NULL_SLOT # todavia no hay ningun muerto
             self.save_header()
         else:
             self.data = data
             self.load_header()
 
     def save_header(self):
-        struct.pack_into(HEADER_FORMAT, self.data, 0, self.page_id, self.slot_count, self.free_space_high)
+        struct.pack_into(HEADER_FORMAT, self.data, 0, self.page_id, self.slot_count, self.free_space_high, self.first_free_slot)
 
     def load_header(self):
-        self.page_id, self.slot_count, self.free_space_high = struct.unpack_from(HEADER_FORMAT, self.data, 0)
+        self.page_id, self.slot_count, self.free_space_high, self.first_free_slot = struct.unpack_from(HEADER_FORMAT, self.data, 0)
 
     @property
     def free_space_low(self): 
@@ -68,16 +71,13 @@ class SlottedPage:
     def insert(self, record_data: bytes):
         record_len = len(record_data)
 
-        target_slot_id = -1
+        # solo miramos quien es el primer muerto, todavia no lo consumimos
+        # de la free list -- si el insert termina fallando por falta de
+        # espacio, no queremos habernos comido un slot reciclable por nada
+        target_slot_id = self.first_free_slot if self.first_free_slot != NULL_SLOT else -1
         needed_space = record_len
 
-        for i in range(self.slot_count):
-            offset, length = self.get_slot(i)
-            if length == 0: # slot vacio/reutilizable
-                target_slot_id = i
-                break
-
-        if target_slot_id == -1: # no encontramos uno reutlizable
+        if target_slot_id == -1: # no hay ningun muerto reciclable
             needed_space += SLOT_SIZE
 
         if self.free_space_bytes < needed_space: # si no hay espacio
@@ -90,11 +90,13 @@ class SlottedPage:
         self.data[new_offset : self.free_space_high] = record_data # en el anterior espacio libre escribimos la data
         self.free_space_high = new_offset
 
-        if target_slot_id != -1: # reescribimos el slot
-            self.set_slot(target_slot_id,new_offset,record_len)
+        if target_slot_id != -1: # reciclamos el primero de la free list
+            next_free, _ = self.get_slot(target_slot_id) # su offset guardaba el puntero al siguiente muerto
+            self.first_free_slot = next_free # recien ahora avanzamos la free list
+            self.set_slot(target_slot_id, new_offset, record_len)
             res_slot_id = target_slot_id
         else: # nuevo slot
-            self.set_slot(self.slot_count, new_offset, record_len) 
+            self.set_slot(self.slot_count, new_offset, record_len)
             res_slot_id = self.slot_count
             self.slot_count += 1
 
@@ -119,7 +121,11 @@ class SlottedPage:
         if length == 0: # eliminado
             return False # ya estaba eliminado
 
-        self.set_slot(slot_id, 0, 0)
+        # lo enganchamos a la cabeza de la free list: el offset (ya no
+        # sirve para ubicar datos) pasa a guardar quien era el primer
+        # muerto hasta ahora, y este slot se vuelve el nuevo primero
+        self.set_slot(slot_id, self.first_free_slot, 0)
+        self.first_free_slot = slot_id
         self.save_header()
         return True
 

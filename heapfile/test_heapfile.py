@@ -133,13 +133,14 @@ def test_memoria_ram_vs_disco():
     print("OK: el archivo en disco crecio, los datos SI se estan persistiendo")
 
     # 4.2: lo unico que HeapFile mantiene vivo en RAM entre operaciones es
-    # la pagina 0 (el directorio) -- su tamano no depende de cuantos
-    # registros se hayan insertado.
-    tam_directorio_en_ram = sys.getsizeof(hf._dir_data)
-    print("tamano en RAM del directorio cacheado (self._dir_data):", tam_directorio_en_ram, "bytes")
+    # la cadena de paginas de directorio -- su tamano depende de cuantas
+    # paginas de datos hay, pero crece muchisimo mas lento que ellas
+    # (una pagina de directorio nueva recien cada ENTRIES_PER_DIR_PAGE paginas).
+    tam_directorio_en_ram = sum(sys.getsizeof(b) for b in hf._dir_pages)
+    print("tamano en RAM de la cadena de directorio cacheada (self._dir_pages):", tam_directorio_en_ram, "bytes")
     print("tamano del archivo en disco en este punto:", tam_final, "bytes")
     print(
-        "OK: la RAM que HeapFile retiene es fija (~", PAGE_SIZE, "bytes) sin importar cuanto",
+        "OK: la RAM que HeapFile retiene es chica (~", PAGE_SIZE, "bytes por pagina de directorio) sin importar cuanto",
         "crecio el archivo en disco -- las paginas de datos no quedan cacheadas.",
     )
 
