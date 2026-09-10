@@ -975,13 +975,15 @@ def test_variable_string_sizes():
 
         assert logical_keys(seq) == [1, 2, 3, 4, 5]
 
-        for key, value in values:
-            result = seq.search(key)
+        for expected in values:
+            result = seq.search(expected[0])
+
             assert len(result) == 1
-            assert result[0].params == list(value)
+            assert result[0].params == list(expected)
 
     finally:
         close_sequential(filename, fm, bm)
+
 
 
 def test_utf8_strings():
@@ -1005,10 +1007,12 @@ def test_utf8_strings():
         for key, value in values:
             result = seq.search(key)
             assert len(result) == 1
-            assert result[0].params[1] == value[1]
+
+            assert result[0].params[1] == value
 
     finally:
         close_sequential(filename, fm, bm)
+
 
 
 def test_record_near_page_limit():
@@ -1137,7 +1141,7 @@ def test_multiple_reorganizations():
         expected = list(range(1, 30, 2))
         assert logical_keys(seq) == expected
 
-        for i in range(30, 60):
+        for i in range(31, 60, 2):
             seq.insert((i, f"value-{i}"))
 
         assert logical_keys(seq) == list(range(1, 60, 2))
@@ -1310,14 +1314,14 @@ tests = [
     test_reorganize_next_rids,
     test_record_too_large,
 
-    #test_variable_string_sizes,
-    #test_utf8_strings,
-    #test_record_near_page_limit,
-    #test_record_too_large_2,
-    #test_insert_after_delete,
-    #test_duplicate_order_survives_reorganization,
-    #test_multiple_reorganizations,
-    #test_record_counters,
+    test_variable_string_sizes,
+    test_utf8_strings,
+    test_record_near_page_limit,
+    test_record_too_large_2,
+    test_insert_after_delete,
+    test_duplicate_order_survives_reorganization,
+    test_multiple_reorganizations,
+    test_record_counters,
 
     test_everything_together,
 ]
