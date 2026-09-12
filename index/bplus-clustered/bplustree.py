@@ -107,11 +107,6 @@ class Node(object):
 
 class Leaf(Node):
     def __init__(self, parent=None, prev_node=None, next_node=None):
-        """
-        Create a new leaf in the leaf link
-        :type prev_node: Leaf
-        :type next_node: Leaf
-        """
         super(Leaf, self).__init__(parent)
         self.next: Leaf = next_node
         if next_node is not None:
@@ -263,15 +258,14 @@ class BPlusTree(object):
                 node.fusion()
                 self.delete(key, node.parent)
 
+    # to be deleted jeje
     def show(self, node=None, file=None, _prefix="", _last=True):
-        """Prints the keys at each level."""
         if node is None:
             node = self.root
         print(_prefix, "`- " if _last else "|- ", node.keys, sep="", file=file)
         _prefix += "   " if _last else "|  "
 
         if type(node) is Node:
-            # Recursively print the key of child nodes (if these exist).
             for i, child in enumerate(node.values):
                 _last = (i == len(node.values) - 1)
                 self.show(child, file, _prefix, _last)
