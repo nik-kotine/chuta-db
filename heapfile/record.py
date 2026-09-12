@@ -38,7 +38,6 @@ class RecordPacker:
     def record_decoder(self, record_bytes: bytes):
         # Leemos la cantidad de campos
         num_fields = struct.unpack(">H", record_bytes[:2])[0]
-        print(num_fields)
         if num_fields != len(self.schema):
             raise ValueError(f"Expected {len(self.schema)} but received {num_fields}")
 

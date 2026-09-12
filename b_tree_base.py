@@ -20,17 +20,25 @@ class BPlusTreeBase:
         self.file=open(index_filename,"w+b" if is_new else "r+b")
 
         if is_new:
-            # pag 0 es header
-            # pag 1 es hoja vacía
-            self.file.write(b"\x00"*PAGE_SIZE)
-            root_leaf=BTreeLeafPage(1)
-            self.file.write(root_leaf.data)
-            self.root_page_id=1
-            self.root_is_leaf=True
-            self.height=0
-            self._save_root_header()  # sin esto la pagina 0 se queda en ceros
+            self._init_empty_index()
         else:
             self._load_root_header()
+
+    # crea (o recrea) un indice vacio: pag 0 es header, pag 1 es hoja
+    # vacia que arranca como raiz. Separado de __init__ para que
+    # _reindex() en las subclases lo pueda reusar cuando haga falta
+    # reconstruir el indice desde cero (por ejemplo, si
+    # SequentialFile.reorganize() invalido los RID guardados)
+    def _init_empty_index(self):
+        self.file.truncate(0)
+        self.file.seek(0)  # truncate no mueve el puntero, hay que reposicionarlo
+        self.file.write(b"\x00"*PAGE_SIZE)
+        root_leaf=BTreeLeafPage(1)
+        self.file.write(root_leaf.data)
+        self.root_page_id=1
+        self.root_is_leaf=True
+        self.height=0
+        self._save_root_header()  # sin esto la pagina 0 se queda en ceros
 
     # -------- página 0: persistencia de la raiz ---------
 
@@ -98,7 +106,13 @@ class BPlusTreeBase:
     def insert(self, key, params):
         # se persiste el dato real primero, para tener el ref listo
         ref = self._store_record(params)
+        return self._insert_ref(key, ref)
 
+    # hace todo lo de insert() menos persistir el dato real -- separado
+    # para que las subclases puedan reindexar un ref que ya existe
+    # (por ejemplo, si hay que reconstruir el indice entero porque
+    # SequentialFile.reorganize() invalido los RID de todos)
+    def _insert_ref(self, key, ref):
         # mismo descenso que search(), guardando el camino recorrido
         # para poder propagar un split hacia arriba si hace falta
         path = []

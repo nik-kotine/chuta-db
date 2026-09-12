@@ -193,6 +193,12 @@ class SequentialFile:
         self.n_pages = 0
         self.n_records = 0
         self.n_deleted = 0
+        # contador en RAM (no persiste) que se incrementa cada vez que
+        # reorganize() corre. Sirve para que quien mantenga una
+        # estructura externa basada en RID (como un indice B+
+        # agrupado) pueda detectar cuando sus RID guardados quedaron
+        # invalidos porque reorganize() reasigno todo.
+        self.reorganize_count = 0
         header = self.file_manager.read_header()
         if len(header) == 0:
             return
@@ -518,6 +524,7 @@ class SequentialFile:
         Reconstruye completamente el SequentialFile eliminando registros
         marcados como deleted y vaciando el overflow.
         """
+        self.reorganize_count += 1
         records = []
 
         for _, record in self._iter_records():
