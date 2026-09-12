@@ -169,18 +169,32 @@ Variante no agrupada: conecta `BPlusTreeBase` con un `HeapFile` ya abierto (para
 - `test_b_tree_base.py`: lógica del árbol sola (storage falso en memoria) -- insert/search, split de hoja forzado, `range_search` cruzando hojas, persistencia, delete simple, delete forzando redistribución/fusión, y colapso de la raíz.
 - `test_b_plus_clustered.py`: contra `SequentialFile` real -- insert/search/delete, que el orden físico coincida con el del índice, persistencia, y el reindexado automático tras un `reorganize()` forzado.
 - `test_b_plus_unclustered.py`: contra `HeapFile` real -- insert/search/delete, que `range_search` ordene bien aunque el heap esté desordenado, y dos índices compartiendo el mismo `HeapFile`.
-- `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad.
+- `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` y `delete()`, espacio en disco y RAM retenida, a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad.
 
 ## Complejidad medida
 
 Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈ 511), corriendo `test_b_tree_complexity.py`:
 
-| N | altura | páginas leídas por `search` |
-|---|---|---|
-| 100 | 0 | 1.00 |
-| 1 000 | 1 | 2.00 |
-| 10 000 | 1 | 2.00 |
-| 50 000 | 1 | 2.00 |
-| 100 000 | 1 | 2.00 |
+**Páginas leídas por operación (memoria secundaria):**
 
-N creció 1000x (de 100 a 100 000) y las páginas leídas por búsqueda solo crecieron de 1 a 2 -- confirma que el costo es logarítmico (`D·log_(R/2)(M)`), no lineal. Con este fanout, un único nodo raíz interno alcanza para indexar hasta ~511 × 340 ≈ 173 000 registros en altura 1; recién con más de eso el árbol pasaría a altura 2.
+| N | altura | páginas/`search` | páginas/`delete` |
+|---|---|---|---|
+| 100 | 0 | 1.00 | 1.00 |
+| 1 000 | 1 | 2.00 | 2.00 |
+| 10 000 | 1 | 2.00 | 2.00 |
+| 50 000 | 1 | 2.00 | 2.00 |
+| 100 000 | 1 | 2.00 | 2.00 |
+
+N creció 1000x (de 100 a 100 000) y las páginas leídas por búsqueda/borrado solo crecieron de 1 a 2 -- confirma que el costo es logarítmico (`D·log_(R/2)(M)`), no lineal. Que `páginas/delete` se mantenga igual de chico que `páginas/search` confirma también que el **rebalanceo funciona**: si `delete()` no reequilibrara bien el árbol, este número se iría degradando con cada borrado. Con este fanout, un único nodo raíz interno alcanza para indexar hasta ~511 × 340 ≈ 173 000 registros en altura 1; recién con más de eso el árbol pasaría a altura 2.
+
+**Espacio en disco y RAM:**
+
+| N | disco (KB) | bytes/registro | RAM del árbol (bytes) |
+|---|---|---|---|
+| 100 | 8.0 | 81.92 | 8 766 |
+| 1 000 | 24.0 | 24.58 | 8 766 |
+| 10 000 | 160.0 | 16.38 | 8 766 |
+| 50 000 | 904.0 | 18.51 | 8 766 |
+| 100 000 | 1 840.0 | 18.84 | 8 766 |
+
+El disco crece proporcional a N (con overhead esperable de páginas no 100% llenas tras splits -- el valor real de una entrada es 12 bytes). La **RAM se mantiene fija** sin importar N, porque `BPlusTreeBase` no cachea páginas entre llamadas: cada `_load_leaf`/`_load_internal` relee de disco, así que el árbol nunca retiene en memoria más que el objeto en sí (equivalente al patrón que ya usa `HeapFile`).
