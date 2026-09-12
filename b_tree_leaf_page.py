@@ -1,6 +1,5 @@
 import struct
 from collections import namedtuple
-
 # Una hoja de B+ Tree guarda entradas de tamaño FIJO (key, ref) 
 # en un arreglo denso y siempre ordenado por key. Esto es necesario 
 # para poder hacer busqueda binaria dentro de la página y 
