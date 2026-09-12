@@ -118,11 +118,102 @@ def test_persistencia():
     limpiar()
 
 
+def test_delete_simple():
+    limpiar()
+    tree = FakeBPlusTree(TEST_INDEX_FILE)
+
+    for key in [10, 20, 30, 40, 50]:
+        tree.insert(key, f"valor{key}")
+
+    assert tree.delete(30) is True
+    assert tree.search(30) is None
+    assert tree.search(10) is not None
+    assert tree.search(50) is not None
+
+    assert tree.delete(999) is False  # no existia
+
+    print("OK: delete simple, sin forzar rebalanceo")
+
+    tree.file.close()
+    limpiar()
+
+
+def test_delete_forzando_rebalanceo():
+    limpiar()
+    tree = FakeBPlusTree(TEST_INDEX_FILE)
+
+    claves = list(range(1, 2000))
+    for key in claves:
+        tree.insert(key, f"valor{key}")
+
+    altura_antes = tree.height
+
+    # borramos la mitad -- suficiente para forzar redistribuciones y
+    # fusiones en varias hojas, y probablemente tambien en internos
+    a_borrar = claves[::2]
+    for key in a_borrar:
+        assert tree.delete(key) is True
+
+    sobrevivientes = [k for k in claves if k not in a_borrar]
+
+    for key in sobrevivientes:
+        ref = tree.search(key)
+        assert ref is not None, f"la clave {key} debia seguir existiendo"
+        assert tree._fetch_record(ref) == f"valor{key}"
+
+    for key in a_borrar:
+        assert tree.search(key) is None, f"la clave {key} debia estar borrada"
+
+    resultados = tree.range_search(sobrevivientes[0], sobrevivientes[-1])
+    claves_en_rango = [key for key, _ in resultados]
+    assert claves_en_rango == sobrevivientes
+
+    print(f"OK: {len(a_borrar)} deletes con rebalanceo, altura antes={altura_antes}, despues={tree.height}")
+
+    tree.file.close()
+    limpiar()
+
+
+def test_delete_hasta_colapsar_raiz():
+    limpiar()
+    tree = FakeBPlusTree(TEST_INDEX_FILE)
+
+    claves = list(range(1, 2000))
+    for key in claves:
+        tree.insert(key, f"valor{key}")
+
+    assert tree.height > 0  # confirmamos que crecio antes de borrar
+
+    # borramos casi todo, dejando solo un puñado -- la raiz interna
+    # tiene que colapsar de vuelta a una sola hoja
+    sobrevivientes = [1, 500, 1999]
+    a_borrar = [k for k in claves if k not in sobrevivientes]
+    for key in a_borrar:
+        assert tree.delete(key) is True
+
+    assert tree.height == 0
+    assert tree.root_is_leaf is True
+
+    for key in sobrevivientes:
+        assert tree.search(key) is not None
+
+    for key in a_borrar:
+        assert tree.search(key) is None
+
+    print("OK: la raiz colapsa de vuelta a una hoja cuando se borra casi todo")
+
+    tree.file.close()
+    limpiar()
+
+
 tests = [
     test_insert_y_search_simple,
     test_forzar_split_de_hoja,
     test_range_search,
     test_persistencia,
+    test_delete_simple,
+    test_delete_forzando_rebalanceo,
+    test_delete_hasta_colapsar_raiz,
 ]
 
 for test in tests:

@@ -22,6 +22,11 @@ CHILD_SIZE = struct.calcsize(CHILD_FORMAT)
 # que reservamos espacio fijo para MAX_KEYS claves y MAX_KEYS+1 hijos.
 MAX_KEYS = (PAGE_SIZE - HEADER_SIZE - CHILD_SIZE) // (KEY_SIZE + CHILD_SIZE)
 
+# minimo de claves para un nodo no-raiz. Misma cuenta que en la hoja:
+# floor div asegura que un merge de dos nodos en el minimo, mas la
+# clave que baja del padre, siempre entra en una sola pagina
+MIN_KEYS = MAX_KEYS // 2
+
 
 class BTreeInternalPage:
 
@@ -72,12 +77,15 @@ class BTreeInternalPage:
                 hi = mid
         return lo
 
-    # Retorna el hijo en el primer indice cuya clave
-    # es estrictamente mayor a key (o el ultimo hijo si key es mayor o
-    # igual a todas las claves). Con esto se cumple la invariante:
-    # child[0] cubre < key[0], child[i] cubre [key[i-1], key[i]) para
-    # 0 < i < n_keys, y child[n_keys] cubre >= key[n_keys-1].
-    def find_child(self, key: int) -> int:
+    # Retorna el indice del hijo por el que hay que bajar para buscar
+    # key: primer indice cuya clave es estrictamente mayor a key (o
+    # n_keys si key es mayor o igual a todas). Con esto se cumple la
+    # invariante: child[0] cubre < key[0], child[i] cubre
+    # [key[i-1], key[i]) para 0 < i < n_keys, y child[n_keys] cubre
+    # >= key[n_keys-1]. Separado de find_child() porque
+    # b_tree_base.py necesita el indice (no solo el page_id) para
+    # saber que hermanos son adyacentes durante el rebalanceo.
+    def find_child_index(self, key: int) -> int:
         lo, hi = 0, self.n_keys
         while lo < hi:
             mid = (lo + hi) // 2
@@ -85,7 +93,10 @@ class BTreeInternalPage:
                 hi = mid
             else:
                 lo = mid + 1
-        return self._read_child(lo)
+        return lo
+
+    def find_child(self, key: int) -> int:
+        return self._read_child(self.find_child_index(key))
 
     def has_space(self) -> bool:
         return self.n_keys < MAX_KEYS
@@ -138,3 +149,75 @@ class BTreeInternalPage:
         self.save_header()
 
         return pushed_up_key, new_page
+
+    # true si quedo por debajo del minimo despues de sacarle una clave
+    def is_underflow(self) -> bool:
+        return self.n_keys < MIN_KEYS
+
+    # true si tiene de sobra como para prestarle una clave a un
+    # hermano sin quedar el mismo en underflow
+    def can_lend(self) -> bool:
+        return self.n_keys > MIN_KEYS
+
+    # quita keys[index] y children[index+1] (el par que queda huerfano
+    # tras una fusion), desplazando el resto del arreglo
+    def delete_key_at(self, index: int):
+        for i in range(index, self.n_keys - 1):
+            self._write_key(i, self._read_key(i + 1))
+        for i in range(index + 1, self.n_keys):
+            self._write_child(i, self._read_child(i + 1))
+        self.n_keys -= 1
+        self.save_header()
+
+    # pide prestada la ULTIMA clave+hijo del hermano izquierdo. La
+    # clave separadora del padre baja como primera clave aca, y la
+    # ultima clave del hermano sube a ser la nueva separadora
+    def borrow_from_left(self, left_sibling: "BTreeInternalPage", separator_key: int) -> int:
+        borrowed_key = left_sibling._read_key(left_sibling.n_keys - 1)
+        borrowed_child = left_sibling._read_child(left_sibling.n_keys)
+        left_sibling.n_keys -= 1
+        left_sibling.save_header()
+
+        for i in range(self.n_keys, 0, -1):
+            self._write_key(i, self._read_key(i - 1))
+        for i in range(self.n_keys + 1, 0, -1):
+            self._write_child(i, self._read_child(i - 1))
+
+        self._write_key(0, separator_key)
+        self._write_child(0, borrowed_child)
+        self.n_keys += 1
+        self.save_header()
+
+        return borrowed_key
+
+    # pide prestada la PRIMERA clave+hijo del hermano derecho. La
+    # separadora del padre baja como ultima clave aca, y la primera
+    # clave del hermano sube a ser la nueva separadora
+    def borrow_from_right(self, right_sibling: "BTreeInternalPage", separator_key: int) -> int:
+        borrowed_key = right_sibling._read_key(0)
+        borrowed_child = right_sibling._read_child(0)
+
+        right_sibling.delete_key_at(0)
+
+        self._write_key(self.n_keys, separator_key)
+        self._write_child(self.n_keys + 1, borrowed_child)
+        self.n_keys += 1
+        self.save_header()
+
+        return borrowed_key
+
+    # fusiona el hermano derecho entero dentro de este nodo, bajando
+    # en el medio la clave separadora del padre (a diferencia de la
+    # hoja, acá SI hace falta esa clave porque los nodos internos no
+    # guardan directamente ningun dato, solo separadores)
+    def merge_with_right(self, right_sibling: "BTreeInternalPage", separator_key: int):
+        self._write_key(self.n_keys, separator_key)
+        base = self.n_keys + 1
+
+        for i in range(right_sibling.n_keys):
+            self._write_key(base + i, right_sibling._read_key(i))
+        for i in range(right_sibling.n_keys + 1):
+            self._write_child(base + i, right_sibling._read_child(i))
+
+        self.n_keys = base + right_sibling.n_keys
+        self.save_header()

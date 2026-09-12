@@ -24,7 +24,12 @@ NULL_LEAF = 0
 
 ENTRY_FORMAT = ">iii"
 ENTRY_SIZE = struct.calcsize(ENTRY_FORMAT)
-MAX_ENTRIES = (PAGE_SIZE - HEADER_SIZE) // ENTRY_SIZE 
+MAX_ENTRIES = (PAGE_SIZE - HEADER_SIZE) // ENTRY_SIZE
+
+# minimo de entradas que debe tener una hoja no-raiz. Con floor div
+# (igual que split) un merge de dos hojas justo en el minimo siempre
+# entra en una sola pagina: (MIN-1) + MIN <= MAX_ENTRIES
+MIN_ENTRIES = MAX_ENTRIES // 2
 
 RID = namedtuple("RID", ["page_id", "slot_id"])
 
@@ -154,3 +159,45 @@ class BTreeLeafPage:
 
         split_key, _ = new_page._read_entry(0)
         return split_key, new_page
+
+    # true si quedo por debajo del minimo despues de un delete
+    def is_underflow(self) -> bool:
+        return self.n_entries < MIN_ENTRIES
+
+    # true si tiene de sobra como para prestarle una entrada a un
+    # hermano sin quedar ella misma en underflow
+    def can_lend(self) -> bool:
+        return self.n_entries > MIN_ENTRIES
+
+    # se lleva la ULTIMA entrada del hermano izquierdo y la pone
+    # primera aca (redistribucion). retorna la nueva clave separadora
+    # que el padre tiene que guardar entre ambas hojas
+    def borrow_from_left(self, left_sibling: "BTreeLeafPage") -> int:
+        key, ref = left_sibling._read_entry(left_sibling.n_entries - 1)
+        left_sibling.delete(key)
+
+        self.insert(key, ref)
+        return key
+
+    # se lleva la PRIMERA entrada del hermano derecho y la agrega al
+    # final aca. retorna la nueva clave separadora (la que quedo
+    # primera en el hermano despues de sacarle una)
+    def borrow_from_right(self, right_sibling: "BTreeLeafPage") -> int:
+        key, ref = right_sibling._read_entry(0)
+        right_sibling.delete(key)
+
+        self.insert(key, ref)
+        new_separator, _ = right_sibling._read_entry(0)
+        return new_separator
+
+    # fusiona el hermano derecho entero dentro de esta hoja (cuando
+    # ninguna de las dos tiene de sobra para redistribuir). el
+    # hermano derecho queda huerfano, lo saca de la cadena quien
+    # llame a esto (b_tree_base.py, sacando su clave del padre)
+    def merge_with_right(self, right_sibling: "BTreeLeafPage"):
+        for i in range(right_sibling.n_entries):
+            key, ref = right_sibling._read_entry(i)
+            self.insert(key, ref)
+
+        self.next_leaf_id = right_sibling.next_leaf_id
+        self.save_header()
