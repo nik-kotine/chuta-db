@@ -1,3 +1,7 @@
+"""
+Nota: los tests fueron generados por IA.
+"""
+
 import os
 import struct
 import tempfile
@@ -62,6 +66,17 @@ def logical_keys(seq):
         current_rid = record.next_rid
 
     return result
+
+
+def every_main_page_has_live(seq):
+    if seq.first_rid is None:
+        return True
+
+    for phys_page_id in range(1, seq.n_pages + 1):
+        if seq._first_live_in_page(phys_page_id) is None:
+            return False
+
+    return True
 
 
 def primary_page_keys(seq):
@@ -267,6 +282,117 @@ def test_reorganize():
     finally:
         close_sequential(filename, fm, bm)
 
+def test_reorganize_truncates_file():
+    filename, fm, bm, seq = create_sequential()
+
+    try:
+        for key in range(1, 21):
+            seq.insert((key,))
+
+        for phys_page_id in list(bm.page_table.keys()):
+            bm.flush_page(phys_page_id)
+        fm.flush()
+
+        size_before = os.path.getsize(filename)
+        expected_before = HEADER_SIZE + PAGE_SIZE * (seq.n_pages + 1)
+        assert size_before == expected_before
+
+        for key in range(1, 21, 2):
+            seq.delete(key)
+
+        for phys_page_id in list(bm.page_table.keys()):
+            bm.flush_page(phys_page_id)
+        fm.flush()
+
+        size_after = os.path.getsize(filename)
+        expected_after = HEADER_SIZE + PAGE_SIZE * (seq.n_pages + 1)
+
+        assert size_after < size_before
+        assert size_after == expected_after
+        assert logical_keys(seq) == list(range(2, 21, 2))
+        assert every_main_page_has_live(seq)
+
+    finally:
+        close_sequential(filename, fm, bm)
+
+def test_neighbors_binary_search():
+    filename, fm, bm, seq = create_sequential()
+
+    try:
+        for key in [10, 20, 30, 40, 50, 60]:
+            seq.insert((key,))
+
+        seq.reorganize()
+
+        # main: pagina 1 = [10,20,30,40], pagina 2 = [50,60], overflow vacio
+        assert seq.n_pages == 2
+        assert logical_keys(seq) == [10, 20, 30, 40, 50, 60]
+
+        # frontera a mitad de la ultima pagina (clave entre 50 y 60)
+        assert seq._find_neighbors(55) == ((2, 0), (2, 1))
+        # frontera en medio de la primera pagina
+        assert seq._find_neighbors(35) == ((1, 2), (1, 3))
+        # clave mas pequena que todo
+        assert seq._find_neighbors(5) == (None, (1, 0))
+        # clave mas grande que todo
+        assert seq._find_neighbors(100) == ((2, 1), None)
+        # clave de la frontera exacta entre paginas
+        assert seq._find_neighbors(50) == ((1, 3), (2, 0))
+        # clave duplicada por el overflow (insertada despues de reorganizar)
+        seq.insert((45,))
+        assert logical_keys(seq) == [10, 20, 30, 40, 45, 50, 60]
+        assert seq._find_neighbors(45) == ((1, 3), (0, 0))
+
+    finally:
+        close_sequential(filename, fm, bm)
+
+def test_delete_keeps_every_main_page_alive():
+    filename, fm, bm, seq = create_sequential()
+
+    try:
+        # 21 registros -> 6 paginas (4 por pagina). La ultima tiene 1 solo.
+        for key in range(1, 22):
+            seq.insert((key,))
+
+        seq.reorganize()
+        assert seq.n_pages == 6
+        assert every_main_page_has_live(seq)
+
+        # borrar el unico registro vivo de la ultima pagina: la dejaria vacia,
+        # asi que delete() debe reorganizar (n_pages 6 -> 5).
+        assert seq.delete(21) is True
+        assert seq.n_pages == 5
+        assert every_main_page_has_live(seq)
+        assert logical_keys(seq) == list(range(1, 21))
+
+        # vaciar una pagina del medio ([5,6,7,8]): tambien reorganiza al llegar
+        # a 0 vivos en ella (la proporcion de tachados es 4/20 = 0.2 < 0.5, asi
+        # que el trigger es el de pagina vacia, no el del 50%).
+        for key in range(5, 9):
+            assert seq.delete(key) is True
+
+        assert every_main_page_has_live(seq)
+        assert logical_keys(seq) == [
+            1, 2, 3, 4, 9, 10, 11, 12,
+            13, 14, 15, 16, 17, 18, 19, 20,
+        ]
+
+        # borrado completo: el archivo queda vacio (1 pagina) y sigue usable.
+        for key in [1, 2, 3, 4] + list(range(9, 21)):
+            assert seq.delete(key) is True
+
+        assert seq.first_rid is None
+        assert seq.n_records == 0
+        assert seq.n_pages == 1
+        assert seq._find_neighbors(5) == (None, None)
+
+        seq.insert((7,))
+        assert logical_keys(seq) == [7]
+        assert every_main_page_has_live(seq)
+
+    finally:
+        close_sequential(filename, fm, bm)
+
 
 def test_primary_pages_sorted():
     filename, fm, bm, seq = create_sequential()
@@ -408,6 +534,9 @@ tests = [
     test_delete_duplicates,
     test_chain_sorted_after_delete,
     test_reorganize,
+    test_reorganize_truncates_file,
+    test_neighbors_binary_search,
+    test_delete_keeps_every_main_page_alive,
     test_primary_pages_sorted,
     test_overflow_full,
     test_persistence,
