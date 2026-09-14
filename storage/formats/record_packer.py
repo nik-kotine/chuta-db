@@ -1,9 +1,12 @@
 import struct
+from storage.formats.record_format import RecordFormat
 
-# Esta clase se encarga de convertir los registros a binario
-# De momento, soporta los siguientes tipos en un objeto: int, float y string.
+"""
+Esta clase se encarga de convertir los registros a binario
+De momento, soporta los siguientes tipos en un objeto: int, float y string.
+"""
 
-class RecordPacker:
+class RecordPacker(RecordFormat):
     def __init__(self, schema: list[str]):
         # ex: schema = ['int', 'float', 'string', 'float']
         self.schema = schema
@@ -63,6 +66,12 @@ class RecordPacker:
                 values.append(value_bytes.decode("utf-8"))
 
         return values
+
+    def encode(self, values):
+        return self.record_encoder(values)
+
+    def decode(self, data: bytes) -> list:
+        return self.record_decoder(data)
  
 if __name__ == "__main__":
     l = ['int', 'float', 'int','int','int','int','int','int','int','int','int','int','int','int','int','int']

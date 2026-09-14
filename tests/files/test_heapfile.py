@@ -1,7 +1,7 @@
 import os
 import sys
 
-from heapfile.record import RecordPacker
+from storage.formats.record_packer import RecordPacker
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 from storage.pages.slotted_page import SlottedPage, PAGE_SIZE
@@ -60,56 +60,60 @@ def test_page():
     print("OK: defragment recupera el espacio del registro borrado")
 
 
-# ---------- 3. heapfile.py: integracion completa, con record.py encima ----------
+# ---------- 3. heapfile.py: integracion completa, con record_format encima ----------
 
 def test_heapfile_integracion():
     print("\n--- heapfile.py (integracion) ---")
     limpiar()
-    packer = RecordPacker(["int", "float", "string"])
+    
+    # Definimos el esquema del formato que usará este HeapFile
+    schema = ["int", "float", "string"]
 
     fm = FileManager(TEST_FILE, PAGE_SIZE, HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
 
-    # Nota: se le pasa "" como record_format para cumplir la firma, ya que aqui se empaqueta a mano
-    hf = HeapFile(TEST_FILE, bm, "")
+    # Pasamos el esquema directamente al HeapFile para que gestione el empaquetado interno
+    hf = HeapFile(TEST_FILE, bm, schema)
     rids = []
+    
     for i in range(5):
-        blob = packer.record_encoder([i, i * 1.5, f"alumno{i}"])
-        rid = hf.add(blob)
+        valores = [i, i * 1.5, f"alumno{i}"]
+        rid = hf.insert(valores) # Ahora inserta listas directamente
         rids.append(rid)
     print("RIDs insertados:", rids)
 
     for rid, i in zip(rids, range(5)):
-        valores = packer.record_decoder(hf.get(rid))
+        valores = hf.fetch(rid) # Fetch ya devuelve la lista desempaquetada
         assert valores == [i, i * 1.5, f"alumno{i}"]
     print("OK: los 5 registros se leen de vuelta con sus valores correctos")
 
-    assert hf.remove(rids[2]) is True
-    assert hf.get(rids[2]) is None
-    assert hf.remove(rids[2]) is False
+    assert hf.delete(rids[2]) is True
+    assert hf.fetch(rids[2]) is None
+    assert hf.delete(rids[2]) is False
     print("OK: remove borra, get ya no lo encuentra, y un doble remove no revive nada")
 
-    hf.compact(1)
-    hf.vacuum()
-    print("OK: compact/vacuum corren sin romper el resto de los registros")
+    hf.reorganize() # Usamos reorganize() en lugar de vacuum() para alinear con la interfaz RecordFile
+    print("OK: reorganize corre sin romper el resto de los registros")
+    
     for rid, i in zip(rids, range(5)):
         if rid == rids[2]:
             continue
-        valores = packer.record_decoder(hf.get(rid))
+        valores = hf.fetch(rid)
         assert valores == [i, i * 1.5, f"alumno{i}"]
-    print("OK: tras compact/vacuum los registros que seguian vivos siguen intactos")
+    print("OK: tras reorganize los registros que seguian vivos siguen intactos")
 
-    # registro que no entra en ninguna pagina vacia -> ValueError
+    # Registro demasiado grande que excede el tamaño máximo permitido
     try:
-        hf.add(b"x" * (MAX_RECORD_SIZE + 1))
+        # Creamos una lista con un string gigante que supere el MAX_RECORD_SIZE
+        hf.insert([999, 99.9, "x" * (MAX_RECORD_SIZE + 1)])
         raise AssertionError("debio lanzar ValueError")
     except ValueError as e:
         print("OK: registro demasiado grande rechazado ->", e)
 
-    # forzar una segunda pagina con registros grandes
-    rids_grandes = [hf.add(b"y" * 1000) for _ in range(6)]
+    # Forzar una segunda página con registros grandes
+    rids_grandes = [hf.insert([j, 1.0, "y" * 1000]) for j in range(6)]
     paginas_usadas = sorted(set(r.page_id for r in rids_grandes))
-    print("paginas usadas para 6 registros de 1000 bytes:", paginas_usadas)
+    print("paginas usadas para registros grandes:", paginas_usadas)
     assert len(paginas_usadas) > 1
     print("OK: cuando una pagina se llena, heapfile crea una pagina nueva sola")
 
@@ -123,56 +127,47 @@ def test_memoria_ram_vs_disco():
     print("\n--- RAM vs disco secundario (Con BufferManager) ---")
     limpiar()
     
+    schema = ["string"]
     fm = FileManager(TEST_FILE, PAGE_SIZE, HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
-    hf = HeapFile(TEST_FILE, bm, "")
+    hf = HeapFile(TEST_FILE, bm, schema)
 
-    # 4.1: Para ver el tamaño real del archivo, necesitamos asegurarnos
-    # de que el BufferManager vuelque lo inicial al disco.
     bm.flush_all()
     tam_inicial = os.path.getsize(TEST_FILE)
-    print("tamano del archivo recien creado (solo pagina 0):", tam_inicial, "bytes")
-    # Es posible que tam_inicial sea 0 si Allocate_page no escribe nada físico, 
-    # pero definitivamente crecerá con el add()
+    print("tamano del archivo recien creado:", tam_inicial, "bytes")
 
     rids = []
     for i in range(20):
-        rid = hf.add(f"registro numero {i}".encode("utf-8"))
+        rid = hf.insert([f"registro numero {i}"])
         rids.append(rid)
 
-    # Hacemos flush_all() para que las "dirty pages" (páginas sucias en RAM)
-    # se vuelquen físicamente al disco duro para poder medir su tamaño real.
     bm.flush_all()
     tam_final = os.path.getsize(TEST_FILE)
     print("tamano del archivo tras 20 inserts:", tam_final, "bytes")
     assert tam_final > tam_inicial
     print("OK: el archivo en disco crecio, los datos SI se estan persistiendo")
 
-    # 4.2: Ahora la RAM ya no es una lista dinámica de páginas de directorio.
-    # Está fijada por los "frames" de tu Buffer Manager.
     tam_buffer_pool = sum(sys.getsizeof(frame.page_bin) for frame in bm.frames if frame.page_bin is not None)
     print(f"tamano en RAM ocupado por el Buffer Pool (Max {BUFFER_FRAMES} frames):", tam_buffer_pool, "bytes")
-    print("tamano del archivo en disco en este punto:", tam_final, "bytes")
-    print("OK: la RAM de la DB está acotada estrictamente por tu BufferManager, el disco puede crecer infinitamente.")
+    print("OK: la RAM de la DB está acotada estrictamente por tu BufferManager.")
 
-    hf.close() # Esto por defecto hace flush y cierra el FileManager
+    hf.close()
 
-    # 4.3: Destruir el objeto, crear TODO de cero simulando que reiniciaste la PC,
-    # y confirmar que los datos siguen ahi.
+    # Destruir objetos y reabrir desde cero simulando reinicio
     del hf
     del bm
     del fm
 
     fm2 = FileManager(TEST_FILE, PAGE_SIZE, HEADER_SIZE)
     bm2 = BufferManager(fm2, BUFFER_FRAMES)
-    hf2 = HeapFile(TEST_FILE, bm2, "")
+    hf2 = HeapFile(TEST_FILE, bm2, schema)
     
     for i, rid in enumerate(rids):
-        valor = hf2.get(rid)
-        assert valor == f"registro numero {i}".encode("utf-8")
+        valor = hf2.fetch(rid)
+        assert valor == [f"registro numero {i}"]
         
     print("OK: tras destruir todo en RAM y reabrir el archivo desde cero,")
-    print("    los 20 registros se siguen leyendo bien -> la persistencia via Buffer Manager funciona perfecto.")
+    print("    los 20 registros se siguen leyendo bien.")
 
     hf2.close()
     limpiar()

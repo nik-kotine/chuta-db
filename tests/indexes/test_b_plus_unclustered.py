@@ -20,7 +20,7 @@ def limpiar():
 def crear_arbol():
     fm = FileManager(HEAP_FILE, PAGE_SIZE, HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
-    heap = HeapFile(HEAP_FILE, bm, "")
+    heap = HeapFile(HEAP_FILE, bm, record_format=["int", "int"])
     
     tree = BPlusTreeUnclustered(INDEX_FILE, heap, schema=["int", "int"])
     return tree, heap
@@ -113,7 +113,7 @@ def test_dos_indices_comparten_el_mismo_heap():
     fm = FileManager(HEAP_FILE, PAGE_SIZE, HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
 
-    heap = HeapFile(HEAP_FILE, bm, "")
+    heap = HeapFile(HEAP_FILE, bm, record_format=["int", "int"])
     indice_por_id = BPlusTreeUnclustered(INDEX_FILE, heap, schema=["int", "int"])
     indice_por_valor = BPlusTreeUnclustered(index_2, heap, schema=["int", "int"])
 

@@ -1,6 +1,6 @@
 from indexes.b_tree_base import BPlusTreeBase
 from storage.files.heap_file import HeapFile
-from heapfile.record import RecordPacker
+from storage.formats.record_packer import RecordPacker
 
 
 class BPlusTreeUnclustered(BPlusTreeBase):
@@ -11,22 +11,19 @@ class BPlusTreeUnclustered(BPlusTreeBase):
     def __init__(self, index_filename: str, heap_file: HeapFile, schema: list[str]):
         super().__init__(index_filename)
         self.heap_file = heap_file
-        # HeapFile.add() pide bytes ya empaquetados, a diferencia de
+        # HeapFile.insert() pide bytes ya empaquetados, a diferencia de
         # SequentialFile que empaqueta solo -- por eso acá hace falta
         # un RecordPacker propio para codificar/decodificar
-        self.packer = RecordPacker(schema)
 
     def _store_record(self, params):
-        record_bytes = self.packer.record_encoder(list(params))
-        return self.heap_file.add(record_bytes)
+        return self.heap_file.insert(list(params))
 
     def _fetch_record(self, ref):
-        record_bytes = self.heap_file.get(ref)
-        return self.packer.record_decoder(record_bytes) if record_bytes else None
+        return self.heap_file.fetch(ref)
 
     def _delete_record(self, key, ref) -> bool:
         # acá key no hace falta, HeapFile borra directo por RID
-        return self.heap_file.remove(ref)
+        return self.heap_file.delete(ref)
 
     def close(self):
         self.file.close()

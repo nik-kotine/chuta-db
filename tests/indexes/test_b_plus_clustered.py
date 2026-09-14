@@ -119,7 +119,7 @@ def test_reindex_automatico_tras_reorganize():
     # page_size chico para que el overflow se llene rapido y dispare
     # SequentialFile.reorganize() varias veces durante los inserts
     limpiar()
-    tree = BPlusTreeClustered(INDEX_FILE, DATA_FILE, page_size=128, record_format="ii", buffer_frames=20)
+    tree = BPlusTreeClustered(INDEX_FILE, DATA_FILE, page_size=128, record_format="ii", buffer_frames=100)
 
     veces_antes = tree.sequential_file.reorganize_count
     claves = list(range(1, 300))

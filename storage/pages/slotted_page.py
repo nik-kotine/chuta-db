@@ -10,6 +10,9 @@ SLOT_SIZE = struct.calcsize(SLOT_FORMAT)
 NULL_SLOT = 0xFFFF # marca "no hay ningun slot muerto que reciclar" en la free list
 
 class SlottedPage:
+    """
+    Clase usada en el Heap File
+    """
     def __init__(self, page_id: int, data: bytearray = None):
         if data is None:
             self.data = bytearray(PAGE_SIZE)

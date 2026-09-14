@@ -52,7 +52,7 @@ class BPlusTreeClustered(BPlusTreeBase):
 
     def _delete_record(self, key, ref) -> bool:
         # SequentialFile borra por key, no por RID (borrado lógico)
-        ok = self.sequential_file.delete(key)
+        ok = self.sequential_file.delete_by_key(key)
         self._check_reindex()
         return ok
 
