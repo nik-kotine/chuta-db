@@ -52,7 +52,7 @@ def test_insert_y_search_simple():
     assert tree.search(999) is None
     print("OK: insert y search simples andan bien, sin forzar ningún split")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -74,7 +74,7 @@ def test_forzar_split_de_hoja():
 
     print(f"OK: split de hojas y creación de raíz nueva anduvieron, altura final = {tree.height}")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -91,7 +91,7 @@ def test_range_search():
     assert claves_encontradas == list(range(100, 121))
     print("OK: range_search devuelve las claves en orden, cruzando varias hojas")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -103,7 +103,7 @@ def test_persistencia():
         tree.insert(key, f"valor{key}")
 
     altura_previa = tree.height
-    tree.file.close()
+    tree.buffer_manager.close()
 
     # reabrimos el mismo archivo de índice desde cero, sin la
     # instancia vieja -- si algo dependiera de estado en RAM no
@@ -114,7 +114,7 @@ def test_persistencia():
 
     print("OK: la raíz y la altura se recuperan bien tras cerrar y reabrir el índice")
 
-    tree2.file.close()
+    tree2.buffer_manager.close()
     limpiar()
 
 
@@ -134,7 +134,7 @@ def test_delete_simple():
 
     print("OK: delete simple, sin forzar rebalanceo")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -170,7 +170,7 @@ def test_delete_forzando_rebalanceo():
 
     print(f"OK: {len(a_borrar)} deletes con rebalanceo, altura antes={altura_antes}, despues={tree.height}")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -202,7 +202,7 @@ def test_delete_hasta_colapsar_raiz():
 
     print("OK: la raiz colapsa de vuelta a una hoja cuando se borra casi todo")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 

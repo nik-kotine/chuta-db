@@ -29,6 +29,6 @@ class BPlusTreeUnclustered(BPlusTreeBase):
         return self.heap_file.remove(ref)
 
     def close(self):
-        self.file.close()
+        self.buffer_manager.close()
         # el HeapFile no se cierra acá: puede estar compartido con
         # otros índices, lo cierra quien lo creó

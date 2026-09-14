@@ -23,7 +23,7 @@ class BPlusTreeClustered(BPlusTreeBase):
     # clave (por eso "agrupado", orden del índice = orden del dato).
 
     def __init__(self, index_filename: str, data_filename: str, page_size: int, record_format: str, buffer_frames: int = 50):
-        super().__init__(index_filename)
+        super().__init__(index_filename, buffer_frames)
 
         # el archivo de datos necesita su propio header + página de
         # overflow antes de abrirlo con FileManager, igual que hace
@@ -98,4 +98,4 @@ class BPlusTreeClustered(BPlusTreeBase):
 
     def close(self):
         self.sequential_file.buffer_manager.close()
-        self.file.close()
+        self.buffer_manager.close()

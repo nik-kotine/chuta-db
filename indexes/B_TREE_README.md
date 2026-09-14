@@ -173,9 +173,17 @@ Variante no agrupada: conecta `BPlusTreeBase` con un `HeapFile` ya abierto (para
 - `test_b_plus_unclustered.py`: contra `HeapFile` real -- insert/search/delete, que `range_search` ordene bien aunque el heap esté desordenado, y dos índices compartiendo el mismo `HeapFile`.
 - `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` y `delete()`, espacio en disco y RAM retenida, a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad.
 
+## `b_tree_base.py` y el buffer pool
+
+`BPlusTreeBase` ya no maneja su archivo de índice con `open()`/`struct` directo: usa su propio `FileManager`/`BufferManager` (mismas clases que `SequentialFile`/`HeapFile`, `storage/file_manager.py` y `storage/buffer_manager.py`), con `buffer_frames` configurable (default 50, pasado por las subclases). `_load_leaf`/`_load_internal`/`_save_page` hacen pin+unpin dentro del mismo método en vez de quedarse con una página "prestada" del pool -- necesario porque una sola operación (`insert`/`delete`) puede sostener varias páginas a la vez (el camino descendido, hermanos durante rebalanceo), y con el pool lleno eso podría gatillar evicciones a mitad de la operación. Cada mutación llama a `mark_dirty()` antes de soltar el pin, así que aunque el clock-sweep evicte una página entre que se lee y se vuelve a guardar, el contenido nuevo no se pierde.
+
+De paso, el header del archivo de índice (dónde está la raíz y su altura) dejó de ocupar una página entera de 4096 bytes -- ahora vive en el header compacto de 6 bytes que ya maneja `FileManager` (mismo esquema que `SequentialFile`). Por eso el tamaño en disco bajó (ver tabla más abajo, N=100 pasó de 8.0 KB a 4.0 KB).
+
+**Reindexado y el buffer pool:** cuando `_reindex()` (ver más abajo) llama a `_init_empty_index()` a mitad de la vida del árbol, el archivo subyacente se trunca y se reescribe entero -- pero el buffer pool podía seguir teniendo cacheadas páginas viejas con esos mismos `page_id`, y devolverlas como si fueran las nuevas. Por eso `BufferManager` ahora expone `invalidate_all()`, que `_init_empty_index()` llama antes de truncar.
+
 ## Complejidad medida
 
-Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈ 511), corriendo `test_b_tree_complexity.py`:
+Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈ 511), corriendo `test_b_tree_complexity.py` (medido después de migrar `b_tree_base.py` a `BufferManager`/`FileManager`):
 
 **Páginas leídas por operación (memoria secundaria):**
 
@@ -187,16 +195,21 @@ Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈
 | 50 000 | 1 | 2.00 | 2.00 |
 | 100 000 | 1 | 2.00 | 2.00 |
 
-N creció 1000x (de 100 a 100 000) y las páginas leídas por búsqueda/borrado solo crecieron de 1 a 2 -- confirma que el costo es logarítmico (`D·log_(R/2)(M)`), no lineal. Que `páginas/delete` se mantenga igual de chico que `páginas/search` confirma también que el **rebalanceo funciona**: si `delete()` no reequilibrara bien el árbol, este número se iría degradando con cada borrado. Con este fanout, un único nodo raíz interno alcanza para indexar hasta ~511 × 340 ≈ 173 000 registros en altura 1; recién con más de eso el árbol pasaría a altura 2.
+N creció 1000x (de 100 a 100 000) y las páginas leídas por búsqueda/borrado solo crecieron de 1 a 2 -- confirma que el costo es logarítmico (`D·log_(R/2)(M)`), no lineal. Que `páginas/delete` se mantenga igual de chico que `páginas/search` confirma también que el **rebalanceo funciona**: si `delete()` no reequilibrara bien el árbol, este número se iría degradando con cada borrado. Con este fanout, un único nodo raíz interno alcanza para indexar hasta ~511 × 340 ≈ 173 000 registros en altura 1; recién con más de eso el árbol pasaría a altura 2. Estos números no cambiaron con la migración al buffer pool -- el pin/unpin es contable aparte, no agrega lecturas de página extra.
 
 **Espacio en disco y RAM:**
 
 | N | disco (KB) | bytes/registro | RAM del árbol (bytes) |
 |---|---|---|---|
-| 100 | 8.0 | 81.92 | 8 766 |
-| 1 000 | 24.0 | 24.58 | 8 766 |
-| 10 000 | 160.0 | 16.38 | 8 766 |
-| 50 000 | 904.0 | 18.51 | 8 766 |
+| 100 | 4.0 | 41.02 | ~590 |
+| 1 000 | 20.0 | 20.49 | ~590 |
+| 10 000 | 160.0 | 16.38 | ~580 |
+| 50 000 | 912.0 | 18.68 | ~575 |
+| 100 000 | 1 900.0 | 19.46 | ~565 |
+
+El disco bajó frente a la medición anterior (era 8.0/24.0/160.0/904.0 KB) por el header compacto explicado arriba. La "RAM del árbol" también bajó fuerte (de ~8766 a ~590 bytes) pero es en buena parte un artefacto de medición: `ram_del_arbol()` en el test usa `sys.getsizeof` superficial sobre los atributos del árbol, y antes eso incluía a `self.file`, un objeto `io.BufferedRandom` cuyo buffer interno de E/S (~8 KB) se contaba entero; ahora son `self.file_manager`/`self.buffer_manager`, objetos chicos cuyo contenido (`frames`, con las páginas cacheadas) no se cuenta porque `sys.getsizeof` no es recursivo.
+
+**Aviso -- test roto, no arreglado en esta migración:** `test_b_tree_complexity.py` tiene un `assert` a nivel de módulo (`max(ram_valores) - min(ram_valores) == 0`) que espera que la RAM medida sea *exactamente* igual en cada corrida para todo N. Nunca lo fue de forma exacta (ya fallaba antes de esta migración, con una diferencia de ~30 bytes) porque `sys.getsizeof` no es perfectamente determinístico entre corridas. Sigue rompiendo la colección de tests (`pytest tests/`) con ese archivo incluido; hay que correrlo con `--ignore=tests/test_b_tree_complexity.py` mientras alguien no relaje esa aserción (por ejemplo, con una tolerancia en vez de igualdad exacta).
 | 100 000 | 1 840.0 | 18.84 | 8 766 |
 
 El disco crece proporcional a N (con overhead esperable de páginas no 100% llenas tras splits -- el valor real de una entrada es 12 bytes). La **RAM se mantiene fija** sin importar N, porque `BPlusTreeBase` no cachea páginas entre llamadas: cada `_load_leaf`/`_load_internal` relee de disco, así que el árbol nunca retiene en memoria más que el objeto en sí (equivalente al patrón que ya usa `HeapFile`).

@@ -94,7 +94,7 @@ def medir(n):
         tree.delete(key)
     loads_por_delete = tree.page_loads / len(muestra)
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
     return {
