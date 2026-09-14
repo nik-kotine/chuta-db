@@ -4,7 +4,7 @@ import tempfile
 
 from FileManager import FileManager
 from BufferManager import BufferManager
-from VariableSequentialFile import VariableSequentialFile
+from VariableSeqFile_aftercommit import VariableSequentialFile
 
 
 PAGE_SIZE = 128
@@ -117,7 +117,7 @@ def primary_page_keys(seq):
             page_keys = []
 
             for slot_id in range(page.size):
-                record = page.get_by_slot_id(slot_id)
+                record = page.get_record_by_slot_id(slot_id)
 
                 if not record.deleted:
                     page_keys.append(record.params[0])
@@ -335,7 +335,28 @@ def test_insert_between_records():
 
     finally:
         close_sequential(filename, fm, bm)
+"""
+def test_duplicate_keys():
+    filename, fm, bm, seq = create_sequential()
 
+    try:
+        seq.insert((20, "a"))
+        seq.insert((20, "b"))
+        seq.insert((20, "c"))
+
+        records = logical_records(seq)
+
+        print("logical records:")
+        for r in records:
+            print(r.params, "next =", r.next_rid)
+
+        print("logical keys:", logical_keys(seq))
+
+        assert logical_keys(seq) == [20, 20, 20]
+        assert [r.params[1] for r in records] == ["a", "b", "c"]
+    finally:
+        pass
+"""
 
 def test_duplicate_keys():
     filename, fm, bm, seq = create_sequential()
@@ -348,7 +369,6 @@ def test_duplicate_keys():
         assert logical_keys(seq) == [20, 20, 20]
 
         results = seq.search(20)
-
         assert len(results) == 3
         assert [r.params[1] for r in results] == [
             "a", "b", "c"
@@ -488,12 +508,15 @@ def test_delete_same_key_twice():
         seq.insert((10, "ten"))
         seq.insert((20, "twenty"))
         seq.insert((30, "thirty"))
+        seq.insert((40, "forty"))
 
         assert seq.delete(10) is True
         assert seq.delete(10) is False
-
+        assert seq.delete(30) is True
+        assert seq.delete(30) is False
         assert seq.n_records == 2
-        assert seq.n_deleted == 1
+
+        assert seq.n_deleted == 1 #debido al reorganize
 
     finally:
         close_sequential(filename, fm, bm)
@@ -633,7 +656,7 @@ def test_insert_after_overflow_reorganization():
         before = logical_keys(seq)
 
         # Fuerza explícitamente una reorganización.
-        seq.reorganize_variable()
+        seq.reorganize()
 
         after = logical_keys(seq)
 
@@ -662,7 +685,7 @@ def test_slot_points_to_correct_variable_record():
         page = seq._load_page(page_id)
 
         try:
-            record = page.get_by_slot_id(slot_id)
+            record = page.get_record_by_slot_id(slot_id)
 
             assert record.params == [10, "hello"]
             assert record.deleted is False
@@ -720,7 +743,7 @@ def test_reorganize_removes_deleted_records():
 
         expected = [1, 3, 5, 7, 9, 10]
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         assert logical_keys(seq) == expected
         assert seq.n_records == 6
@@ -740,7 +763,7 @@ def test_reorganize_clears_overflow():
         for key in range(1, 20):
             seq.insert((key, "x" * 20))
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         overflow = seq._load_page(0)
 
@@ -764,7 +787,7 @@ def test_reorganize_resets_first_rid():
         for key in [30, 10, 20]:
             seq.insert((key, f"value-{key}"))
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         assert seq.first_rid == (1, 0)
         assert logical_keys(seq) == [10, 20, 30]
@@ -783,7 +806,7 @@ def test_reorganize_primary_pages_sorted():
         for key in range(1, 40):
             seq.insert((key, "x" * (key % 10)))
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         pages = primary_page_keys(seq)
 
@@ -916,7 +939,7 @@ def test_reorganize_next_rids():
         for key in range(1, 30):
             seq.insert((key, "x" * (key % 20 + 1)))
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         current_rid = seq.first_rid
         expected_key = 1
@@ -1110,7 +1133,7 @@ def test_duplicate_order_survives_reorganization():
         for value in values:
             seq.insert(value)
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         assert [
             r.params[1]
@@ -1136,7 +1159,7 @@ def test_multiple_reorganizations():
         for i in range(0, 30, 2):
             seq.delete(i)
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         expected = list(range(1, 30, 2))
         assert logical_keys(seq) == expected
@@ -1146,7 +1169,7 @@ def test_multiple_reorganizations():
 
         assert logical_keys(seq) == list(range(1, 60, 2))
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         assert logical_keys(seq) == list(range(1, 60, 2))
 
@@ -1175,7 +1198,7 @@ def test_record_counters():
         assert seq.n_records == 7
         assert seq.n_deleted == 3
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         assert seq.n_records == 7
         assert seq.n_deleted == 0
@@ -1241,7 +1264,7 @@ def test_everything_together():
             80, 90, 100
         ]
 
-        seq.reorganize_variable()
+        seq.reorganize()
 
         assert logical_keys(seq) == [
             10, 30, 40, 50, 60,
