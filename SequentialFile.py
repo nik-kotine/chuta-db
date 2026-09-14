@@ -1,93 +1,118 @@
 import struct
+
 from BufferManager import BufferManager
+from RecordSerializer import (
+    DELETED_FORMAT,
+    DELETED_SIZE,
+    RID_FORMAT,
+    RID_SIZE,
+    SLOT_FORMAT,
+    SLOT_SIZE,
+    return_format,
+)
+from FixedLengthRecordSerializer import FixedLengthRecordSerializer
+from VariableLengthRecordSerializer import VariableLengthRecordSerializer
 
-"""
-rid: (page_id, slot_id)
-page_id representa en que pagina se encuentra (0+, 0 siendo overflow) y
-slot_id el numero de registro dentro de esa pagina. (-1, -1) es un registro
-nulo
-"""
-RID_FORMAT = "ii"
-RID_SIZE = struct.calcsize(RID_FORMAT)
+SLOT_ID_BITS = 16
 
-"""
-deleted: bool
-Representa si el registro fue marcado como eliminado
-"""
-DELETED_FORMAT = "?"
-DELETED_SIZE = struct.calcsize(DELETED_FORMAT)
-
-"""
-La cabecera del archivo contiene:
-    n_pages: cantidad de paginas principales
-    first_rid: RID del primer registro de la secuencia logica
-    n_records: cantidad de registros vivos
-    n_deleted: cantidad de registros marcados como eliminados
-"""
-FILE_HEADER_FORMAT = "iiii"
+FILE_HEADER_FORMAT = ">iiii"
 FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT)
 
-"""
-La cabecera de cada pagina contiene:
-    n_records: cantidad de registros almacenados fisicamente en la pagina
-"""
-PAGE_HEADER_FORMAT = "i"
-PAGE_HEADER_SIZE = struct.calcsize(PAGE_HEADER_FORMAT)
 WASTED_RATIO = 0.5
 
-
-class FixedLengthRecordSerializer:
-    
-    def __init__(self, record_format: str):
-        self.record_format = record_format
-        self.record_size = struct.calcsize(record_format)
-        self.slot_format = self.record_format + RID_FORMAT + DELETED_FORMAT
-        self.slot_size = struct.calcsize(self.slot_format)
-
-    def serialize(self, params) -> bytes:
-        """
-        Serializa los datos proporcionados por el usuario.
-        """
-        return struct.pack(self.record_format, *params)
-
-    def deserialize(self, data: bytes):
-        """
-        Deserializa los datos proporcionados por el usuario.
-        """
-        return struct.unpack(self.record_format, data)
-
-
 class Record:
-    
+
     def __init__(self, params, next_rid=None, deleted=False):
         self.params = params
         self.next_rid = next_rid
         self.deleted = deleted
 
+class Page:
+    """
+    Página de almacenamiento. Define la interfaz común que comparten
+    FixedPage y VariablePage.
+    """
 
-class FixedPage:
-    
-    def __init__(
-        self,
-        page_ba: bytearray,
-        page_size: int,
-        serializer: FixedLengthRecordSerializer,
-    ):
+    def __init__(self, page_ba: bytearray, page_size: int, serializer):
         self.page_ba = page_ba
         self.page_size = page_size
         self.serializer = serializer
-        self.max_records = (page_size - PAGE_HEADER_SIZE) // serializer.slot_size
+
+    @property
+    def n_records(self) -> int:
+        """
+        Cantidad de registros almacenados físicamente en la página.
+        """
+        raise NotImplementedError
+
+    def has_space(self, size=None) -> bool:
+        """
+        Indica si la página admite un registro (de tamaño `size`).
+        """
+        raise NotImplementedError
+
+    def get_record(self, slot_id: int) -> Record | None:
+        """
+        Retorna el registro ubicado en slot_id (None si no existe).
+        """
+        raise NotImplementedError
+
+    def set_record(self, slot_id: int, record: Record):
+        """
+        Sobreescribe completamente un slot existente.
+        """
+        raise NotImplementedError
+
+    def insert(self, record: Record) -> int:
+        """
+        Inserta un registro y retorna su slot_id (-1 si no hay espacio).
+        """
+        raise NotImplementedError
+
+    def delete_slot(self, slot_id: int) -> bool:
+        """
+        Marca un slot como eliminado.
+        """
+        raise NotImplementedError
+
+    def reset(self):
+        """
+        Deja la pagina vacía como si fuera recién creada.
+        """
+        raise NotImplementedError
+
+    def ensure_initialized(self) -> bool:
+        """
+        Inicializa la pagina si fue leída desde un area en cero de un archivo
+        nuevo. Retorna True si modificó el buffer (para marcarla dirty).
+        Las páginas de longitud fija nunca lo necesitan.
+        """
+        return False
+
+
+class FixedPage(Page):
+    """
+    Página de slots de tamaño fijo: la cabecera guarda cuántos registros hay
+    y los registros se acomodan a partir del byte del primer slot.
+    """
+    PAGE_HEADER_FORMAT = ">i"
+    PAGE_HEADER_SIZE = struct.calcsize(PAGE_HEADER_FORMAT)
+
+    def __init__(self, page_ba, page_size, serializer):
+        super().__init__(page_ba, page_size, serializer)
+        self.max_records = (page_size - self.PAGE_HEADER_SIZE) // \
+            serializer.slot_size
 
     @property
     def n_records(self) -> int:
         """
         Retorna la cantidad de registros actualmente almacenados.
         """
-        return struct.unpack_from(PAGE_HEADER_FORMAT, self.page_ba, 0)[0]
+        return struct.unpack_from(self.PAGE_HEADER_FORMAT, self.page_ba, 0)[0]
 
     @n_records.setter
     def n_records(self, value: int):
-        struct.pack_into(PAGE_HEADER_FORMAT, self.page_ba, 0, value)
+        struct.pack_into(self.PAGE_HEADER_FORMAT, self.page_ba, 0, value)
 
     @property
     def free_slots(self) -> int:
@@ -96,7 +121,7 @@ class FixedPage:
         """
         return self.max_records - self.n_records
 
-    def has_space(self) -> bool:
+    def has_space(self, size=None) -> bool:
         """
         Indica si la pagina tiene al menos un slot libre.
         """
@@ -108,10 +133,9 @@ class FixedPage:
         """
         if slot_id < 0 or slot_id >= self.max_records:
             raise RuntimeError("index out of range")
+        return self.PAGE_HEADER_SIZE + slot_id * self.serializer.slot_size
 
-        return PAGE_HEADER_SIZE + slot_id * self.serializer.slot_size
-
-    def get_record_by_slot_id(self, slot_id: int) -> Record | None:
+    def get_record(self, slot_id: int) -> Record | None:
         """
         Retorna el registro ubicado en slot_id.
         """
@@ -119,20 +143,23 @@ class FixedPage:
             return None
 
         offset = self._slot_offset(slot_id)
-        slot_data = struct.unpack_from(
-            self.serializer.slot_format, self.page_ba, offset
+        record_data = bytes(
+            self.page_ba[offset: offset + self.serializer.record_size]
         )
         
-        params = slot_data[:-3]
-        next_rid = slot_data[-3:-1]
-        deleted = slot_data[-1] 
+        offset += self.serializer.record_size
+        params = self.serializer.deserialize(record_data)
+        next_rid = struct.unpack_from(RID_FORMAT, self.page_ba, offset)
 
         if next_rid == (-1, -1):
             next_rid = None
+            
+        offset += RID_SIZE
+        deleted = struct.unpack_from(DELETED_FORMAT, self.page_ba, offset)[0]
 
         return Record(params, next_rid, deleted)
 
-    def set_record_in_slot_id(self, slot_id: int, record: Record):
+    def set_record(self, slot_id: int, record: Record):
         """
         Sobreescribe completamente un slot existente.
         """
@@ -141,28 +168,30 @@ class FixedPage:
 
         offset = self._slot_offset(slot_id)
         next_rid = record.next_rid
-        
+
         if next_rid is None:
             next_rid = (-1, -1)
-        
-        slot_data = record.params + next_rid + (record.deleted,)
-        
+
+        slot_data = self.serializer.pack_slot(
+            record.params, next_rid, record.deleted
+        )
+
         struct.pack_into(
             self.serializer.slot_format, self.page_ba, offset, *slot_data
         )
 
-    def overflow_insert(self, record: Record) -> int:
+    def insert(self, record: Record) -> int:
         """
-        Inserta un registro en el primer slot libre y retorna su slot_id,
-        como se haria en un heap file. Se usa exclusivamente para el
-        overflow page.
+        Inserta un registro en el primer slot libre y retorna su slot_id
+        (antes overflow_insert, por conveniencia la renombro a la interfaz
+        comun)
         """
         if not self.has_space():
             return -1
 
         slot_id = self.n_records
         self.n_records += 1
-        self.set_record_in_slot_id(slot_id, record)
+        self.set_record(slot_id, record)
 
         return slot_id
 
@@ -170,32 +199,223 @@ class FixedPage:
         """
         Marca un registro como eliminado (si es que no fue eliminado ya).
         """
-        record = self.get_record_by_slot_id(slot_id)
+        record = self.get_record(slot_id)
 
         if record is None or record.deleted:
             return False
 
         record.deleted = True
-        self.set_record_in_slot_id(slot_id, record)
+        self.set_record(slot_id, record)
 
         return True
 
+    def reset(self):
+        """
+        Deja la página vacía como si fuera recién creada.
+        """
+        self.n_records = 0
+
+
+class VariablePage(Page):
+    """
+    Página con registros de longitud variable.
+    """
+
+    PAGE_HEADER_FORMAT = ">ii"
+    PAGE_HEADER_SIZE = struct.calcsize(PAGE_HEADER_FORMAT)
+
+    @property
+    def offset(self) -> int:
+        return struct.unpack_from(">i", self.page_ba, 0)[0]
+
+    @offset.setter
+    def offset(self, offset: int):
+        struct.pack_into(">i", self.page_ba, 0, offset)
+
+    @property
+    def size(self) -> int:
+        return struct.unpack_from(">i", self.page_ba, 4)[0]
+
+    @size.setter
+    def size(self, size: int):
+        struct.pack_into(">i", self.page_ba, 4, size)
+
+    @property
+    def n_records(self) -> int:
+        return self.size
+
+    def has_space(self, size) -> bool:
+        return self.offset - (self.PAGE_HEADER_SIZE + self.size * SLOT_SIZE) \
+            >= size + SLOT_SIZE
+
+    def _slot_offset(self, slot_id: int) -> int:
+        if slot_id < 0 or slot_id >= self.size:
+            raise RuntimeError("index out of range")
+        return self.PAGE_HEADER_SIZE + slot_id * SLOT_SIZE
+
+    def get_record(self, slot_id: int) -> Record | None:
+        if slot_id < 0 or slot_id >= self.size:
+            return None
+
+        slot_offset = self._slot_offset(slot_id)
+        offset, size = struct.unpack_from(
+            SLOT_FORMAT, self.page_ba, slot_offset
+        )
+
+        record_byte_len = size - RID_SIZE - DELETED_SIZE
+        record_data = bytes(self.page_ba[offset: offset + record_byte_len])
+        params = self.serializer.deserialize(record_data)
+
+        next_rid = struct.unpack_from(
+            RID_FORMAT, self.page_ba, offset + record_byte_len
+        )
+
+        if next_rid == (-1, -1):
+            next_rid = None
+
+        deleted = struct.unpack_from(
+            DELETED_FORMAT, self.page_ba, offset + record_byte_len + RID_SIZE
+        )[0]
+
+        return Record(params, next_rid, deleted)
+
+    def set_record(self, slot_id: int, record: Record):
+        """
+        Sobreescribe un slot. Solo válido si el nuevo registro ocupa el mismo
+        tamaño que el almacenado (los registros nunca se compactan en sitio).
+        """
+        if slot_id < 0 or slot_id >= self.size:
+            raise RuntimeError("index out of range")
+
+        slot_offset = self._slot_offset(slot_id)
+        offset, size = struct.unpack_from(
+            SLOT_FORMAT, self.page_ba, slot_offset
+        )
+
+        record_bytes = self.serializer.serialize(record.params)
+
+        if len(record_bytes) != size - RID_SIZE - DELETED_SIZE:
+            raise RuntimeError("record size does not match the stored size")
+
+        self.page_ba[offset: offset + len(record_bytes)] = record_bytes
+
+        next_rid = record.next_rid
+        if next_rid is None:
+            next_rid = (-1, -1)
+
+        struct.pack_into(
+            RID_FORMAT, self.page_ba, offset + len(record_bytes), *next_rid
+        )
+        struct.pack_into(
+            DELETED_FORMAT,
+            self.page_ba,
+            offset + len(record_bytes) + RID_SIZE, record.deleted
+        )
+
+    def insert(self, record: Record) -> int:
+        """
+        Inserta un registro en el primer slot libre al final de la pagina.
+        """
+        record_bytes = self.serializer.serialize(record.params)
+        record_size = len(record_bytes) + RID_SIZE + DELETED_SIZE
+
+        if not self.has_space(record_size):
+            return -1
+
+        slot_id = self.size
+        self.size += 1
+        self.offset -= record_size
+
+        struct.pack_into(
+            SLOT_FORMAT,
+            self.page_ba,
+            self.PAGE_HEADER_SIZE + slot_id * SLOT_SIZE,
+            self.offset,
+            record_size,
+        )
+
+        self.page_ba[
+            self.offset: self.offset + len(record_bytes)
+        ] = record_bytes
+
+        next_rid = record.next_rid
+        if next_rid is None:
+            next_rid = (-1, -1)
+
+        struct.pack_into(
+            RID_FORMAT, self.page_ba, self.offset + len(record_bytes), *next_rid
+        )
+        struct.pack_into(
+            DELETED_FORMAT,
+            self.page_ba,
+            self.offset + len(record_bytes) + RID_SIZE, record.deleted
+        )
+
+        return slot_id
+
+    def delete_slot(self, slot_id: int) -> bool:
+        record = self.get_record(slot_id)
+
+        if record is None or record.deleted:
+            return False
+
+        record.deleted = True
+        self.set_record(slot_id, record)
+
+        return True
+
+    def reset(self):
+        """
+        Deja la página vacía como si fuera recién creada.
+        """
+        self.size = 0
+        self.offset = self.page_size
+
+    def ensure_initialized(self) -> bool:
+        """
+        Una página recién asignada es un bloque de ceros (offset == 0).
+        En ese caso hay que inicializar el offset al final de la página.
+        """
+        if self.size == 0 and self.offset == 0:
+            self.offset = self.page_size
+            return True
+        return False
+
 class SequentialFile:
+    """
+    Archivo secuencial con orden por clave.
+    Ahora soporta fija y variable. La forma para elegir cual usar es por
+    el formato.
+    """
     def __init__(
-        self, buffer_manager: BufferManager, page_size: int, record_format: str
+        self,
+        buffer_manager: BufferManager,
+        page_size: int,
+        record_format: list[str],
     ):
         self.buffer_manager = buffer_manager
         self.file_manager = buffer_manager.file_manager
         self.page_size = page_size
         self.key_index = 0
-        self.serializer = FixedLengthRecordSerializer(record_format)
-        self.max_records_per_page = (
-            page_size - PAGE_HEADER_SIZE
-        ) // self.serializer.slot_size
+        
+        self.variable_length = False
+        for token in record_format:
+            if return_format(token)[1] == -1:
+                self.variable_length = True
+                break
+
+        if self.variable_length:
+            self.serializer = VariableLengthRecordSerializer(record_format)
+            self.page_class = VariablePage
+        else:
+            self.serializer = FixedLengthRecordSerializer(record_format)
+            self.page_class = FixedPage
+
         self.first_rid = None
         self.n_pages = 0
         self.n_records = 0
         self.n_deleted = 0
+
         header = self.file_manager.read_header()
         if len(header) == 0:
             return
@@ -203,16 +423,15 @@ class SequentialFile:
 
     def _load_header(self):
         """
-        Carga la metadata del SequentialFile desde el header del archivo.
+        Carga la metadata desde el header del archivo.
         """
         header = self.file_manager.read_header()
 
         if len(header) != FILE_HEADER_SIZE:
             raise RuntimeError("invalid or corrupt header file")
 
-        self.n_pages, first_rid, self.n_records, self.n_deleted = struct.unpack(
-            FILE_HEADER_FORMAT, header
-        )
+        self.n_pages, first_rid, self.n_records, self.n_deleted = \
+            struct.unpack(FILE_HEADER_FORMAT, header)
 
         if first_rid == -1:
             self.first_rid = None
@@ -221,12 +440,16 @@ class SequentialFile:
 
     def _write_header(self):
         """
-        Persiste la metadata del SequentialFile en el header del archivo.
+        Persiste la metadata en el header del archivo.
         """
         first_rid = self._rid_to_int(self.first_rid)
 
         header = struct.pack(
-            FILE_HEADER_FORMAT, self.n_pages, first_rid, self.n_records, self.n_deleted
+            FILE_HEADER_FORMAT,
+            self.n_pages,
+            first_rid,
+            self.n_records,
+            self.n_deleted
         )
 
         self.file_manager.write_header(header)
@@ -239,7 +462,7 @@ class SequentialFile:
             return -1
 
         phys_page_id, slot_id = rid
-        return phys_page_id * self.max_records_per_page + slot_id
+        return (phys_page_id << SLOT_ID_BITS) | slot_id
 
     def _int_to_rid(self, value):
         """
@@ -248,7 +471,7 @@ class SequentialFile:
         if value == -1:
             return None
 
-        return (value // self.max_records_per_page, value % self.max_records_per_page)
+        return value >> SLOT_ID_BITS, value % (1 << SLOT_ID_BITS)
 
     def _make_rid(self, phys_page_id: int, slot_id: int):
         """
@@ -256,14 +479,14 @@ class SequentialFile:
         """
         return phys_page_id, slot_id
 
-    def _load_page(self, phys_page_id: int) -> FixedPage:
+    def _load_page(self, phys_page_id: int) -> Page:
         """
-        Obtiene una pagina del BufferManager y crea una interfaz
-        FixedPage sobre el bytearray almacenado en el frame.
+        Obtiene una pagina del BufferManager y crea la interfaz de página
+        concreta sobre el bytearray almacenado en el frame.
         """
         page_ba = self.buffer_manager.fetch_page(phys_page_id)
 
-        return FixedPage(page_ba, self.page_size, self.serializer)
+        return self.page_class(page_ba, self.page_size, self.serializer)
 
     def _get_record(self, rid):
         """
@@ -276,7 +499,7 @@ class SequentialFile:
         page = self._load_page(phys_page_id)
 
         try:
-            return page.get_record_by_slot_id(slot_id)
+            return page.get_record(slot_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
 
@@ -288,7 +511,7 @@ class SequentialFile:
         page = self._load_page(phys_page_id)
 
         try:
-            page.set_record_in_slot_id(slot_id, record)
+            page.set_record(slot_id, record)
             self.buffer_manager.mark_dirty(phys_page_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
@@ -302,10 +525,9 @@ class SequentialFile:
 
         try:
             for slot_id in range(page.n_records):
-                record = page.get_record_by_slot_id(slot_id)
+                record = page.get_record(slot_id)
                 if not record.deleted:
                     return slot_id, record
-
             return None
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
@@ -319,10 +541,9 @@ class SequentialFile:
 
         try:
             for slot_id in range(page.n_records - 1, -1, -1):
-                record = page.get_record_by_slot_id(slot_id)
+                record = page.get_record(slot_id)
                 if not record.deleted:
                     return slot_id, record
-
             return None
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
@@ -341,14 +562,11 @@ class SequentialFile:
 
         return None, None
 
-    def _last_page_lt(self, key):
+    def _last_page_lt(self, key, duplicates_after: bool):
         """
-        Busca mediante busqueda binaria (O(log n_pages) lecturas de pagina) la
-        ultima pagina principal cuyo primer registro (slot 0) tiene clave <
-        key. Las paginas estan ordenadas por clave, asi que el primer registro
-        vivo con clave >= key esta dentro de esa pagina (si llega a contenerla)
-        o en la pagina siguiente.
-        Retorna 0 si ninguna pagina principal empieza con clave < key.
+        Busca mediante busqueda binaria la ultima pagina principal cuyo primer
+        registro (slot 0) tiene clave < key. Si duplicates_after es
+        True, entonces tambien incluye clave == key.
         """
         if self.n_pages == 0:
             return 0
@@ -361,10 +579,18 @@ class SequentialFile:
             page = self._load_page(mid)
 
             try:
-                first = page.get_record_by_slot_id(0)
+                first = page.get_record(0)
 
-                # una pagina vacia se trata como si su clave fuera +infinito
-                if first is not None and first.params[self.key_index] < key:
+                if (
+                    first is not None
+                    and (
+                        first.params[self.key_index] < key
+                        or (
+                            duplicates_after
+                            and first.params[self.key_index] == key
+                        )
+                    )
+                ):
                     result = mid
                     low = mid + 1
                 else:
@@ -374,18 +600,18 @@ class SequentialFile:
 
         return result
 
-    def _main_neighbors(self, key):
+    def _main_neighbors(self, key, duplicates_after: bool):
         """
         Vecinos de key considerando solo los registros vivos de las paginas
-        principales (1..n_pages). Como su orden fisico coincide con el de la
-        cadena, basta ubicar con busqueda binaria la pagina de la frontera y
-        revisarla a ella y, como mucho, a paginas adyacentes.
+        principales con busqueda binaria. Basta acceder a la pagina anterior y
+        posterior en casos extremos.
         Retorna (rid_anterior, clave_anterior, rid_siguiente, clave_siguiente).
+        Se garantizan paginas no vacias, asi que es tiempo logaritmico.
         """
         if self.n_pages == 0:
             return None, None, None, None
 
-        hi = self._last_page_lt(key)
+        hi = self._last_page_lt(key, duplicates_after=duplicates_after)
         next_rid, next_key = None, None
         next_page, next_slot = None, None
 
@@ -394,10 +620,14 @@ class SequentialFile:
 
             try:
                 for slot_id in range(page.n_records):
-                    record = page.get_record_by_slot_id(slot_id)
+                    record = page.get_record(slot_id)
                     if record.deleted:
                         continue
-                    if record.params[self.key_index] >= key:
+                    
+                    if record.params[self.key_index] > key or (
+                        (not duplicates_after)
+                        and record.params[self.key_index] == key
+                    ):
                         next_rid = self._make_rid(hi, slot_id)
                         next_key = record.params[self.key_index]
                         next_page, next_slot = hi, slot_id
@@ -426,7 +656,7 @@ class SequentialFile:
 
                 try:
                     for slot_id in range(next_slot - 1, -1, -1):
-                        record = page.get_record_by_slot_id(slot_id)
+                        record = page.get_record(slot_id)
                         if not record.deleted:
                             prev_rid = self._make_rid(next_page, slot_id)
                             prev_key = record.params[self.key_index]
@@ -450,12 +680,10 @@ class SequentialFile:
 
         return prev_rid, prev_key, next_rid, next_key
 
-    def _overflow_neighbors(self, key):
+    def _overflow_neighbors(self, key, duplicates_after: bool):
         """
         Vecinos de key considerando solo los registros vivos de la pagina de
-        overflow (pagina 0). Su orden fisico es el de insercion (no el de la
-        cadena), por lo que se recorre completa; a lo sumo hay
-        max_records_per_page registros.
+        overflow en tiempo lineal.
         Retorna (rid_anterior, clave_anterior, rid_siguiente, clave_siguiente).
         """
         page = self._load_page(0)
@@ -465,46 +693,54 @@ class SequentialFile:
             next_rid, next_key = None, None
 
             for slot_id in range(page.n_records):
-                record = page.get_record_by_slot_id(slot_id)
+                record = page.get_record(slot_id)
                 if record.deleted:
                     continue
 
                 current_key = record.params[self.key_index]
                 rid = self._make_rid(0, slot_id)
 
-                if current_key < key:
-                    if prev_key is None or current_key > prev_key:
-                        prev_rid, prev_key = rid, current_key
-
+                if duplicates_after:
+                    if current_key <= key:
+                        if prev_key is None or current_key >= prev_key:
+                            prev_rid, prev_key = rid, current_key
+                    else:
+                        if next_key is None or current_key < next_key:
+                            next_rid, next_key = rid, current_key
                 else:
-                    if next_key is None or current_key < next_key:
-                        next_rid, next_key = rid, current_key
-                    elif current_key == next_key:
-                        next_rid, next_key = rid, current_key
+                    if current_key < key:
+                        if prev_key is None or current_key > prev_key:
+                            prev_rid, prev_key = rid, current_key
+                    else:
+                        if next_key is None or current_key < next_key:
+                            next_rid, next_key = rid, current_key
 
             return prev_rid, prev_key, next_rid, next_key
         finally:
             self.buffer_manager.unpin_page(0)
 
-    def _find_neighbors(self, key):
+    def _find_neighbors(self, key, duplicates_after: bool):
         """
         Busca los registros inmediatamente anterior y posterior a una clave
-        combinando las paginas principales (ordenadas) con la pagina de
-        overflow. Retorna (previous_rid, next_rid).
+        combinando las paginas principales con la pagina de overflow.
+        Retorna (previous_rid, next_rid).
+        En caso de empate de claves entre paginas principales y overflow, para
+        next gana main y para previous ganan los registros de overflow (los
+        duplicados mas nuevos siempre estan en overflow).
         """
         if self.first_rid is None:
             return None, None
 
         main_prev_rid, main_prev_key, main_next_rid, main_next_key = (
-            self._main_neighbors(key)
+            self._main_neighbors(key, duplicates_after=duplicates_after)
         )
         ov_prev_rid, ov_prev_key, ov_next_rid, ov_next_key = (
-            self._overflow_neighbors(key)
+            self._overflow_neighbors(key, duplicates_after=duplicates_after)
         )
 
         if (
             ov_next_rid is not None
-            and (main_next_rid is None or ov_next_key <= main_next_key)
+            and (main_next_rid is None or ov_next_key < main_next_key)
         ):
             next_rid = ov_next_rid
         else:
@@ -512,7 +748,7 @@ class SequentialFile:
 
         if (
             main_prev_rid is not None
-            and (ov_prev_rid is None or main_prev_key >= ov_prev_key)
+            and (ov_prev_rid is None or main_prev_key > ov_prev_key)
         ):
             prev_rid = main_prev_rid
         else:
@@ -529,32 +765,38 @@ class SequentialFile:
         page = self._load_page(phys_page_id)
 
         try:
-            page.n_records = 0
+            page.reset()
             self.buffer_manager.mark_dirty(phys_page_id)
         finally:
             self.buffer_manager.unpin_page(phys_page_id)
 
         return phys_page_id
 
-    def _insert_into_overflow(self, record: Record) -> tuple:
+    def _insert_into_overflow(self, record: Record) -> tuple | None:
         """
-        Inserta un registro en la pagina de overflow y retorna su rid.
+        Inserta un registro en la pagina de overflow y retorna su rid, o None
+        si la pagina de overflow esta llena.
         """
+        size = self.serializer.get_size_of(record.params)
         page = self._load_page(0)
 
         try:
-            if not page.has_space():
+            if page.ensure_initialized():
+                self.buffer_manager.mark_dirty(0)
+
+            if not page.has_space(size):
+                if page.n_records == 0:
+                    raise RuntimeError("record is too big for insertion")
                 return None
 
-            slot_id = page.overflow_insert(record)
+            slot_id = page.insert(record)
             self.buffer_manager.mark_dirty(0)
 
             return self._make_rid(0, slot_id)
-
         finally:
             self.buffer_manager.unpin_page(0)
-            
-    def _iter_records(self, start_rid = None):
+
+    def _iter_records(self, start_rid=None):
         """
         Recorre la secuencia logica desde start_rid y retorna cada RID junto
         con su registro.
@@ -572,19 +814,27 @@ class SequentialFile:
 
     def insert(self, params):
         """
-        Inserta un registro nuevo en overflow y actualiza la cadena
-        logica para conservar el orden por clave.
+        Inserta un registro nuevo en overflow y actualiza la cadena logica para
+        conservar el orden por clave. Los duplicados conservan el orden de
+        llegada.
         """
         record = Record(params)
+        size = self.serializer.get_size_of(record.params)
 
         if self.first_rid is None:
+            
             if self.n_pages == 0:
                 self._append_page()
 
             page = self._load_page(1)
 
             try:
-                rid = self._make_rid(1, page.overflow_insert(record))
+                if page.ensure_initialized():
+                    self.buffer_manager.mark_dirty(1)
+                if not page.has_space(size):
+                    raise RuntimeError("Record is too big for insertion")
+
+                rid = self._make_rid(1, page.insert(record))
                 self.first_rid = rid
                 self.n_records = 1
                 self.buffer_manager.mark_dirty(1)
@@ -594,7 +844,9 @@ class SequentialFile:
             self._write_header()
             return rid
 
-        previous_rid, next_rid = self._find_neighbors(params[self.key_index])
+        previous_rid, next_rid = self._find_neighbors(
+            params[self.key_index], duplicates_after=True
+        )
 
         record.next_rid = next_rid
 
@@ -621,13 +873,13 @@ class SequentialFile:
         Retorna todos los registros vivos cuya clave coincide con key.
         """
         results = []
-        _, current_rid = self._find_neighbors(key)
+        _, current_rid = self._find_neighbors(key, duplicates_after=False)
 
         for current_rid, record in self._iter_records(current_rid):
             current_key = record.params[self.key_index]
             if current_key > key:
                 break
-            
+
             if current_key == key and not record.deleted:
                 results.append(record)
 
@@ -637,13 +889,12 @@ class SequentialFile:
         """
         Marca como eliminados todos los registros vivos cuya clave coincide
         con key. Si tras el borrado alguna pagina principal se queda sin
-        registros vivos, llama a reorganize para conservar la invariante de
-        que toda pagina principal tiene al menos un registro vivo (o que el
-        archivo queda vacio).
+        registros vivos (o la proporcion de eliminados supera WASTED_RATIO),
+        reorganiza para conservar las invariantes del archivo.
         """
         deleted_any = False
         pages_touched = set()
-        _, current_rid = self._find_neighbors(key)
+        _, current_rid = self._find_neighbors(key, duplicates_after=False)
 
         for current_rid, record in self._iter_records(current_rid):
             current_key = record.params[self.key_index]
@@ -658,7 +909,7 @@ class SequentialFile:
                 self.n_deleted += 1
                 self.n_records -= 1
                 deleted_any = True
-                
+
         if deleted_any:
             page_emptied = any(
                 phys_page_id >= 1
@@ -675,10 +926,6 @@ class SequentialFile:
     def _wasted_space_ratio(self) -> float:
         """
         Calcula la proporcion de slots ocupados por registros eliminados.
-        Ahora es O(1) porque el header ya cuenta cuantos registros hay
-        vivos (n_records) y cuantos marcados como eliminados (n_deleted);
-        cada slot ocupado es de uno u otro tipo, asi que el total es la
-        suma de ambos.
         """
         total_slots = self.n_records + self.n_deleted
 
@@ -689,70 +936,77 @@ class SequentialFile:
 
     def reorganize(self):
         """
-        Reconstruye completamente el SequentialFile: conserva solo los
-        registros vivos, los acomoda ordenados en las paginas principales y
-        deja la pagina de overflow vacia.
+        Reconstruye completamente el archivo: conserva solo los registros
+        vivos, los acomoda ordenados en las paginas principales y deja la
+        pagina de overflow vacia.
         """
         records = [
             Record(record.params)
             for _, record in self._iter_records()
             if not record.deleted
         ]
-        n_records = len(records)
-        required_pages = max(
-            1,
-            (n_records + self.max_records_per_page - 1) //
-            self.max_records_per_page
-        )
 
-        while self.n_pages < required_pages:
-            self._append_page()
+        if len(records) == 0:
+            self.first_rid = None
+            self.n_records = 0
+            self.n_deleted = 0
+            self._truncate(0)
+            self._write_header()
+            return
 
-        if self.n_pages > required_pages:
-            self.buffer_manager.flush_all()
-            self.file_manager.truncate(
-                self.file_manager.file_header_size
-                + (required_pages + 1) * self.page_size
-            )
-            self.n_pages = required_pages
+        page = self._load_page(0)
+        try:
+            page.reset()
+            self.buffer_manager.mark_dirty(0)
+        finally:
+            self.buffer_manager.unpin_page(0)
 
-        for phys_page_id in range(0, self.n_pages + 1):
-            page = self._load_page(phys_page_id)
+        rids = []
+        pageindex = 1
+        page = None
 
-            try:
-                page.page_ba[:] = b"\x00" * self.page_size
-                page.n_records = 0
-                self.buffer_manager.mark_dirty(phys_page_id)
-            finally:
-                self.buffer_manager.unpin_page(phys_page_id)
+        for record in records:
+            record_size = self.serializer.get_size_of(record.params)
 
-        self.first_rid = None
+            if page is not None and not page.has_space(record_size):
+                self.buffer_manager.mark_dirty(pageindex)
+                self.buffer_manager.unpin_page(pageindex)
+                pageindex += 1
+                page = None
 
-        for index, record in enumerate(records):
-            phys_page_id = index // self.max_records_per_page + 1
-            slot_id = index % self.max_records_per_page
+            if page is None:
+                if self.n_pages < pageindex:
+                    self._append_page()
+                page = self._load_page(pageindex)
+                page.reset()
 
-            if index + 1 < n_records:
-                record.next_rid = self._make_rid(
-                    ((index + 1) // self.max_records_per_page) + 1,
-                    (index + 1) % self.max_records_per_page,
-                )
-            else:
-                record.next_rid = None
+                if not page.has_space(record_size):
+                    raise RuntimeError("Record is too big for insertion")
 
-            if slot_id == 0:
-                page = self._load_page(phys_page_id)
+            slot_id = page.insert(record)
+            rids.append(self._make_rid(pageindex, slot_id))
 
-            page.n_records += 1
-            page.set_record_in_slot_id(slot_id, record)
-            self.buffer_manager.mark_dirty(phys_page_id)
+        self.buffer_manager.mark_dirty(pageindex)
+        self.buffer_manager.unpin_page(pageindex)
 
-            if slot_id == self.max_records_per_page - 1 or index + 1 == n_records:
-                self.buffer_manager.unpin_page(phys_page_id)
+        self.first_rid = rids[0]
+        for index in range(len(rids) - 1):
+            record = self._get_record(rids[index])
+            record.next_rid = rids[index + 1]
+            self._set_record(rids[index], record)
 
-            if index == 0:
-                self.first_rid = self._make_rid(phys_page_id, slot_id)
-
-        self.n_records = n_records
+        self.n_pages = pageindex
+        self.n_records = len(rids)
         self.n_deleted = 0
+        self._truncate(pageindex)
         self._write_header()
+
+    def _truncate(self, n_main_pages: int):
+        """
+        Deja el archivo con la pagina de overflow y n_main_pages paginas
+        principales.
+        """
+        self.buffer_manager.flush_all()
+        self.file_manager.truncate(
+            self.file_manager.file_header_size + (n_main_pages + 1) * self.page_size
+        )
