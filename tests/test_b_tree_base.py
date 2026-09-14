@@ -1,7 +1,7 @@
 import os
 
-from b_tree_base import BPlusTreeBase
-from b_tree_leaf_page import RID
+from indexes.b_tree_base import BPlusTreeBase
+from indexes.b_tree_leaf_page import RID
 
 TEST_INDEX_FILE = "test_index.bin"
 

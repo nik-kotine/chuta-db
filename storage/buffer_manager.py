@@ -1,4 +1,4 @@
-from FileManager import FileManager
+from storage.file_manager import FileManager
 
 """
 Cada frame alberga exactamente una pagina.

@@ -2,9 +2,9 @@ import os
 import struct
 import tempfile
 
-from FileManager import FileManager
-from BufferManager import BufferManager
-from SequentialFile import SequentialFile
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
+from storage.files.sequential_file import SequentialFile
 
 
 PAGE_SIZE = 64

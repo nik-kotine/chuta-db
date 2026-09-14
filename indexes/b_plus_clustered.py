@@ -1,11 +1,11 @@
 import os
 import struct
 
-from b_tree_base import BPlusTreeBase
-from b_tree_leaf_page import RID
-from FileManager import FileManager
-from BufferManager import BufferManager
-from SequentialFile import SequentialFile, FILE_HEADER_FORMAT, FILE_HEADER_SIZE
+from indexes.b_tree_base import BPlusTreeBase
+from indexes.b_tree_leaf_page import RID
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
+from storage.files.sequential_file import SequentialFile, FILE_HEADER_FORMAT, FILE_HEADER_SIZE
 
 
 # señal interna: se usa para cortar insert()/delete() a mitad de

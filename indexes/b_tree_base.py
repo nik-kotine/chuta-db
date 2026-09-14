@@ -1,8 +1,8 @@
 import struct
 import os
 
-from b_tree_leaf_page import PAGE_SIZE, NULL_LEAF, BTreeLeafPage
-from b_tree_internal_page import BTreeInternalPage
+from indexes.b_tree_leaf_page import PAGE_SIZE, NULL_LEAF, BTreeLeafPage
+from indexes.b_tree_internal_page import BTreeInternalPage
 
 # Página 0 del archivo de índice, guarda dónde está la raíz y su altura
 ROOT_HEADER_FORMAT = ">I?B"  # root_page_id, root_is_leaf, height

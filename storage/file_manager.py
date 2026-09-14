@@ -6,13 +6,17 @@ Definimos rid = phys_page_id * records_per_page + slot_id,
 con rid = -1 siendo NULL
 """
 
+import os
+
+
 class FileManager:
 
     def __init__(self, filename: str, page_size: int, file_header_size: int):
         self.filename: str              = filename
         self.page_size: int             = page_size
         self.file_header_size: int      = file_header_size
-        self.file_ptr                   = open(filename, "r+b")
+        is_new = not os.path.exists(filename)
+        self.file_ptr                   = open(filename, "w+b" if is_new else "r+b")
 
     def _calc_page_offset(self, phys_page_id: int) -> int:
         """Calcula el offset a partir del indice fisico de la pagina."""
@@ -59,6 +63,9 @@ class FileManager:
         """
         self.file_ptr.seek(0, 2)
         file_size = self.file_ptr.tell()
+        if file_size < self.file_header_size:
+            self.file_ptr.write(b"\x00" * (self.file_header_size - file_size))
+            file_size = self.file_header_size
         data_size = file_size - self.file_header_size
         page_id = data_size // self.page_size
         self.file_ptr.write(b"\x00" * self.page_size)

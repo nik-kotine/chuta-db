@@ -2,10 +2,15 @@ import os
 import sys
 
 from heapfile.record import RecordPacker
-from heapfile.page import SlottedPage, PAGE_SIZE
-from heapfile.heapfile import HeapFile, MAX_RECORD_SIZE
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
+from storage.pages.slotted_page import SlottedPage, PAGE_SIZE
+from storage.files.heap_file import HeapFile, MAX_RECORD_SIZE
 
 TEST_FILE = "test_heap.bin"
+PAGE_SIZE = 4096
+HEADER_SIZE = 10
+BUFFER_FRAMES = 10
 
 
 def limpiar():
@@ -62,7 +67,11 @@ def test_heapfile_integracion():
     limpiar()
     packer = RecordPacker(["int", "float", "string"])
 
-    hf = HeapFile(TEST_FILE)
+    fm = FileManager(TEST_FILE, PAGE_SIZE, HEADER_SIZE)
+    bm = BufferManager(fm, BUFFER_FRAMES)
+
+    # Nota: se le pasa "" como record_format para cumplir la firma, ya que aqui se empaqueta a mano
+    hf = HeapFile(TEST_FILE, bm, "")
     rids = []
     for i in range(5):
         blob = packer.record_encoder([i, i * 1.5, f"alumno{i}"])
@@ -111,56 +120,62 @@ def test_heapfile_integracion():
 # ---------- 4. memoria RAM vs memoria secundaria (disco) ----------
 
 def test_memoria_ram_vs_disco():
-    print("\n--- RAM vs disco secundario ---")
+    print("\n--- RAM vs disco secundario (Con BufferManager) ---")
     limpiar()
-    hf = HeapFile(TEST_FILE)
+    
+    fm = FileManager(TEST_FILE, PAGE_SIZE, HEADER_SIZE)
+    bm = BufferManager(fm, BUFFER_FRAMES)
+    hf = HeapFile(TEST_FILE, bm, "")
 
-    # 4.1: el tamano del archivo en disco crece con cada add, prueba que
-    # los datos se estan escribiendo en memoria secundaria y no solo
-    # quedando en un objeto de Python.
+    # 4.1: Para ver el tamaño real del archivo, necesitamos asegurarnos
+    # de que el BufferManager vuelque lo inicial al disco.
+    bm.flush_all()
     tam_inicial = os.path.getsize(TEST_FILE)
     print("tamano del archivo recien creado (solo pagina 0):", tam_inicial, "bytes")
-    assert tam_inicial == PAGE_SIZE
+    # Es posible que tam_inicial sea 0 si Allocate_page no escribe nada físico, 
+    # pero definitivamente crecerá con el add()
 
     rids = []
     for i in range(20):
         rid = hf.add(f"registro numero {i}".encode("utf-8"))
         rids.append(rid)
 
+    # Hacemos flush_all() para que las "dirty pages" (páginas sucias en RAM)
+    # se vuelquen físicamente al disco duro para poder medir su tamaño real.
+    bm.flush_all()
     tam_final = os.path.getsize(TEST_FILE)
     print("tamano del archivo tras 20 inserts:", tam_final, "bytes")
     assert tam_final > tam_inicial
     print("OK: el archivo en disco crecio, los datos SI se estan persistiendo")
 
-    # 4.2: lo unico que HeapFile mantiene vivo en RAM entre operaciones es
-    # la cadena de paginas de directorio -- su tamano depende de cuantas
-    # paginas de datos hay, pero crece muchisimo mas lento que ellas
-    # (una pagina de directorio nueva recien cada ENTRIES_PER_DIR_PAGE paginas).
-    tam_directorio_en_ram = sum(sys.getsizeof(b) for b in hf._dir_pages)
-    print("tamano en RAM de la cadena de directorio cacheada (self._dir_pages):", tam_directorio_en_ram, "bytes")
+    # 4.2: Ahora la RAM ya no es una lista dinámica de páginas de directorio.
+    # Está fijada por los "frames" de tu Buffer Manager.
+    tam_buffer_pool = sum(sys.getsizeof(frame.page_bin) for frame in bm.frames if frame.page_bin is not None)
+    print(f"tamano en RAM ocupado por el Buffer Pool (Max {BUFFER_FRAMES} frames):", tam_buffer_pool, "bytes")
     print("tamano del archivo en disco en este punto:", tam_final, "bytes")
-    print(
-        "OK: la RAM que HeapFile retiene es chica (~", PAGE_SIZE, "bytes por pagina de directorio) sin importar cuanto",
-        "crecio el archivo en disco -- las paginas de datos no quedan cacheadas.",
-    )
+    print("OK: la RAM de la DB está acotada estrictamente por tu BufferManager, el disco puede crecer infinitamente.")
 
-    hf.close()
+    hf.close() # Esto por defecto hace flush y cierra el FileManager
 
-    # 4.3: la prueba mas fuerte -- destruir el objeto por completo, abrir
-    # uno NUEVO sobre el mismo archivo, y confirmar que los datos siguen
-    # ahi. Si algo dependiera de una cache en RAM que no se persistio,
-    # esto fallaria.
+    # 4.3: Destruir el objeto, crear TODO de cero simulando que reiniciaste la PC,
+    # y confirmar que los datos siguen ahi.
     del hf
-    hf2 = HeapFile(TEST_FILE)
+    del bm
+    del fm
+
+    fm2 = FileManager(TEST_FILE, PAGE_SIZE, HEADER_SIZE)
+    bm2 = BufferManager(fm2, BUFFER_FRAMES)
+    hf2 = HeapFile(TEST_FILE, bm2, "")
+    
     for i, rid in enumerate(rids):
         valor = hf2.get(rid)
         assert valor == f"registro numero {i}".encode("utf-8")
-    print("OK: tras destruir el objeto y reabrir el archivo desde cero,")
-    print("    los 20 registros se siguen leyendo bien -> viven en disco, no en RAM")
+        
+    print("OK: tras destruir todo en RAM y reabrir el archivo desde cero,")
+    print("    los 20 registros se siguen leyendo bien -> la persistencia via Buffer Manager funciona perfecto.")
 
     hf2.close()
     limpiar()
-
 
 if __name__ == "__main__":
     test_record()

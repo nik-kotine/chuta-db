@@ -3,9 +3,9 @@ import random
 import sys
 import time
 
-from b_tree_base import BPlusTreeBase
-from b_tree_leaf_page import RID, MAX_ENTRIES
-from b_tree_internal_page import MAX_KEYS
+from indexes.b_tree_base import BPlusTreeBase
+from indexes.b_tree_leaf_page import RID, MAX_ENTRIES
+from indexes.b_tree_internal_page import MAX_KEYS
 
 TEST_FILE = "test_complexity_index.bin"
 

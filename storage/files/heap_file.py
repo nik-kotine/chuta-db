@@ -1,9 +1,9 @@
 import os
 import struct
 from collections import namedtuple
-
-from heapfile.page import SlottedPage, PAGE_SIZE, HEADER_SIZE, SLOT_SIZE
-
+from storage.record_file import RecordFile
+from storage.pages.slotted_page import SlottedPage, PAGE_SIZE, HEADER_SIZE, SLOT_SIZE, NULL_SLOT
+from storage.buffer_manager import BufferManager
 RID = namedtuple("RID", ["page_id", "slot_id"])
 
 # Pagina 0 del archivo: directorio persistente. Guarda cuantas paginas de
@@ -25,8 +25,8 @@ NULL_DIR_PAGE = 0  # pagina 0 nunca es "la siguiente" de nadie, sirve de centine
 MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE
 
 
-class HeapFile:
-    def __init__(self, filename: str):
+class HeapFile(RecordFile):
+    def __init__(self, filename: str, buffer_manager: BufferManager, record_format: str):
         # Si el archivo no existe: crearlo e inicializar la pagina 0
         # (page_count = 0) vacia.
         # Si ya existe: abrirlo y cargar TODA la cadena de paginas de
@@ -34,42 +34,44 @@ class HeapFile:
         # directorio que exista) siguiendo next_dir_page_id, para no tener
         # que releerlas de disco en cada operacion.
         self.filename=filename
-        is_new=not os.path.exists(filename)
-        self.file=open(filename,"w+b" if is_new else "r+b")
+        self.buffer_manager = buffer_manager
+        self.file_manager = buffer_manager.file_manager
+        self.record_format = record_format
+
+        file_size = os.path.getsize(filename) if os.path.exists(filename) else 0
+        is_new = file_size <= self.file_manager.file_header_size
+        self._dir_page_ids=[]
 
         if is_new:
+            page_id = self.file_manager.allocate_page()
+            if page_id != 0:
+                raise RuntimeError(f"Expected page_id 0 but got {page_id}")
+
             self.page_count=0
-            self._dir_pages=[bytearray(PAGE_SIZE)]
             self._dir_page_ids=[0]
-            self._save_directory()
+
+            dir_data = self.buffer_manager.fetch_page(0)
+            struct.pack_into(DIR_HEADER_FORMAT, dir_data, 0, self.page_count, NULL_DIR_PAGE)
+            self.buffer_manager.mark_dirty(0)
+            self.buffer_manager.unpin_page(0)
         else:
-            self._dir_pages=[]
-            self._dir_page_ids=[]
             page_id=0
             while True:
-                self.file.seek(page_id*PAGE_SIZE)
-                block=bytearray(self.file.read(PAGE_SIZE))
-                self._dir_pages.append(block)
                 self._dir_page_ids.append(page_id)
-                next_dir_page_id=struct.unpack_from(DIR_HEADER_FORMAT, block, 0)[1]
+                dir_data = self.buffer_manager.fetch_page(page_id)
+                next_dir_page_id = struct.unpack_from(DIR_HEADER_FORMAT, dir_data, 0)[1]
+
+                if page_id == 0:
+                    self.page_count = struct.unpack_from(DIR_HEADER_FORMAT, dir_data, 0)[0]
+
+                self.buffer_manager.unpin_page(page_id)
+
                 if next_dir_page_id==NULL_DIR_PAGE:
                     break
                 page_id=next_dir_page_id
-            self.page_count = struct.unpack_from(DIR_HEADER_FORMAT, self._dir_pages[0], 0)[0]
+
 
     # ---------- directorio de espacio libre (pagina 0) ----------
-
-    def _save_directory(self):
-        # El page_count global solo vive en la primera pagina de directorio
-        # (el next_dir_page_id de cada pagina no cambia aca, eso lo pisa
-        # _add_dir_page una sola vez cuando encadena una pagina nueva).
-        # Reescribe TODAS las paginas de directorio a disco -- son pocas
-        # (una cada ENTRIES_PER_DIR_PAGE paginas de datos), asi que es barato.
-        struct.pack_into(">I", self._dir_pages[0], 0, self.page_count)
-        for dir_page_id, block in zip(self._dir_page_ids, self._dir_pages):
-            self.file.seek(dir_page_id*PAGE_SIZE)
-            self.file.write(block)
-        self.file.flush()
 
     def _entry_location(self, page_id: int):
         # Ubica en que pagina de directorio (indice dentro de
@@ -85,14 +87,30 @@ class HeapFile:
         # Lee de la pagina de directorio correspondiente el free_space_bytes
         # guardado para page_id.
         dir_index, offset = self._entry_location(page_id)
-        return struct.unpack_from(DIR_ENTRY_FORMAT, self._dir_pages[dir_index], offset)[0]
+        dir_page_id = self._dir_page_ids[dir_index]
+
+        dir_data = self.buffer_manager.fetch_page(dir_page_id)
+        free_space = struct.unpack_from(DIR_ENTRY_FORMAT, dir_data, offset)[0]
+        self.buffer_manager.unpin_page(dir_page_id)
+        return free_space
 
     def _set_free_space(self, page_id: int, free_bytes: int):
         # Escribe en la pagina de directorio correspondiente el
-        # free_space_bytes de page_id (todavia no persiste a disco,
-        # eso lo hace _save_directory).
+        # free_space_bytes de page_id
         dir_index, offset = self._entry_location(page_id)
-        struct.pack_into(DIR_ENTRY_FORMAT, self._dir_pages[dir_index], offset, free_bytes)
+        dir_page_id = self._dir_page_ids[dir_index]
+
+        dir_data = self.buffer_manager.fetch_page(dir_page_id)
+        struct.pack_into(DIR_ENTRY_FORMAT, dir_data, offset, free_bytes)
+
+        self.buffer_manager.mark_dirty(dir_page_id)
+        self.buffer_manager.unpin_page(dir_page_id)
+
+    def _update_page_count(self):
+        dir_data = self.buffer_manager.fetch_page(0)
+        struct.pack_into(">I", dir_data, 0, self.page_count)
+        self.buffer_manager.mark_dirty(0)
+        self.buffer_manager.unpin_page(0)
 
     # ---------- I/O de paginas de datos ----------
 
@@ -100,22 +118,14 @@ class HeapFile:
         return page_id * PAGE_SIZE  # page_id 0 = directorio, 1..N = datos
 
     def _load(self, page_id: int) -> SlottedPage:
-        # Lee PAGE_SIZE bytes del archivo en el offset de page_id y
-        # arma un SlottedPage a partir de ese bytearray.
-        self.file.seek(self._page_offset(page_id))
-        raw = bytearray(self.file.read(PAGE_SIZE))
+        raw = self.buffer_manager.fetch_page(page_id)
         return SlottedPage(page_id, data=raw)
 
-    def _write_page(self, page: SlottedPage):
-        # Escribe page.data de vuelta en su offset dentro del archivo.
-        self.file.seek(self._page_offset(page.page_id))
-        self.file.write(page.data)
-
     def _sync_page(self, page: SlottedPage):
-        # Persiste una pagina modificada y actualiza su entrada en el directorio
-        self._write_page(page)
+        # Marcar la página de datos, actualizar su espacio libre y despinarla
+        self.buffer_manager.mark_dirty(page.page_id)
+        self.buffer_manager.unpin_page(page.page_id)
         self._set_free_space(page.page_id, page.free_space_bytes)
-        self._save_directory()
 
     @property
     def next_page_id(self) -> int:
@@ -129,25 +139,30 @@ class HeapFile:
         # True si la proxima pagina de datos no entra en ninguna pagina
         # de directorio existente (se les acabaron las entradas).
         dir_index = (self.next_page_id - 1) // ENTRIES_PER_DIR_PAGE
-        return dir_index >= len(self._dir_pages)
+        return dir_index >= len(self._dir_page_ids)
 
     def _add_dir_page(self):
         # Encadena una pagina de directorio nueva al final de la cadena:
         # le pone el next_dir_page_id a la ultima pagina de la cadena y
         # reserva la pagina nueva (vacia, con next_dir_page_id=0/NULL).
         new_dir_id = self.next_page_id
-        last_block = self._dir_pages[-1]
-        last_id = self._dir_page_ids[-1]
-        struct.pack_into(">I", last_block, 4, new_dir_id)  # 2do campo del header = next_dir_page_id
-        self.file.seek(last_id*PAGE_SIZE)
-        self.file.write(last_block)
+        last_dir_id = self._dir_page_ids[-1]
 
-        new_block = bytearray(PAGE_SIZE)  # ya nace con next_dir_page_id=0 (NULL)
-        self._dir_pages.append(new_block)
+        last_data = self.buffer_manager.fetch_page(last_dir_id)
+        struct.pack_into(">I", last_data, 4, new_dir_id)  # 2do campo del header = next_dir_page_id
+        self.buffer_manager.mark_dirty(last_dir_id)
+        self.buffer_manager.unpin_page(last_dir_id)
+
+        allocated_id = self.file_manager.allocate_page()
+        if allocated_id != new_dir_id:
+            new_dir_id = allocated_id
+
+        new_data =self.buffer_manager.fetch_page(new_dir_id)
+        struct.pack_into(DIR_HEADER_FORMAT, new_data, 0, 0, NULL_DIR_PAGE) # (pc: 0, next:NULL=0)
+        self.buffer_manager.mark_dirty(new_dir_id)
+        self.buffer_manager.unpin_page(new_dir_id)
+
         self._dir_page_ids.append(new_dir_id)
-        self.file.seek(new_dir_id*PAGE_SIZE)
-        self.file.write(new_block)
-        self.file.flush()
 
     def _is_data_page(self, page_id: int) -> bool:
         # Un page_id es valido si cae dentro del rango usado y no es en
@@ -162,11 +177,24 @@ class HeapFile:
         # no hay un tope duro de paginas, solo el espacio en disco.
         if self._needs_new_dir_page():
             self._add_dir_page()
-        page = SlottedPage(self.next_page_id)
-        self.page_count += 1
-        self._sync_page(page)
-        return page
 
+        new_page_id = self.file_manager.allocate_page()
+        raw_data = self.buffer_manager.fetch_page(new_page_id)
+        page = SlottedPage(new_page_id, data=raw_data)
+
+        page.page_id = new_page_id
+        page.slot_count = 0
+        page.free_space_high = PAGE_SIZE
+        page.first_free_slot = NULL_SLOT  # Usamos la constante oficial de SlottedPage (0xFFFF)
+        
+        page.save_header()
+
+        self.page_count += 1
+        self._update_page_count()
+        self._set_free_space(new_page_id, page.free_space_bytes)
+
+        return page
+    
     # ---------- API publica ----------
 
     def add(self, record_data: bytes) -> RID:
@@ -179,42 +207,48 @@ class HeapFile:
         #    SlottedPage.insert.
         # 3. Si ninguna alcanza, pedir pagina nueva con _new_page.
         # Devuelve el RID (page_id, slot_id) del registro insertado.
-        if len(record_data)>MAX_RECORD_SIZE:
-            raise ValueError(f"Registro demasiado grande: {len(record_data)} bytes, maximo {MAX_RECORD_SIZE}")
+        if len(record_data) > MAX_RECORD_SIZE:
+            raise ValueError(f"Reg's length exceeds maximum: {len(record_data)} bytes, maximum {MAX_RECORD_SIZE}")
 
-        needed=len(record_data)+SLOT_SIZE
-        for page_id in range(1,self.next_page_id):
-            if page_id in self._dir_page_ids: # esta es una pagina de directorio, no de datos
+        needed = len(record_data) + SLOT_SIZE
+        for page_id in range(1, self.next_page_id):
+            if page_id in self._dir_page_ids:
                 continue
-            if self._get_free_space(page_id)<needed:
+            if self._get_free_space(page_id) < needed:
                 continue
-            page=self._load(page_id)
-            slot_id=page.insert(record_data)
+            page = self._load(page_id)
+            slot_id = page.insert(record_data)
             self._sync_page(page)
-            return RID(page_id,slot_id)
-        page=self._new_page()
-        slot_id=page.insert(record_data)
+            return RID(page_id, slot_id)
+        
+        page = self._new_page()
+        slot_id = page.insert(record_data)
         self._sync_page(page)
-        return RID(page.page_id,slot_id)
+        return RID(page.page_id, slot_id)
+    
     def get(self, rid: RID):
         # Devuelve los bytes del registro en rid, o None si no existe
         # o esta borrado. Delegado en SlottedPage.get_record.
         page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return None
-        page=self._load(page_id)
-        return page.get_record(slot_id)
+        page = self._load(page_id)
+        record = page.get_record(slot_id)
+        self.buffer_manager.unpin_page(page_id)
+        return record
 
     def remove(self, rid: RID) -> bool:
         # Borra el registro en rid (delegado en SlottedPage.delete_record)
         # y sincroniza la pagina/directorio si el borrado fue efectivo.
-        page_id, slot_id=rid
+        page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return False
-        page=self._load(page_id)
-        ok=page.delete_record(slot_id)
+        page = self._load(page_id)
+        ok = page.delete_record(slot_id)
         if ok:
             self._sync_page(page)
+        else:
+            self.buffer_manager.unpin_page(page_id)
         return ok
 
     def compact(self, page_id: int):
@@ -235,8 +269,9 @@ class HeapFile:
                 continue
             self.compact(page_id)
 
+
     def close(self):
-        self.file.close()
+        self.buffer_manager.close()
 
     def __enter__(self):
         return self

@@ -1,5 +1,5 @@
-from b_tree_base import BPlusTreeBase
-from heapfile.heapfile import HeapFile
+from indexes.b_tree_base import BPlusTreeBase
+from storage.files.heap_file import HeapFile
 from heapfile.record import RecordPacker
 
 

@@ -1,6 +1,6 @@
 import os
 
-from b_plus_clustered import BPlusTreeClustered
+from indexes.b_plus_clustered import BPlusTreeClustered
 
 INDEX_FILE = "test_clustered_index.bin"
 DATA_FILE = "test_clustered_data.bin"

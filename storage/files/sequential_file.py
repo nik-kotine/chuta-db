@@ -1,5 +1,5 @@
 import struct
-from BufferManager import BufferManager
+from storage.buffer_manager import BufferManager
 
 """
 rid: (page_id, slot_id)

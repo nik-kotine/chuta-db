@@ -1,7 +1,7 @@
 import os
 
-from b_plus_unclustered import BPlusTreeUnclustered
-from heapfile.heapfile import HeapFile
+from indexes.b_plus_unclustered import BPlusTreeUnclustered
+from storage.files.heap_file import HeapFile
 
 INDEX_FILE = "test_unclustered_index.bin"
 HEAP_FILE = "test_unclustered_heap.bin"
