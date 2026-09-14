@@ -2,10 +2,14 @@ import os
 
 from indexes.b_plus_unclustered import BPlusTreeUnclustered
 from storage.files.heap_file import HeapFile
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
 
 INDEX_FILE = "test_unclustered_index.bin"
 HEAP_FILE = "test_unclustered_heap.bin"
-
+PAGE_SIZE = 4096
+HEADER_SIZE = 10
+BUFFER_FRAMES = 10
 
 def limpiar():
     for f in (INDEX_FILE, HEAP_FILE):
@@ -14,7 +18,10 @@ def limpiar():
 
 
 def crear_arbol():
-    heap = HeapFile(HEAP_FILE)
+    fm = FileManager(HEAP_FILE, PAGE_SIZE, HEADER_SIZE)
+    bm = BufferManager(fm, BUFFER_FRAMES)
+    heap = HeapFile(HEAP_FILE, bm, "")
+    
     tree = BPlusTreeUnclustered(INDEX_FILE, heap, schema=["int", "int"])
     return tree, heap
 
@@ -103,8 +110,10 @@ def test_dos_indices_comparten_el_mismo_heap():
     index_2 = "test_unclustered_index_2.bin"
     if os.path.exists(index_2):
         os.remove(index_2)
+    fm = FileManager(HEAP_FILE, PAGE_SIZE, HEADER_SIZE)
+    bm = BufferManager(fm, BUFFER_FRAMES)
 
-    heap = HeapFile(HEAP_FILE)
+    heap = HeapFile(HEAP_FILE, bm, "")
     indice_por_id = BPlusTreeUnclustered(INDEX_FILE, heap, schema=["int", "int"])
     indice_por_valor = BPlusTreeUnclustered(index_2, heap, schema=["int", "int"])
 
