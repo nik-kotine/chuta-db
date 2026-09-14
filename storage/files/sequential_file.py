@@ -209,7 +209,6 @@ class SequentialFile(RecordFile):
         """
         phys_page_id = self.file_manager.allocate_page()
         self.n_pages += 1
-        page = self._load_page(phys_page_id)
 
         page_ba = self.buffer_manager.fetch_page(phys_page_id)
         if len(page_ba) == 0:
