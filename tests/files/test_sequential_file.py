@@ -176,17 +176,17 @@ def test_duplicate_records():
         close_sequential(filename, fm, bm)
 
 
-def test_delete():
+def test_delete_by_key():
     filename, fm, bm, seq = create_sequential()
 
     try:
         for key in [10, 20, 30, 40, 50]:
             seq.insert((key,))
 
-        assert seq.delete(30) is True
+        assert seq.delete_by_key(30) is True
         assert seq.search(30) == []
 
-        assert seq.delete(99) is False
+        assert seq.delete_by_key(99) is False
 
         assert logical_keys(seq) == [10, 20, 40, 50]
 
@@ -194,14 +194,14 @@ def test_delete():
         close_sequential(filename, fm, bm)
 
 
-def test_delete_duplicates():
+def test_delete_by_key_duplicates():
     filename, fm, bm, seq = create_sequential()
 
     try:
         for key in [10, 20, 20, 20, 30]:
             seq.insert((key,))
 
-        assert seq.delete(20) is True
+        assert seq.delete_by_key(20) is True
         assert seq.search(20) == []
         assert logical_keys(seq) == [10, 30]
 
@@ -209,15 +209,15 @@ def test_delete_duplicates():
         close_sequential(filename, fm, bm)
 
 
-def test_chain_sorted_after_delete():
+def test_chain_sorted_after_delete_by_key():
     filename, fm, bm, seq = create_sequential()
 
     try:
         for key in [10, 20, 30, 40, 50, 60]:
             seq.insert((key,))
 
-        assert seq.delete(20) is True
-        assert seq.delete(40) is True
+        assert seq.delete_by_key(20) is True
+        assert seq.delete_by_key(40) is True
 
         assert logical_keys(seq) == [10, 30, 50, 60]
 
@@ -232,10 +232,10 @@ def test_reorganize():
         for key in [10, 20, 30, 40, 50, 60, 70, 80]:
             seq.insert((key,))
 
-        assert seq.delete(20) is True
-        assert seq.delete(40) is True
-        assert seq.delete(60) is True
-        assert seq.delete(80) is True
+        assert seq.delete_by_key(20) is True
+        assert seq.delete_by_key(40) is True
+        assert seq.delete_by_key(60) is True
+        assert seq.delete_by_key(80) is True
 
         seq.reorganize()
 
@@ -373,9 +373,9 @@ def test_everything_together():
 
         assert [r.params[0] for r in seq.search(20)] == [20, 20, 20]
 
-        assert seq.delete(20) is True
-        assert seq.delete(70) is True
-        assert seq.delete(5) is True
+        assert seq.delete_by_key(20) is True
+        assert seq.delete_by_key(70) is True
+        assert seq.delete_by_key(5) is True
 
         assert logical_keys(seq) == [
             10, 30, 40, 50, 60,
@@ -404,9 +404,9 @@ tests = [
     test_insert_before_first,
     test_insert_after_last,
     test_duplicate_records,
-    test_delete,
-    test_delete_duplicates,
-    test_chain_sorted_after_delete,
+    test_delete_by_key,
+    test_delete_by_key_duplicates,
+    test_chain_sorted_after_delete_by_key,
     test_reorganize,
     test_primary_pages_sorted,
     test_overflow_full,

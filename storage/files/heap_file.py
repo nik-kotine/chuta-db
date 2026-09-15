@@ -2,9 +2,10 @@ import os
 import struct
 from collections import namedtuple
 from storage.record_file import RecordFile
+from storage.formats.record_packer import RecordPacker
+from storage.rid import RID
 from storage.pages.slotted_page import SlottedPage, PAGE_SIZE, HEADER_SIZE, SLOT_SIZE, NULL_SLOT
 from storage.buffer_manager import BufferManager
-RID = namedtuple("RID", ["page_id", "slot_id"])
 
 # Pagina 0 del archivo: directorio persistente. Guarda cuantas paginas de
 # datos hay y, para cada una, su free_space_bytes actual. Evita re-escanear
@@ -24,7 +25,6 @@ NULL_DIR_PAGE = 0  # pagina 0 nunca es "la siguiente" de nadie, sirve de centine
 # (sin fragmentacion, sin otros slots).
 MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE
 
-
 class HeapFile(RecordFile):
     def __init__(self, filename: str, buffer_manager: BufferManager, record_format: str):
         # Si el archivo no existe: crearlo e inicializar la pagina 0
@@ -37,6 +37,7 @@ class HeapFile(RecordFile):
         self.buffer_manager = buffer_manager
         self.file_manager = buffer_manager.file_manager
         self.record_format = record_format
+        self.packer = RecordPacker(self.record_format)
 
         file_size = os.path.getsize(filename) if os.path.exists(filename) else 0
         is_new = file_size <= self.file_manager.file_header_size
@@ -197,7 +198,7 @@ class HeapFile(RecordFile):
     
     # ---------- API publica ----------
 
-    def add(self, record_data: bytes) -> RID:
+    def insert(self, values) -> RID:
         # record_data puede pesar cualquier cosa <= MAX_RECORD_SIZE
         # (heapfile.py no sabe ni le importa si es de largo fijo o
         # variable, eso ya lo resolvio record.py).
@@ -207,8 +208,10 @@ class HeapFile(RecordFile):
         #    SlottedPage.insert.
         # 3. Si ninguna alcanza, pedir pagina nueva con _new_page.
         # Devuelve el RID (page_id, slot_id) del registro insertado.
+        record_data = self.packer.encode(values)
+
         if len(record_data) > MAX_RECORD_SIZE:
-            raise ValueError(f"Reg's length exceeds maximum: {len(record_data)} bytes, maximum {MAX_RECORD_SIZE}")
+            raise ValueError(f"Record's length exceeds maximum: {len(record_data)} bytes, maximum {MAX_RECORD_SIZE}")
 
         needed = len(record_data) + SLOT_SIZE
         for page_id in range(1, self.next_page_id):
@@ -226,18 +229,20 @@ class HeapFile(RecordFile):
         self._sync_page(page)
         return RID(page.page_id, slot_id)
     
-    def get(self, rid: RID):
+    def fetch(self, rid: RID):
         # Devuelve los bytes del registro en rid, o None si no existe
         # o esta borrado. Delegado en SlottedPage.get_record.
         page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return None
         page = self._load(page_id)
-        record = page.get_record(slot_id)
+        record_bytes = page.get_record(slot_id)
         self.buffer_manager.unpin_page(page_id)
-        return record
+        if record_bytes is None:
+            return None
+        return self.packer.decode(record_bytes)
 
-    def remove(self, rid: RID) -> bool:
+    def delete(self, rid: RID) -> bool:
         # Borra el registro en rid (delegado en SlottedPage.delete_record)
         # y sincroniza la pagina/directorio si el borrado fue efectivo.
         page_id, slot_id = rid
@@ -261,7 +266,7 @@ class HeapFile(RecordFile):
         page.defragment()
         self._sync_page(page)
 
-    def vacuum(self):
+    def reorganize(self):
         # compact() sobre todas las paginas de datos del archivo (saltando
         # las paginas de directorio, que tambien viven en este rango de ids).
         for page_id in range(1,self.next_page_id):
@@ -269,6 +274,21 @@ class HeapFile(RecordFile):
                 continue
             self.compact(page_id)
 
+    def scan(self):
+        # devuelve (RID, record_bytes) para todos los registros vivos
+        for page_id in range(1, self.next_page_id):
+            if page_id in self._dir_page_ids:
+                continue
+            
+            page = self._load(page_id)
+            
+            # Recorremos todos los slots de esta pagina
+            for slot_id in range(page.slot_count):
+                record = page.get_record(slot_id)
+                if record is not None:
+                    yield RID(page_id, slot_id), self.packer.decode(record)
+                    
+            self.buffer_manager.unpin_page(page_id)
 
     def close(self):
         self.buffer_manager.close()
