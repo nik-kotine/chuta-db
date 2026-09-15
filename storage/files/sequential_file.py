@@ -6,6 +6,7 @@ from storage.pages.fixed_page import FixedPage
 from storage.pages.variable_page import VariablePage
 from storage.formats.serializers.fixed_length_serializer import FixedLengthRecordSerializer
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
+from storage.record_file import RecordFile
 
 SLOT_ID_BITS = 16
 
@@ -14,7 +15,7 @@ FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT)
 
 WASTED_RATIO = 0.5
 
-class SequentialFile:
+class SequentialFile(RecordFile):
     def __init__(
         self,
         buffer_manager: BufferManager,

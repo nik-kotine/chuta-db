@@ -26,7 +26,7 @@ NULL_DIR_PAGE = 0  # pagina 0 nunca es "la siguiente" de nadie, sirve de centine
 MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE
 
 class HeapFile(RecordFile):
-    def __init__(self, filename: str, buffer_manager: BufferManager, record_format: str):
+    def __init__(self, filename: str, buffer_manager: BufferManager, record_format: list[str] | str):
         # Si el archivo no existe: crearlo e inicializar la pagina 0
         # (page_count = 0) vacia.
         # Si ya existe: abrirlo y cargar TODA la cadena de paginas de
@@ -37,6 +37,10 @@ class HeapFile(RecordFile):
         self.buffer_manager = buffer_manager
         self.file_manager = buffer_manager.file_manager
         self.record_format = record_format
+        if isinstance(record_format, str):
+            self.record_format = [record_format]
+        else:
+            self.record_format = record_format
         self.packer = RecordPacker(self.record_format)
 
         file_size = os.path.getsize(filename) if os.path.exists(filename) else 0
