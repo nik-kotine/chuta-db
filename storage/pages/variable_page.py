@@ -59,7 +59,7 @@ class VariablePage(Page):
         params = self.serializer.deserialize(record_data)
 
         next_rid_tuple = struct.unpack_from(
-            RID_FORMAT, self.page_ba, offset + record_byte_len
+            ">" + RID_FORMAT, self.page_ba, offset + record_byte_len
         )
 
         if next_rid_tuple == (-1, -1):
@@ -92,7 +92,10 @@ class VariablePage(Page):
         next_rid = record.next_rid if record.next_rid is not None else NULL_RID
 
         struct.pack_into(
-            RID_FORMAT, self.page_ba, offset + len(record_bytes), *next_rid
+            ">" + RID_FORMAT,
+            self.page_ba,
+            offset + len(record_bytes),
+            *next_rid,
         )
         struct.pack_into(
             DELETED_FORMAT,
@@ -126,7 +129,10 @@ class VariablePage(Page):
         next_rid = record.next_rid if record.next_rid is not None else NULL_RID
 
         struct.pack_into(
-            RID_FORMAT, self.page_ba, self.offset + len(record_bytes), *next_rid
+            ">" + RID_FORMAT,
+            self.page_ba,
+            self.offset + len(record_bytes),
+            *next_rid,
         )
         struct.pack_into(
             DELETED_FORMAT,

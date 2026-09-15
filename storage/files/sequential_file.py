@@ -1,9 +1,10 @@
 import struct
 from storage.buffer_manager import BufferManager
-from storage.rid import RID
+from storage.rid import RID, RID_SIZE, DELETED_SIZE
 from storage.seq_record import Record
 from storage.pages.fixed_page import FixedPage
 from storage.pages.variable_page import VariablePage
+from storage.formats.data_types import return_format
 from storage.formats.serializers.fixed_length_serializer import FixedLengthRecordSerializer
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from storage.record_file import RecordFile
@@ -26,8 +27,9 @@ class SequentialFile(RecordFile):
         self.file_manager = buffer_manager.file_manager
         self.page_size = page_size
         self.key_index = 0
-        
-        self.variable_length = any("-1" in token or "s" in token for token in record_format)
+
+        # Determinación precisa de tipos de longitud variable
+        self.variable_length = any(return_format(t)[1] == -1 for t in record_format)
 
         if self.variable_length:
             self.serializer = VariableLengthRecordSerializer(record_format)
@@ -69,8 +71,10 @@ class SequentialFile(RecordFile):
     def _rid_to_int(self, rid: RID | None) -> int:
         if rid is None:
             return -1
-        # Aprovechamos las bondades del namedtuple para acceder por atributo
-        return (rid.page_id << SLOT_ID_BITS) | rid.slot_id
+        page_id, slot_id = rid
+        if page_id == -1:
+            return -1
+        return (page_id << SLOT_ID_BITS) | slot_id
 
     def _int_to_rid(self, value: int) -> RID | None:
         if value == -1:
@@ -82,13 +86,15 @@ class SequentialFile(RecordFile):
 
     def _load_page(self, phys_page_id: int):
         page_ba = self.buffer_manager.fetch_page(phys_page_id)
+        if len(page_ba) < self.page_size:
+            page_ba.extend(b"\x00" * (self.page_size - len(page_ba)))
         return self.page_class(page_ba, self.page_size, self.serializer)
 
     def _get_record(self, rid: RID) -> Record | None:
-        if rid is None:
+        # Guarda de seguridad contra RIDs nulos o inválidos
+        if rid is None or rid == (-1, -1) or getattr(rid, "page_id", -1) == -1:
             return None
-        
-        # Como es namedtuple, el desempaquetado sigue funcionando normal
+
         phys_page_id, slot_id = rid 
         page = self._load_page(phys_page_id)
         try:
@@ -97,6 +103,8 @@ class SequentialFile(RecordFile):
             self.buffer_manager.unpin_page(phys_page_id)
 
     def _set_record(self, rid: RID, record: Record):
+        if rid is None or rid == (-1, -1) or getattr(rid, "page_id", -1) == -1:
+            return
         phys_page_id, slot_id = rid
         page = self._load_page(phys_page_id)
         try:
@@ -296,19 +304,21 @@ class SequentialFile(RecordFile):
         return phys_page_id
 
     def _insert_into_overflow(self, record: Record) -> RID | None:
-        size = self.serializer.get_size_of(record.params)
+        total_slot_size = self.serializer.get_size_of(record.params) + RID_SIZE + DELETED_SIZE
         page = self._load_page(0)
+
         try:
             if page.ensure_initialized():
                 self.buffer_manager.mark_dirty(0)
 
-            if not page.has_space(size):
+            if not page.has_space(total_slot_size):
                 if page.n_records == 0:
                     raise RuntimeError("record is too big for insertion")
                 return None
 
             slot_id = page.insert(record)
             self.buffer_manager.mark_dirty(0)
+
             return self._make_rid(0, slot_id)
         finally:
             self.buffer_manager.unpin_page(0)
@@ -322,19 +332,20 @@ class SequentialFile(RecordFile):
             yield current_rid, record
             current_rid = record.next_rid
 
-    def insert(self, values) -> RID:
-        record = Record(values)
-        size = self.serializer.get_size_of(record.params)
+    def insert(self, params):
+        record = Record(params)
+        total_slot_size = self.serializer.get_size_of(record.params) + RID_SIZE + DELETED_SIZE
 
         if self.first_rid is None:
             if self.n_pages == 0:
                 self._append_page()
 
             page = self._load_page(1)
+
             try:
                 if page.ensure_initialized():
                     self.buffer_manager.mark_dirty(1)
-                if not page.has_space(size):
+                if not page.has_space(total_slot_size):
                     raise RuntimeError("Record is too big for insertion")
 
                 rid = self._make_rid(1, page.insert(record))
@@ -347,23 +358,28 @@ class SequentialFile(RecordFile):
             self._write_header()
             return rid
 
-        previous_rid, next_rid = self._find_neighbors(values[self.key_index], duplicates_after=True)
-        record.next_rid = next_rid
+        previous_rid, next_rid = self._find_neighbors(
+            params[self.key_index], duplicates_after=True
+        )
 
+        record.next_rid = next_rid
         new_rid = self._insert_into_overflow(record)
+
         if new_rid is None:
             self.reorganize()
-            return self.insert(values)
+            return self.insert(params)
 
         if previous_rid is None:
             self.first_rid = new_rid
         else:
             previous_record = self._get_record(previous_rid)
-            previous_record.next_rid = new_rid
-            self._set_record(previous_rid, previous_record)
+            if previous_record is not None:
+                previous_record.next_rid = new_rid
+                self._set_record(previous_rid, previous_record)
 
         self.n_records += 1
         self._write_header()
+
         return new_rid
 
     def fetch(self, rid: RID) -> list | None:
@@ -375,16 +391,21 @@ class SequentialFile(RecordFile):
     def search(self, key):
         results = []
         _, current_rid = self._find_neighbors(key, duplicates_after=False)
+        if current_rid is None:
+            return results
 
         for _, record in self._iter_records(current_rid):
             current_key = record.params[self.key_index]
             if current_key > key:
                 break
             if current_key == key and not record.deleted:
-                results.append(record.params)
+                results.append(record)
         return results
 
     def delete(self, rid: RID) -> bool:
+        if not isinstance(rid, RID):
+            return self.delete_by_key(rid)
+
         record = self._get_record(rid)
         if record is None or record.deleted:
             return False
@@ -404,6 +425,8 @@ class SequentialFile(RecordFile):
         deleted_any = False
         pages_touched = set()
         _, current_rid = self._find_neighbors(key, duplicates_after=False)
+        if current_rid is None:
+            return False
 
         for current_rid, record in self._iter_records(current_rid):
             current_key = record.params[self.key_index]
@@ -413,7 +436,6 @@ class SequentialFile(RecordFile):
             if current_key == key and not record.deleted:
                 record.deleted = True
                 self._set_record(current_rid, record)
-                # Aprovechamos el namedtuple accediendo por .page_id
                 pages_touched.add(current_rid.page_id)
                 self.n_deleted += 1
                 self.n_records -= 1
@@ -465,7 +487,7 @@ class SequentialFile(RecordFile):
         page = None
 
         for record in records:
-            record_size = self.serializer.get_size_of(record.params)
+            record_size = self.serializer.get_size_of(record.params) + RID_SIZE + DELETED_SIZE
 
             if page is not None and not page.has_space(record_size):
                 self.buffer_manager.mark_dirty(pageindex)
@@ -491,14 +513,23 @@ class SequentialFile(RecordFile):
         self.first_rid = rids[0]
         for index in range(len(rids) - 1):
             rec = self._get_record(rids[index])
-            rec.next_rid = rids[index + 1]
-            self._set_record(rids[index], rec)
+            if rec is not None:
+                rec.next_rid = rids[index + 1]
+                self._set_record(rids[index], rec)
 
         self.n_pages = pageindex
         self.n_records = len(rids)
         self.n_deleted = 0
         self._truncate(pageindex)
         self._write_header()
+
+    def scan(self):
+        if self.first_rid is None:
+            return
+
+        for rid, record in self._iter_records():
+            if not record.deleted:
+                yield rid, list(record.params)
 
     def _truncate(self, n_main_pages: int):
         self.buffer_manager.flush_all()
