@@ -42,6 +42,7 @@ class SequentialFile(RecordFile):
         self.n_pages = 0
         self.n_records = 0
         self.n_deleted = 0
+        self.reorganize_count = 0
 
         header = self.file_manager.read_header()
         if len(header) > 0:
@@ -459,6 +460,7 @@ class SequentialFile(RecordFile):
         return self.n_deleted / total_slots
 
     def reorganize(self):
+        self.reorganize_count += 1
         records = [
             Record(record.params)
             for _, record in self._iter_records()

@@ -22,8 +22,29 @@ class BPlusTreeClustered(BPlusTreeBase):
     # que mantiene los registros ordenados físicamente por la misma
     # clave (por eso "agrupado", orden del índice = orden del dato).
 
+    @staticmethod
+    def _normalize_record_format(record_format):
+        if isinstance(record_format, (list, tuple)):
+            return list(record_format)
+
+        struct_types = {
+            "i": "integer",
+            "q": "bigint",
+            "h": "smallint",
+            "f": "real",
+            "d": "double precision",
+            "?": "boolean",
+        }
+        if record_format in struct_types:
+            return [struct_types[record_format]]
+        if record_format and all(token in struct_types for token in record_format):
+            return [struct_types[token] for token in record_format]
+        return [record_format]
+
     def __init__(self, index_filename: str, data_filename: str, page_size: int, record_format: str, buffer_frames: int = 50):
         super().__init__(index_filename)
+
+        record_format = self._normalize_record_format(record_format)
 
         # el archivo de datos necesita su propio header + página de
         # overflow antes de abrirlo con FileManager, igual que hace
