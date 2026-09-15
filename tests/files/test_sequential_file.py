@@ -5,11 +5,12 @@ import tempfile
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 from storage.files.sequential_file import SequentialFile
+from storage.rid import RID
 
 
 PAGE_SIZE = 64
 HEADER_SIZE = 16
-RECORD_FORMAT = "i"
+RECORD_FORMAT = ["integer"]  
 BUFFER_FRAMES = 10
 
 
@@ -18,7 +19,8 @@ def create_sequential():
     os.close(fd)
 
     with open(filename, "wb") as f:
-        f.write(struct.pack("iiii", 0, -1, 0, 0))
+        # Se añade > para que sea big-endian, compatible con ">iiii" de FILE_HEADER_FORMAT
+        f.write(struct.pack(">iiii", 0, -1, 0, 0))
         f.write(b"\x00" * PAGE_SIZE)
 
     fm = FileManager(filename, PAGE_SIZE, HEADER_SIZE)
@@ -27,12 +29,14 @@ def create_sequential():
 
     return filename, fm, bm, seq
 
+
 def close_file(fm, bm):
     for phys_page_id in list(bm.page_table.keys()):
         bm.flush_page(phys_page_id)
 
     fm.flush()
     fm.close()
+
 
 def close_sequential(filename, fm, bm):
     for phys_page_id in list(bm.page_table.keys()):
@@ -41,9 +45,6 @@ def close_sequential(filename, fm, bm):
     fm.flush()
     fm.close()
     os.remove(filename)
-
-def keys(seq):
-    return [record.params[0] for record in seq.search_all()]
 
 
 def logical_keys(seq):
@@ -74,9 +75,10 @@ def primary_page_keys(seq):
             page_keys = []
 
             for slot_id in range(page.n_records):
-                record = page.get_record_by_slot_id(slot_id)
+                # Actualizado a get_record según la interfaz de Page
+                record = page.get_record(slot_id)
 
-                if not record.deleted:
+                if record and not record.deleted:
                     page_keys.append(record.params[0])
 
             result.append(page_keys)
@@ -108,9 +110,10 @@ def test_search():
         for key in [10, 20, 30, 40, 50]:
             seq.insert((key,))
 
-        assert [r.params[0] for r in seq.search(10)] == [10]
-        assert [r.params[0] for r in seq.search(30)] == [30]
-        assert [r.params[0] for r in seq.search(50)] == [50]
+        # seq.search retorna list(record.params), por lo que iteramos sobre los resultados
+        assert [r[0] for r in seq.search(10)] == [10]
+        assert [r[0] for r in seq.search(30)] == [30]
+        assert [r[0] for r in seq.search(50)] == [50]
         assert seq.search(99) == []
 
     finally:
@@ -170,7 +173,8 @@ def test_duplicate_records():
         result = seq.search(20)
 
         assert len(result) == 3
-        assert [r.params[0] for r in result] == [20, 20, 20]
+        # search() retorna valores serializados
+        assert [r[0] for r in result] == [20, 20, 20]
 
     finally:
         close_sequential(filename, fm, bm)
@@ -242,14 +246,15 @@ def test_reorganize():
         assert logical_keys(seq) == [10, 30, 50, 70]
         assert seq.n_records == 4
         assert seq.n_pages == 1
-        assert seq.first_rid == (1, 0)
+        # Actualizado para comparar con el namedtuple RID
+        assert seq.first_rid == RID(1, 0)
 
         page = seq._load_page(1)
 
         try:
             assert page.n_records == 4
             assert [
-                page.get_record_by_slot_id(i).params[0]
+                page.get_record(i).params[0]
                 for i in range(page.n_records)
             ] == [10, 30, 50, 70]
 
@@ -347,12 +352,13 @@ def test_persistence():
         assert seq.n_records == 5
         assert logical_keys(seq) == expected
 
-        assert [r.params[0] for r in seq.search(10)] == [10]
-        assert [r.params[0] for r in seq.search(30)] == [30]
-        assert [r.params[0] for r in seq.search(50)] == [50]
+        assert [r[0] for r in seq.search(10)] == [10]
+        assert [r[0] for r in seq.search(30)] == [30]
+        assert [r[0] for r in seq.search(50)] == [50]
 
     finally:
         close_sequential(filename, fm, bm)
+
 
 def test_everything_together():
     filename, fm, bm, seq = create_sequential()
@@ -371,7 +377,7 @@ def test_everything_together():
             80, 90, 100
         ]
 
-        assert [r.params[0] for r in seq.search(20)] == [20, 20, 20]
+        assert [r[0] for r in seq.search(20)] == [20, 20, 20]
 
         assert seq.delete_by_key(20) is True
         assert seq.delete_by_key(70) is True
@@ -415,9 +421,10 @@ tests = [
 ]
 
 
-for test in tests:
-    print(f"Running {test.__name__}...", end=" ")
-    test()
-    print("OK")
+if __name__ == "__main__":
+    for test in tests:
+        print(f"Running {test.__name__}...", end=" ")
+        test()
+        print("OK")
 
-print(f"\n{len(tests)} tests passed.")
+    print(f"\n{len(tests)} tests passed.")

@@ -1,4 +1,4 @@
-from storage.formats.fixed_serializer import FixedLengthRecordSerializer
+from storage.serializers.fixed_serializer import FixedLengthRecordSerializer
 
 def test_fixed_length_record_format():
     # Formato: Int (4 bytes), Int (4 bytes), Double (8 bytes)
