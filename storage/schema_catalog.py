@@ -5,12 +5,13 @@ from storage.table import Table
 
 SYS_TABLES_NAME = "sys_tables"
 SYS_COLUMNS_NAME = "sys_columns"
+SYS_INDEXES_NAME = "sys_indexes"
 
 # Esquemas de las tablas del sistema
 SYS_TABLES_SCHEMA = ["varchar(64)", "varchar(20)", "integer"]  # (table_name, file_type, key_index)
 SYS_COLUMNS_SCHEMA = ["varchar(64)", "varchar(64)", "integer"]  # (table_name, data_type, column_order)
-
-
+# (index_name, table_name, column_name, column_index, index_type)
+SYS_INDEXES_SCHEMA = ["varchar(64)", "varchar(64)", "varchar(64)", "integer", "varchar(20)"]
 class SchemaCatalog:
     """
     Catálogo del sistema que gestiona la metadata de la base de datos
@@ -29,6 +30,7 @@ class SchemaCatalog:
         # Instanciamos directamente las tablas del sistema
         self.sys_tables = self._init_sys_table(SYS_TABLES_NAME, SYS_TABLES_SCHEMA)
         self.sys_columns = self._init_sys_table(SYS_COLUMNS_NAME, SYS_COLUMNS_SCHEMA)
+        self.sys_indexes = self._init_sys_table(SYS_INDEXES_NAME, SYS_INDEXES_SCHEMA)
 
         # Auto-registro inicial si el catálogo es nuevo
         self._bootstrap_if_needed()
@@ -50,16 +52,17 @@ class SchemaCatalog:
         if self.get_table_info(SYS_TABLES_NAME) is None:
             self.register_table(SYS_TABLES_NAME, SYS_TABLES_SCHEMA, "heap", 0)
             self.register_table(SYS_COLUMNS_NAME, SYS_COLUMNS_SCHEMA, "heap", 0)
+            self.register_table(SYS_INDEXES_NAME, SYS_INDEXES_SCHEMA, "heap", 0)
 
     def register_table(self, name: str, schema: list[str], file_type: str, key_index: int):
         """Registra la metadata de una nueva tabla en sys_tables y sys_columns."""
         if self.get_table_info(name) is not None:
             raise ValueError(f"La tabla '{name}' ya existe en el catálogo.")
 
-        # 1. Insertar en sys_tables
+        # Insertar en sys_tables
         self.sys_tables.insert([name, file_type.lower(), key_index])
 
-        # 2. Insertar cada columna en sys_columns
+        # Insertar cada columna en sys_columns
         for idx, col_type in enumerate(schema):
             self.sys_columns.insert([name, col_type, idx])
 
@@ -111,7 +114,48 @@ class SchemaCatalog:
             if self._clean_str(params[0]) == name:
                 self.sys_columns.delete(rid)
 
+    def register_index(self, index_name: str, table_name: str, column_name: str, column_index: int, index_type: str):
+            """Registra un nuevo índice en sys_indexes."""
+            self.sys_indexes.insert([index_name, table_name, column_name, column_index, index_type.lower()])
+
+    def get_table_indexes(self, table_name: str) -> list[dict]:
+        """Recupera la lista de índices registrados para una tabla dada."""
+        indexes = []
+        for _, params in self.sys_indexes.scan():
+            if self._clean_str(params[1]) == table_name:
+                indexes.append({
+                    "index_name": self._clean_str(params[0]),
+                    "table_name": table_name,
+                    "column_name": self._clean_str(params[2]),
+                    "column_index": params[3],
+                    "index_type": self._clean_str(params[4])
+                })
+        return indexes
+
+    def drop_index_info(self, index_name: str):
+        """Elimina un índice de sys_indexes."""
+        for rid, params in list(self.sys_indexes.scan()):
+            if self._clean_str(params[0]) == index_name:
+                self.sys_indexes.delete(rid)
+
+    def drop_table_info(self, name: str):
+        if name in (SYS_TABLES_NAME, SYS_COLUMNS_NAME, SYS_INDEXES_NAME):
+            raise ValueError("No se pueden eliminar las tablas del catálogo del sistema.")
+
+        for rid, params in list(self.sys_tables.scan()):
+            if self._clean_str(params[0]) == name:
+                self.sys_tables.delete(rid)
+
+        for rid, params in list(self.sys_columns.scan()):
+            if self._clean_str(params[0]) == name:
+                self.sys_columns.delete(rid)
+
+        for rid, params in list(self.sys_indexes.scan()):
+            if self._clean_str(params[1]) == name:
+                self.sys_indexes.delete(rid)
+
     def close(self):
         """Cierra los archivos del catálogo."""
         self.sys_tables.close()
         self.sys_columns.close()
+        self.sys_indexes.close()

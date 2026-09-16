@@ -22,32 +22,58 @@ class Table:
         self.buffer_manager = buffer_manager
         self.file_type = file_type.lower()
         self.key_index = key_index
-
-        # El archivo físico se llamará como la tabla (ej. "usuarios.dat")
         self.filename = f"{self.name}.dat"
+
+        # Referencia al índice primario agrupado (si existe)
+        self.clustered_index = None
+
+        # Diccionario para índices secundarios: {column_index: [lista_de_indices_unclustered]}
+        self.secondary_indexes: dict[int, list] = {}
 
         if self.file_type == "heap":
             self.data_file = HeapFile(self.filename, self.buffer_manager, self.schema)
-            
         elif self.file_type == "sequential":
             page_size = self.buffer_manager.file_manager.page_size
             self.data_file = SequentialFile(self.buffer_manager, page_size, self.schema)
             self.data_file.key_index = self.key_index
-            
         else:
             raise ValueError(f"Organización de archivo no soportada: {self.file_type}")
 
-    # ---------- Operaciones CRUD por RID ----------
+    def attach_index(self, column_index: int, index_obj):
+        """Enlaza un índice secundario para actualización automática."""
+        if column_index not in self.secondary_indexes:
+            self.secondary_indexes[column_index] = []
+        self.secondary_indexes[column_index].append(index_obj)
+
+    def set_clustered_index(self, index_obj):
+        """Asigna el índice primario agrupado (BPlusTreeClustered) para esta tabla."""
+        self.clustered_index = index_obj
 
     def insert(self, values: list) -> RID:
         """
-        Inserta un registro en la tabla tras validar la cantidad de campos.
+        Inserta un registro. Si hay un índice Clustered, pasa a través de él;
+        de lo contrario, inserta directo en el archivo de datos y actualiza los índices secundarios.
         """
         if len(values) != len(self.schema):
             raise ValueError(
                 f"La tabla '{self.name}' espera {len(self.schema)} valores, recibió {len(values)}"
             )
-        return self.data_file.insert(values)
+
+        # Inserción guiada por el Árbol B+ Clustered o directa en el archivo físico
+        if self.clustered_index:
+            key = values[self.key_index]
+            rid = self.clustered_index.insert(key, values)
+        else:
+            rid = self.data_file.insert(values)
+
+        # Actualización automática de índices secundarios (Unclustered)
+        if rid is not None:
+            for col_idx, indexes in self.secondary_indexes.items():
+                key = values[col_idx]
+                for idx in indexes:
+                    idx._insert_ref(key, rid)
+
+        return rid
 
     def get(self, rid: RID) -> list | None:
         """
@@ -57,35 +83,41 @@ class Table:
 
     def delete(self, rid: RID) -> bool:
         """
-        Elimina un registro dado su RID.
+        Elimina un registro y limpia sus entradas en los índices secundarios.
         """
-        return self.data_file.delete(rid)
+        record_values = self.get(rid)
+        if record_values is None:
+            return False
 
-    def update(self, rid: RID, new_values: list) -> RID | None:
-        """
-        Actualiza un registro borrando la versión vieja e insertando la nueva.
-        Retorna el nuevo RID asignado.
-        """
-        if len(new_values) != len(self.schema):
-            raise ValueError(
-                f"La tabla '{self.name}' espera {len(self.schema)} valores, recibió {len(new_values)}"
-            )
-        
-        if self.delete(rid):
-            return self.insert(new_values)
-        return None
+        ok = self.data_file.delete(rid)
 
-    # ---------- Búsquedas por Clave ----------
+        # Remover referencias de los índices secundarios
+        if ok:
+            for col_idx, indexes in self.secondary_indexes.items():
+                key = record_values[col_idx]
+                for idx in indexes:
+                    if hasattr(idx, "delete_ref"):
+                        idx.delete_ref(key, rid)
+                    else:
+                        idx.delete(key)
+
+        return ok
 
     def search_by_key(self, key_value) -> list[list]:
         """
-        Busca registros por el valor de su clave primaria.
-        Usa la búsqueda ordenada en SequentialFile o escaneo en HeapFile.
+        Busca por clave priorizando el Árbol B+ Clustered si está disponible.
         """
+        if self.clustered_index:
+            refs = self.clustered_index.search(key_value)
+            if refs is None:
+                return []
+            if not isinstance(refs, list):
+                refs = [refs]
+            return [self.data_file.fetch(ref) for ref in refs]
+
         if self.file_type == "sequential" and hasattr(self.data_file, "search"):
             return [list(record.params) for record in self.data_file.search(key_value)]
         
-        # Para HeapFile: escaneo lineal
         results = []
         for _, record_params in self.scan():
             if record_params[self.key_index] == key_value:
@@ -96,6 +128,9 @@ class Table:
         """
         Elimina registro(s) que coincidan con la clave primaria.
         """
+        if self.clustered_index:
+            return self.clustered_index.delete(key_value)
+
         if self.file_type == "sequential" and hasattr(self.data_file, "delete_by_key"):
             return self.data_file.delete_by_key(key_value)
         
@@ -105,8 +140,6 @@ class Table:
                 if self.delete(rid):
                     deleted_any = True
         return deleted_any
-
-    # ---------- Iteración y Cierre ----------
 
     def scan(self):
         """
