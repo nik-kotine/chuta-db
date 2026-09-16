@@ -1,17 +1,21 @@
 import os
 from storage.storage_manager import StorageManager
 
-def limpiar_entorno(db_name="test_db"):
-    cat_file = f"{db_name}_catalog.json"
-    if os.path.exists(cat_file):
-        os.remove(cat_file)
+def limpiar_entorno():
+    for filename in [
+        "sys_tables.dat",
+        "sys_columns.dat",
+        "usuarios.dat",
+        "productos.dat",
+    ]:
+        if os.path.exists(filename):
+            os.remove(filename)
 
 def test_storage_manager_lifecycle():
-    db_name = "test_db"
-    limpiar_entorno(db_name)
+    limpiar_entorno()
 
     # 1. Inicializar StorageManager
-    with StorageManager(db_name=db_name) as sm:
+    with StorageManager() as sm:
         
         # Crear una tabla tipo Heap
         tabla_usuarios = sm.create_table(
@@ -43,9 +47,9 @@ def test_storage_manager_lifecycle():
     print("Ciclo de vida del StorageManager: OK")
 
     # 2. Test de Persistencia (reabrir la base de datos)
-    with StorageManager(db_name=db_name) as sm_reloaded:
-        assert "usuarios" in sm_reloaded.catalog
-        assert "productos" in sm_reloaded.catalog
+    with StorageManager() as sm_reloaded:
+        assert sm_reloaded.catalog.get_table_info("usuarios") is not None
+        assert sm_reloaded.catalog.get_table_info("productos") is not None
         
         # Reabrir la tabla de usuarios y verificar datos
         t_usr = sm_reloaded.open_table("usuarios")
@@ -55,14 +59,14 @@ def test_storage_manager_lifecycle():
     print("Persistencia del catálogo: OK")
 
     # 3. Test de Drop Table
-    with StorageManager(db_name=db_name) as sm:
+    with StorageManager() as sm:
         sm.drop_table("usuarios")
-        assert "usuarios" not in sm.catalog
+        assert sm.catalog.get_table_info("usuarios") is None
         
         # Archivo físico eliminado
         assert not os.path.exists("usuarios.dat")
 
-    limpiar_entorno(db_name)
+    limpiar_entorno()
     print("Eliminación de tablas (Drop): OK")
 
 if __name__ == "__main__":
