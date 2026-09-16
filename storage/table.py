@@ -2,7 +2,7 @@ from storage.buffer_manager import BufferManager
 from storage.rid import RID
 from storage.files.heap_file import HeapFile 
 from storage.files.sequential_file import SequentialFile
-
+from storage.constraints_manager import ConstraintsManager
 class Table:
     """
     Representa una tabla lógica en la base de datos.
@@ -15,7 +15,10 @@ class Table:
         schema: list[str], 
         buffer_manager: BufferManager, 
         file_type: str = "heap",
-        key_index: int = 0
+        key_index: int = 0,
+        not_null_columns: list[int] = None,
+        unique_columns: list[int] = None,
+        check_constraints: list[callable] = None
     ):
         self.name = name
         self.schema = schema
@@ -23,6 +26,13 @@ class Table:
         self.file_type = file_type.lower()
         self.key_index = key_index
         self.filename = f"{self.name}.dat"
+        
+        self.constraints_manager = ConstraintsManager(
+            table=self,
+            not_null_columns=not_null_columns,
+            unique_columns=unique_columns,
+            check_constraints=check_constraints
+        )
 
         # Referencia al índice primario agrupado (si existe)
         self.clustered_index = None
@@ -58,6 +68,8 @@ class Table:
             raise ValueError(
                 f"La tabla '{self.name}' espera {len(self.schema)} valores, recibió {len(values)}"
             )
+
+        self.constraints_manager.validate_insert(values)
 
         # Inserción guiada por el Árbol B+ Clustered o directa en el archivo físico
         if self.clustered_index:
