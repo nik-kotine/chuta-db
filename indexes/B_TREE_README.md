@@ -2,9 +2,17 @@
 
 Este documento se va completando a medida que se implementa cada archivo.
 
+## `b_tree_key_codec.py` -- keys de tipo `int` o `str`
+
+Las keys del árbol soportan `int` o `str` (una misma instancia de árbol debe ser homogénea -- es un índice sobre una columna de un solo tipo, mezclar tipos en el mismo árbol revienta con `TypeError` al comparar). `encode_key`/`decode_key` codifican con un tag de 1 byte (`i`/`s`) seguido del payload (8 bytes big-endian para `int`, UTF-8 para `str`).
+
+Hay un tope: `MAX_KEY_SIZE = 512` bytes (incluye el tag). No es una limitación arbitraria -- viene de que cada página del árbol mide `PAGE_SIZE = 4096` bytes fijos, y sin un tope una sola key gigante (ej. un párrafo entero) podría no entrar ni en una página, o dejar muy pocas entradas por página y arruinar el fanout que le da al árbol su altura logarítmica. Todos los motores reales hacen lo mismo (Postgres corta ~2700 bytes, InnoDB ~767-3072 según el motor). Insertar una key que excede el tope levanta `ValueError` directo -- no se trunca ni se corrompe silenciosamente.
+
+**Fuera de alcance:** esto es soporte de string **en el árbol** (las keys de ruteo/búsqueda). `b_plus_unclustered.py` ya lo aprovecha de punta a punta (probado contra un `HeapFile` real, ver `test_b_plus_unclustered.py`). `b_plus_clustered.py` es más restringido: su key es un campo del `record_format` de `SequentialFile`, que sigue siendo un struct de tamaño fijo (`FixedLengthRecordSerializer`) -- soportar ahí una PK de tipo string es un cambio aparte, en la capa de storage, no en el árbol.
+
 ## `b_tree_leaf_page.py`
 
-En este archivo se maneja la pagina hoja de un B+ Tree: guarda un arreglo denso y **siempre ordenado por `key`** de entradas de tamaño fijo `(key, ref)`, donde `ref` es una referencia opaca al registro real (un `RID` hacia `HeapFile`, para la variante no agrupada, o hacia `SequentialFile`, para la variante agrupada). A diferencia de `SlottedPage` (`heapfile/page.py`), no usa un slot directory de largo variable: como las entradas son de tamaño fijo, insertar/eliminar se hace desplazando el arreglo, lo que permite hacer busqueda binaria dentro de la pagina y que `split()` pueda dividirla por la mitad de forma directa.
+En este archivo se maneja la pagina hoja de un B+ Tree: guarda un directorio denso y **siempre ordenado por `key`** de entradas `(key, ref)`, donde `ref` es una referencia opaca al registro real (un `RID` hacia `HeapFile`, para la variante no agrupada, o hacia `SequentialFile`, para la variante agrupada). Como la `key` es de largo variable (ver `b_tree_key_codec.py`), cada entrada del directorio guarda solo `(key_offset, key_len, ref)` de tamaño fijo, apuntando a los bytes reales de la key en un área que crece desde el final de la página -- mismo esquema que `SlottedPage` (`heapfile/page.py`), pero el directorio se mantiene siempre ordenado por key (no por orden de inserción) y sin tombstones: toda mutación (`insert`/`delete`/`split`/`borrow_*`/`merge_with_right`) reescribe la página entera compactada vía `_rewrite()` en vez de desplazar bytes in-place, porque el tamaño de cada entrada varía.
 
 Las hojas se encadenan entre si via `next_leaf_id`, formando una lista enlazada que permite recorrer el indice por rango sin volver a subir por el arbol.
 
@@ -42,7 +50,7 @@ Divide la pagina en dos mitades cuando no entra una insercion. La segunda mitad 
 
 5. `is_underflow` / `can_lend`
 
-Chequean si la hoja quedó por debajo del mínimo de entradas (`MIN_ENTRIES = MAX_ENTRIES // 2`) o si tiene de sobra para prestarle una a un hermano sin quedar ella misma corta.
+Como el tamaño de cada entrada varía, el umbral ya no es un conteo fijo (`MIN_ENTRIES`) sino ocupación en bytes: `is_underflow()` es `True` si la página usa menos del 25% de su capacidad (`MIN_USED_BYTES = CAPACITY_BYTES // 4`). `can_lend()` chequea el peor caso (asume que se presta la entrada más grande posible, `MAX_ENTRY_SIZE`, porque no se sabe de antemano cuál se va a prestar) y devuelve `True` solo si después de eso la página seguiría por encima del mínimo. El 25% (no el 50% clásico de arreglos de tamaño fijo) deja margen de sobra: dos hojas en underflow fusionándose ocupan como mucho ~50% de una página más una entrada, lejos de desbordar `PAGE_SIZE`.
 
 6. `borrow_from_left` / `borrow_from_right`
 
@@ -54,7 +62,7 @@ Fusiona el hermano derecho completo dentro de esta hoja, cuando ninguno de los d
 
 ## `b_tree_internal_page.py`
 
-Página interna del B+ Tree: guarda claves de ruteo y punteros a páginas hijas, sin ningún dato del archivo real (los nodos internos son puro directorio). Misma idea de arreglo denso y ordenado que la hoja, pero acá son dos arreglos paralelos: N claves y N+1 hijos.
+Página interna del B+ Tree: guarda claves de ruteo y punteros a páginas hijas, sin ningún dato del archivo real (los nodos internos son puro directorio). Mismo esquema de largo variable que la hoja para las claves (directorio ordenado + área de bytes al final de la página), pero los hijos (`child_page_id`) sí son de tamaño fijo -- van pegados justo después del directorio de claves, y su offset se recalcula cada vez que cambia la cantidad de claves.
 
 1. `find_child`
 
@@ -102,7 +110,7 @@ Igual que `find_child`, pero devuelve el índice del hijo en vez del `page_id`. 
 
 7. `is_underflow` / `can_lend` / `delete_key_at`
 
-Mismo rol que en la hoja, más `delete_key_at(index)`, que quita una clave y su hijo de la derecha tras una fusión.
+Mismo criterio por ocupación en bytes que en la hoja (ver esa sección), más `delete_key_at(index)`, que quita una clave y su hijo de la derecha tras una fusión.
 
 8. `borrow_from_left` / `borrow_from_right`
 
@@ -168,10 +176,10 @@ Variante no agrupada: conecta `BPlusTreeBase` con un `HeapFile` ya abierto (para
 
 ## Tests
 
-- `test_b_tree_base.py`: lógica del árbol sola (storage falso en memoria) -- insert/search, split de hoja forzado, `range_search` cruzando hojas, persistencia, delete simple, delete forzando redistribución/fusión, y colapso de la raíz.
+- `test_b_tree_base.py`: lógica del árbol sola (storage falso en memoria) -- insert/search, split de hoja forzado, `range_search` cruzando hojas, persistencia, delete simple, delete forzando redistribución/fusión, colapso de la raíz, y (nuevo) keys de tipo `str`: insert/search/range_search/delete, split forzado con keys largas, y que una key que excede `MAX_KEY_SIZE` se rechace con `ValueError` en vez de corromper la página.
 - `test_b_plus_clustered.py`: contra `SequentialFile` real -- insert/search/delete, que el orden físico coincida con el del índice, persistencia, y el reindexado automático tras un `reorganize()` forzado.
-- `test_b_plus_unclustered.py`: contra `HeapFile` real -- insert/search/delete, que `range_search` ordene bien aunque el heap esté desordenado, y dos índices compartiendo el mismo `HeapFile`.
-- `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` y `delete()`, espacio en disco y RAM retenida, a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad.
+- `test_b_plus_unclustered.py`: contra `HeapFile` real -- insert/search/delete, que `range_search` ordene bien aunque el heap esté desordenado, y dos índices compartiendo el mismo `HeapFile`. Probado también de punta a punta con keys de tipo `str` (ver `b_tree_key_codec.py`).
+- `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` y `delete()`, espacio en disco y RAM retenida, a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad. **Nota:** desde que las páginas pasaron a largo variable, `MAX_ENTRIES`/`MAX_KEYS` (que este test importa) ya no son la capacidad real de una página sino el peor caso (todas las keys al tope de `MAX_KEY_SIZE`) -- con las keys `int` chicas que usa este test la capacidad real es mucho mayor. La tabla de abajo sigue siendo válida porque mide directo `páginas leídas`, no se apoya en esos valores. Sigue teniendo el `assert` a nivel de módulo ya conocido como flaky (ver más abajo), sin relación con este cambio.
 
 ## `b_tree_base.py` y el buffer pool
 
