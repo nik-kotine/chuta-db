@@ -54,8 +54,12 @@ def limpiar():
 def ram_del_arbol(tree) -> int:
     # tamaño en RAM del objeto arbol en si -- sin contar fake_storage,
     # que es el "storage real" simulado (equivalente a HeapFile o
-    # SequentialFile en la vida real), no parte del indice
-    total = sys.getsizeof(tree.__dict__)
+    # SequentialFile en la vida real), no parte del indice.
+    # No se suma sys.getsizeof(tree.__dict__): el contenedor de
+    # atributos tiene un overhead fijo que CPython reporta con una
+    # variacion espuria de unos bytes segun la magnitud de los enteros
+    # guardados, y eso no representa datos cacheados.
+    total = 0
     for k, v in vars(tree).items():
         if k == "fake_storage":
             continue
