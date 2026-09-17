@@ -2,8 +2,8 @@ from storage.formats.serializers.fixed_length_serializer import FixedLengthRecor
 
 def test_fixed_length_record_format():
     # Formato: Int (4 bytes), Int (4 bytes), Double (8 bytes)
-    fmt_str = "iid"
-    serializer = FixedLengthRecordSerializer(fmt_str)
+    fmt = ["int", "int", "double precision"]
+    serializer = FixedLengthRecordSerializer(fmt)
 
     datos_originales = [42, 100, 3.14159]
 

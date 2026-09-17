@@ -88,4 +88,4 @@ class BPlusTreeClustered(BPlusTreeBase):
         self._reorganize_count = self.sequential_file.reorganize_count
 
     def close(self):
-        self.buffer_manager.close()
+        self.buffer_manager.close(self.file_manager)

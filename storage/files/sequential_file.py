@@ -1,5 +1,6 @@
 import struct
 from storage.buffer_manager import BufferManager
+from storage.file_manager import FileManager
 from storage.rid import RID, RID_SIZE, DELETED_SIZE
 from storage.seq_record import Record
 from storage.pages.fixed_page import FixedPage
@@ -22,9 +23,12 @@ class SequentialFile(RecordFile):
         buffer_manager: BufferManager,
         page_size: int,
         record_format: list[str],
+        file_manager: FileManager = None,
     ):
         self.buffer_manager = buffer_manager
-        self.file_manager = buffer_manager.file_manager
+        self.file_manager = file_manager or getattr(buffer_manager, "active_file", None)
+        if self.file_manager is None:
+            raise ValueError("SequentialFile necesita un FileManager para operar")
         self.page_size = page_size
         self.key_index = 0
 
@@ -86,7 +90,7 @@ class SequentialFile(RecordFile):
         return RID(phys_page_id, slot_id)
 
     def _load_page(self, phys_page_id: int):
-        page_ba = self.buffer_manager.fetch_page(phys_page_id)
+        page_ba = self.buffer_manager.fetch_page(phys_page_id, self.file_manager)
         if len(page_ba) < self.page_size:
             page_ba.extend(b"\x00" * (self.page_size - len(page_ba)))
         return self.page_class(page_ba, self.page_size, self.serializer)
@@ -101,7 +105,7 @@ class SequentialFile(RecordFile):
         try:
             return page.get_record(slot_id)
         finally:
-            self.buffer_manager.unpin_page(phys_page_id)
+            self.buffer_manager.unpin_page(phys_page_id, self.file_manager)
 
     def _set_record(self, rid: RID, record: Record):
         if rid is None or rid == (-1, -1) or getattr(rid, "page_id", -1) == -1:
@@ -110,9 +114,9 @@ class SequentialFile(RecordFile):
         page = self._load_page(phys_page_id)
         try:
             page.set_record(slot_id, record)
-            self.buffer_manager.mark_dirty(phys_page_id)
+            self.buffer_manager.mark_dirty(phys_page_id, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(phys_page_id)
+            self.buffer_manager.unpin_page(phys_page_id, self.file_manager)
 
     def _first_live_in_page(self, phys_page_id: int):
         page = self._load_page(phys_page_id)
@@ -123,7 +127,7 @@ class SequentialFile(RecordFile):
                     return slot_id, record
             return None
         finally:
-            self.buffer_manager.unpin_page(phys_page_id)
+            self.buffer_manager.unpin_page(phys_page_id, self.file_manager)
 
     def _last_live_in_page(self, phys_page_id: int):
         page = self._load_page(phys_page_id)
@@ -134,7 +138,7 @@ class SequentialFile(RecordFile):
                     return slot_id, record
             return None
         finally:
-            self.buffer_manager.unpin_page(phys_page_id)
+            self.buffer_manager.unpin_page(phys_page_id, self.file_manager)
 
     def _last_live_overall(self):
         for phys_page_id in range(self.n_pages, 0, -1):
@@ -168,7 +172,7 @@ class SequentialFile(RecordFile):
                 else:
                     high = mid - 1
             finally:
-                self.buffer_manager.unpin_page(mid)
+                self.buffer_manager.unpin_page(mid, self.file_manager)
 
         return result
 
@@ -195,7 +199,7 @@ class SequentialFile(RecordFile):
                         next_page, next_slot = hi, slot_id
                         break
             finally:
-                self.buffer_manager.unpin_page(hi)
+                self.buffer_manager.unpin_page(hi, self.file_manager)
 
         if next_rid is None:
             start = hi + 1 if hi < self.n_pages else self.n_pages + 1
@@ -220,7 +224,7 @@ class SequentialFile(RecordFile):
                             prev_key = record.params[self.key_index]
                             break
                 finally:
-                    self.buffer_manager.unpin_page(next_page)
+                    self.buffer_manager.unpin_page(next_page, self.file_manager)
 
             if prev_rid is None:
                 for page_id in range(next_page - 1, 0, -1):
@@ -268,7 +272,7 @@ class SequentialFile(RecordFile):
 
             return prev_rid, prev_key, next_rid, next_key
         finally:
-            self.buffer_manager.unpin_page(0)
+            self.buffer_manager.unpin_page(0, self.file_manager)
 
     def _find_neighbors(self, key, duplicates_after: bool = True):
         if self.first_rid is None:
@@ -299,9 +303,9 @@ class SequentialFile(RecordFile):
         page = self._load_page(phys_page_id)
         try:
             page.reset()
-            self.buffer_manager.mark_dirty(phys_page_id)
+            self.buffer_manager.mark_dirty(phys_page_id, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(phys_page_id)
+            self.buffer_manager.unpin_page(phys_page_id, self.file_manager)
         return phys_page_id
 
     def _insert_into_overflow(self, record: Record) -> RID | None:
@@ -310,7 +314,7 @@ class SequentialFile(RecordFile):
 
         try:
             if page.ensure_initialized():
-                self.buffer_manager.mark_dirty(0)
+                self.buffer_manager.mark_dirty(0, self.file_manager)
 
             if not page.has_space(total_slot_size):
                 if page.n_records == 0:
@@ -318,11 +322,11 @@ class SequentialFile(RecordFile):
                 return None
 
             slot_id = page.insert(record)
-            self.buffer_manager.mark_dirty(0)
+            self.buffer_manager.mark_dirty(0, self.file_manager)
 
             return self._make_rid(0, slot_id)
         finally:
-            self.buffer_manager.unpin_page(0)
+            self.buffer_manager.unpin_page(0, self.file_manager)
 
     def _iter_records(self, start_rid: RID | None = None):
         current_rid = self.first_rid if start_rid is None else start_rid
@@ -345,16 +349,16 @@ class SequentialFile(RecordFile):
 
             try:
                 if page.ensure_initialized():
-                    self.buffer_manager.mark_dirty(1)
+                    self.buffer_manager.mark_dirty(1, self.file_manager)
                 if not page.has_space(total_slot_size):
                     raise RuntimeError("Record is too big for insertion")
 
                 rid = self._make_rid(1, page.insert(record))
                 self.first_rid = rid
                 self.n_records = 1
-                self.buffer_manager.mark_dirty(1)
+                self.buffer_manager.mark_dirty(1, self.file_manager)
             finally:
-                self.buffer_manager.unpin_page(1)
+                self.buffer_manager.unpin_page(1, self.file_manager)
 
             self._write_header()
             return rid
@@ -480,9 +484,9 @@ class SequentialFile(RecordFile):
         page = self._load_page(0)
         try:
             page.reset()
-            self.buffer_manager.mark_dirty(0)
+            self.buffer_manager.mark_dirty(0, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(0)
+            self.buffer_manager.unpin_page(0, self.file_manager)
 
         rids = []
         pageindex = 1
@@ -492,8 +496,8 @@ class SequentialFile(RecordFile):
             record_size = self.serializer.get_size_of(record.params) + RID_SIZE + DELETED_SIZE
 
             if page is not None and not page.has_space(record_size):
-                self.buffer_manager.mark_dirty(pageindex)
-                self.buffer_manager.unpin_page(pageindex)
+                self.buffer_manager.mark_dirty(pageindex, self.file_manager)
+                self.buffer_manager.unpin_page(pageindex, self.file_manager)
                 pageindex += 1
                 page = None
 
@@ -509,8 +513,8 @@ class SequentialFile(RecordFile):
             slot_id = page.insert(record)
             rids.append(self._make_rid(pageindex, slot_id))
 
-        self.buffer_manager.mark_dirty(pageindex)
-        self.buffer_manager.unpin_page(pageindex)
+        self.buffer_manager.mark_dirty(pageindex, self.file_manager)
+        self.buffer_manager.unpin_page(pageindex, self.file_manager)
 
         self.first_rid = rids[0]
         for index in range(len(rids) - 1):
@@ -534,7 +538,7 @@ class SequentialFile(RecordFile):
                 yield rid, list(record.params)
 
     def _truncate(self, n_main_pages: int):
-        self.buffer_manager.flush_all()
+        self.buffer_manager.flush_file(self.file_manager)
         self.file_manager.truncate(
             self.file_manager.file_header_size + (n_main_pages + 1) * self.page_size
         )

@@ -6,6 +6,7 @@ from storage.formats.record_packer import RecordPacker
 from storage.rid import RID
 from storage.pages.slotted_page import SlottedPage, PAGE_SIZE, HEADER_SIZE, SLOT_SIZE, NULL_SLOT
 from storage.buffer_manager import BufferManager
+from storage.file_manager import FileManager
 
 # Pagina 0 del archivo: directorio persistente. Guarda cuantas paginas de
 # datos hay y, para cada una, su free_space_bytes actual. Evita re-escanear
@@ -26,7 +27,8 @@ NULL_DIR_PAGE = 0  # pagina 0 nunca es "la siguiente" de nadie, sirve de centine
 MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE
 
 class HeapFile(RecordFile):
-    def __init__(self, filename: str, buffer_manager: BufferManager, record_format: list[str] | str):
+    def __init__(self, filename: str, buffer_manager: BufferManager, record_format: list[str] | str,
+                 file_manager: FileManager = None):
         # Si el archivo no existe: crearlo e inicializar la pagina 0
         # (page_count = 0) vacia.
         # Si ya existe: abrirlo y cargar TODA la cadena de paginas de
@@ -35,7 +37,9 @@ class HeapFile(RecordFile):
         # que releerlas de disco en cada operacion.
         self.filename=filename
         self.buffer_manager = buffer_manager
-        self.file_manager = buffer_manager.file_manager
+        self.file_manager = file_manager or getattr(buffer_manager, "active_file", None)
+        if self.file_manager is None:
+            raise ValueError("HeapFile necesita un FileManager para operar")
         self.record_format = record_format
         if isinstance(record_format, str):
             self.record_format = [record_format]
@@ -55,21 +59,21 @@ class HeapFile(RecordFile):
             self.page_count=0
             self._dir_page_ids=[0]
 
-            dir_data = self.buffer_manager.fetch_page(0)
+            dir_data = self.buffer_manager.fetch_page(0, self.file_manager)
             struct.pack_into(DIR_HEADER_FORMAT, dir_data, 0, self.page_count, NULL_DIR_PAGE)
-            self.buffer_manager.mark_dirty(0)
-            self.buffer_manager.unpin_page(0)
+            self.buffer_manager.mark_dirty(0, self.file_manager)
+            self.buffer_manager.unpin_page(0, self.file_manager)
         else:
             page_id=0
             while True:
                 self._dir_page_ids.append(page_id)
-                dir_data = self.buffer_manager.fetch_page(page_id)
+                dir_data = self.buffer_manager.fetch_page(page_id, self.file_manager)
                 next_dir_page_id = struct.unpack_from(DIR_HEADER_FORMAT, dir_data, 0)[1]
 
                 if page_id == 0:
                     self.page_count = struct.unpack_from(DIR_HEADER_FORMAT, dir_data, 0)[0]
 
-                self.buffer_manager.unpin_page(page_id)
+                self.buffer_manager.unpin_page(page_id, self.file_manager)
 
                 if next_dir_page_id==NULL_DIR_PAGE:
                     break
@@ -94,9 +98,9 @@ class HeapFile(RecordFile):
         dir_index, offset = self._entry_location(page_id)
         dir_page_id = self._dir_page_ids[dir_index]
 
-        dir_data = self.buffer_manager.fetch_page(dir_page_id)
+        dir_data = self.buffer_manager.fetch_page(dir_page_id, self.file_manager)
         free_space = struct.unpack_from(DIR_ENTRY_FORMAT, dir_data, offset)[0]
-        self.buffer_manager.unpin_page(dir_page_id)
+        self.buffer_manager.unpin_page(dir_page_id, self.file_manager)
         return free_space
 
     def _set_free_space(self, page_id: int, free_bytes: int):
@@ -105,17 +109,17 @@ class HeapFile(RecordFile):
         dir_index, offset = self._entry_location(page_id)
         dir_page_id = self._dir_page_ids[dir_index]
 
-        dir_data = self.buffer_manager.fetch_page(dir_page_id)
+        dir_data = self.buffer_manager.fetch_page(dir_page_id, self.file_manager)
         struct.pack_into(DIR_ENTRY_FORMAT, dir_data, offset, free_bytes)
 
-        self.buffer_manager.mark_dirty(dir_page_id)
-        self.buffer_manager.unpin_page(dir_page_id)
+        self.buffer_manager.mark_dirty(dir_page_id, self.file_manager)
+        self.buffer_manager.unpin_page(dir_page_id, self.file_manager)
 
     def _update_page_count(self):
-        dir_data = self.buffer_manager.fetch_page(0)
+        dir_data = self.buffer_manager.fetch_page(0, self.file_manager)
         struct.pack_into(">I", dir_data, 0, self.page_count)
-        self.buffer_manager.mark_dirty(0)
-        self.buffer_manager.unpin_page(0)
+        self.buffer_manager.mark_dirty(0, self.file_manager)
+        self.buffer_manager.unpin_page(0, self.file_manager)
 
     # ---------- I/O de paginas de datos ----------
 
@@ -123,13 +127,13 @@ class HeapFile(RecordFile):
         return page_id * PAGE_SIZE  # page_id 0 = directorio, 1..N = datos
 
     def _load(self, page_id: int) -> SlottedPage:
-        raw = self.buffer_manager.fetch_page(page_id)
+        raw = self.buffer_manager.fetch_page(page_id, self.file_manager)
         return SlottedPage(page_id, data=raw)
 
     def _sync_page(self, page: SlottedPage):
         # Marcar la página de datos, actualizar su espacio libre y despinarla
-        self.buffer_manager.mark_dirty(page.page_id)
-        self.buffer_manager.unpin_page(page.page_id)
+        self.buffer_manager.mark_dirty(page.page_id, self.file_manager)
+        self.buffer_manager.unpin_page(page.page_id, self.file_manager)
         self._set_free_space(page.page_id, page.free_space_bytes)
 
     @property
@@ -153,19 +157,19 @@ class HeapFile(RecordFile):
         new_dir_id = self.next_page_id
         last_dir_id = self._dir_page_ids[-1]
 
-        last_data = self.buffer_manager.fetch_page(last_dir_id)
+        last_data = self.buffer_manager.fetch_page(last_dir_id, self.file_manager)
         struct.pack_into(">I", last_data, 4, new_dir_id)  # 2do campo del header = next_dir_page_id
-        self.buffer_manager.mark_dirty(last_dir_id)
-        self.buffer_manager.unpin_page(last_dir_id)
+        self.buffer_manager.mark_dirty(last_dir_id, self.file_manager)
+        self.buffer_manager.unpin_page(last_dir_id, self.file_manager)
 
         allocated_id = self.file_manager.allocate_page()
         if allocated_id != new_dir_id:
             new_dir_id = allocated_id
 
-        new_data =self.buffer_manager.fetch_page(new_dir_id)
+        new_data =self.buffer_manager.fetch_page(new_dir_id, self.file_manager)
         struct.pack_into(DIR_HEADER_FORMAT, new_data, 0, 0, NULL_DIR_PAGE) # (pc: 0, next:NULL=0)
-        self.buffer_manager.mark_dirty(new_dir_id)
-        self.buffer_manager.unpin_page(new_dir_id)
+        self.buffer_manager.mark_dirty(new_dir_id, self.file_manager)
+        self.buffer_manager.unpin_page(new_dir_id, self.file_manager)
 
         self._dir_page_ids.append(new_dir_id)
 
@@ -184,7 +188,7 @@ class HeapFile(RecordFile):
             self._add_dir_page()
 
         new_page_id = self.file_manager.allocate_page()
-        raw_data = self.buffer_manager.fetch_page(new_page_id)
+        raw_data = self.buffer_manager.fetch_page(new_page_id, self.file_manager)
         page = SlottedPage(new_page_id, data=raw_data)
 
         page.page_id = new_page_id
@@ -241,7 +245,7 @@ class HeapFile(RecordFile):
             return None
         page = self._load(page_id)
         record_bytes = page.get_record(slot_id)
-        self.buffer_manager.unpin_page(page_id)
+        self.buffer_manager.unpin_page(page_id, self.file_manager)
         if record_bytes is None:
             return None
         return self.packer.decode(record_bytes)
@@ -257,7 +261,7 @@ class HeapFile(RecordFile):
         if ok:
             self._sync_page(page)
         else:
-            self.buffer_manager.unpin_page(page_id)
+            self.buffer_manager.unpin_page(page_id, self.file_manager)
         return ok
 
     def compact(self, page_id: int):
@@ -292,10 +296,10 @@ class HeapFile(RecordFile):
                 if record is not None:
                     yield RID(page_id, slot_id), self.packer.decode(record)
                     
-            self.buffer_manager.unpin_page(page_id)
+            self.buffer_manager.unpin_page(page_id, self.file_manager)
 
     def close(self):
-        self.buffer_manager.close()
+        self.buffer_manager.close(self.file_manager)
 
     def __enter__(self):
         return self

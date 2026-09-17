@@ -36,7 +36,7 @@ class BPlusTreeBase:
     def _init_empty_index(self):
         # el archivo subyacente se reescribe entero -- cualquier pagina
         # que el buffer pool tuviera cacheada de antes queda invalida
-        self.buffer_manager.invalidate_all()
+        self.buffer_manager.invalidate_all(self.file_manager)
         self.file_manager.truncate(self.file_manager.file_header_size)
 
         root_page_id = self.file_manager.allocate_page()
@@ -65,20 +65,20 @@ class BPlusTreeBase:
     # (el camino descendido, hermanos durante rebalanceo, etc).
 
     def _load_leaf(self, page_id: int) -> BTreeLeafPage:
-        data = self.buffer_manager.fetch_page(page_id)
-        self.buffer_manager.unpin_page(page_id)
+        data = self.buffer_manager.fetch_page(page_id, self.file_manager)
+        self.buffer_manager.unpin_page(page_id, self.file_manager)
         return BTreeLeafPage(page_id, data=data)
 
     def _load_internal(self, page_id: int) -> BTreeInternalPage:
-        data = self.buffer_manager.fetch_page(page_id)
-        self.buffer_manager.unpin_page(page_id)
+        data = self.buffer_manager.fetch_page(page_id, self.file_manager)
+        self.buffer_manager.unpin_page(page_id, self.file_manager)
         return BTreeInternalPage(page_id, data=data)
 
     def _save_page(self, page) -> None:
-        buf = self.buffer_manager.fetch_page(page.page_id)
+        buf = self.buffer_manager.fetch_page(page.page_id, self.file_manager)
         buf[:] = page.data
-        self.buffer_manager.mark_dirty(page.page_id)
-        self.buffer_manager.unpin_page(page.page_id)
+        self.buffer_manager.mark_dirty(page.page_id, self.file_manager)
+        self.buffer_manager.unpin_page(page.page_id, self.file_manager)
 
     def _allocate_page_id(self) -> int:
         return self.file_manager.allocate_page()
