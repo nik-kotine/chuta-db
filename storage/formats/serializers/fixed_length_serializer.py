@@ -68,7 +68,7 @@ class FixedLengthRecordSerializer(RecordSerializer):
         for (fmt, _), value in zip(self.field_formats, unpacked):
             if fmt[-1] == "s":
                 if isinstance(value, bytes):
-                    result.append(value.decode("utf-8"))
+                    result.append(value.decode("utf-8").rstrip("\x00"))
                 else:
                     result.append(value)
             else:

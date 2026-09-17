@@ -2,7 +2,9 @@ import os
 import struct
 from collections import namedtuple
 from storage.record_file import RecordFile
-from storage.formats.record_packer import RecordPacker
+from storage.formats.data_types import return_format
+from storage.formats.serializers.fixed_length_serializer import FixedLengthRecordSerializer
+from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from storage.rid import RID
 from storage.pages.slotted_page import SlottedPage, PAGE_SIZE, HEADER_SIZE, SLOT_SIZE, NULL_SLOT
 from storage.buffer_manager import BufferManager
@@ -43,9 +45,13 @@ class HeapFile(RecordFile):
         self.record_format = record_format
         if isinstance(record_format, str):
             self.record_format = [record_format]
+
+        self.variable_length = any(return_format(t)[1] == -1 for t in self.record_format)
+
+        if self.variable_length:
+            self.serializer = VariableLengthRecordSerializer(self.record_format)
         else:
-            self.record_format = record_format
-        self.packer = RecordPacker(self.record_format)
+            self.serializer = FixedLengthRecordSerializer(self.record_format)
 
         file_size = os.path.getsize(filename) if os.path.exists(filename) else 0
         is_new = file_size <= self.file_manager.file_header_size
@@ -216,7 +222,7 @@ class HeapFile(RecordFile):
         #    SlottedPage.insert.
         # 3. Si ninguna alcanza, pedir pagina nueva con _new_page.
         # Devuelve el RID (page_id, slot_id) del registro insertado.
-        record_data = self.packer.encode(values)
+        record_data = self.serializer.encode(values)
 
         if len(record_data) > MAX_RECORD_SIZE:
             raise ValueError(f"Record's length exceeds maximum: {len(record_data)} bytes, maximum {MAX_RECORD_SIZE}")
@@ -248,7 +254,7 @@ class HeapFile(RecordFile):
         self.buffer_manager.unpin_page(page_id, self.file_manager)
         if record_bytes is None:
             return None
-        return self.packer.decode(record_bytes)
+        return self.serializer.decode(record_bytes)
 
     def delete(self, rid: RID) -> bool:
         # Borra el registro en rid (delegado en SlottedPage.delete_record)
@@ -294,7 +300,7 @@ class HeapFile(RecordFile):
             for slot_id in range(page.slot_count):
                 record = page.get_record(slot_id)
                 if record is not None:
-                    yield RID(page_id, slot_id), self.packer.decode(record)
+                    yield RID(page_id, slot_id), self.serializer.decode(record)
                     
             self.buffer_manager.unpin_page(page_id, self.file_manager)
 
