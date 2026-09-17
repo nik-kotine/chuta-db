@@ -1,10 +1,11 @@
 import struct
-import os
 
 from indexes.b_tree_leaf_page import PAGE_SIZE, NULL_LEAF, BTreeLeafPage
 from indexes.b_tree_internal_page import BTreeInternalPage
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
 
-# Página 0 del archivo de índice, guarda dónde está la raíz y su altura
+# Header del archivo de índice, guarda dónde está la raíz y su altura
 ROOT_HEADER_FORMAT = ">I?B"  # root_page_id, root_is_leaf, height
 ROOT_HEADER_SIZE = struct.calcsize(ROOT_HEADER_FORMAT)
 
@@ -13,67 +14,74 @@ class BPlusTreeBase:
     # Lógica común del árbol (búsqueda, inserción, borrado). No sabe
     # de HeapFile ni SequentialFile, eso lo llenan las subclases.
 
-    def __init__(self, index_filename: str):
-      
-        self.index_filename=index_filename
-        is_new=not os.path.exists(index_filename)
-        self.file=open(index_filename,"w+b" if is_new else "r+b")
+    def __init__(self, index_filename: str, buffer_frames: int = 50):
+
+        self.index_filename = index_filename
+        self.file_manager = FileManager(index_filename, PAGE_SIZE, ROOT_HEADER_SIZE)
+        self.buffer_manager = BufferManager(self.file_manager, buffer_frames)
+
+        is_new = len(self.file_manager.read_header()) < ROOT_HEADER_SIZE
 
         if is_new:
             self._init_empty_index()
         else:
             self._load_root_header()
 
-    # crea (o recrea) un indice vacio: pag 0 es header, pag 1 es hoja
-    # vacia que arranca como raiz. Separado de __init__ para que
-    # _reindex() en las subclases lo pueda reusar cuando haga falta
-    # reconstruir el indice desde cero (por ejemplo, si
-    # SequentialFile.reorganize() invalido los RID guardados)
+    # crea (o recrea) un indice vacio: la pagina 0 es la hoja vacia
+    # que arranca como raiz (el header de la raiz vive aparte, en el
+    # header del archivo). Separado de __init__ para que _reindex() en
+    # las subclases lo pueda reusar cuando haga falta reconstruir el
+    # indice desde cero (por ejemplo, si SequentialFile.reorganize()
+    # invalido los RID guardados)
     def _init_empty_index(self):
-        self.file.truncate(0)
-        self.file.seek(0)  # truncate no mueve el puntero, hay que reposicionarlo
-        self.file.write(b"\x00"*PAGE_SIZE)
-        root_leaf=BTreeLeafPage(1)
-        self.file.write(root_leaf.data)
-        self.root_page_id=1
-        self.root_is_leaf=True
-        self.height=0
-        self._save_root_header()  # sin esto la pagina 0 se queda en ceros
+        # el archivo subyacente se reescribe entero -- cualquier pagina
+        # que el buffer pool tuviera cacheada de antes queda invalida
+        self.buffer_manager.invalidate_all()
+        self.file_manager.truncate(self.file_manager.file_header_size)
 
-    # -------- página 0: persistencia de la raiz ---------
+        root_page_id = self.file_manager.allocate_page()
+        root_leaf = BTreeLeafPage(root_page_id)
+        self._save_page(root_leaf)
+
+        self.root_page_id = root_page_id
+        self.root_is_leaf = True
+        self.height = 0
+        self._save_root_header()  # sin esto el header se queda en ceros
+
+    # -------- header del archivo: persistencia de la raiz ---------
 
     def _load_root_header(self):
-        self.file.seek(0)
-        header=self.file.read(ROOT_HEADER_SIZE)
-        self.root_page_id, self.root_is_leaf, self.height=struct.unpack(ROOT_HEADER_FORMAT, header)
+        header = self.file_manager.read_header()
+        self.root_page_id, self.root_is_leaf, self.height = struct.unpack(ROOT_HEADER_FORMAT, header)
 
     def _save_root_header(self):
-        self.file.seek(0)
-        self.file.write(struct.pack(ROOT_HEADER_FORMAT,self.root_page_id, self.root_is_leaf, self.height))
-        self.file.flush()
+        header = struct.pack(ROOT_HEADER_FORMAT, self.root_page_id, self.root_is_leaf, self.height)
+        self.file_manager.write_header(header)
 
     # ---------- I/O de paginas del arbol (hoja o nodo interno) ----------
+    # cada load/save es autocontenido (pin+unpin en el mismo metodo, sin
+    # quedarse con una pagina "prestada" del pool) para no arriesgar
+    # pin leaks cuando una operacion sostiene varias paginas a la vez
+    # (el camino descendido, hermanos durante rebalanceo, etc).
 
     def _load_leaf(self, page_id: int) -> BTreeLeafPage:
-        self.file.seek(page_id*PAGE_SIZE)
-        data=bytearray(self.file.read(PAGE_SIZE))
+        data = self.buffer_manager.fetch_page(page_id)
+        self.buffer_manager.unpin_page(page_id)
         return BTreeLeafPage(page_id, data=data)
 
     def _load_internal(self, page_id: int) -> BTreeInternalPage:
-        self.file.seek(page_id*PAGE_SIZE)
-        data=bytearray(self.file.read(PAGE_SIZE))
+        data = self.buffer_manager.fetch_page(page_id)
+        self.buffer_manager.unpin_page(page_id)
         return BTreeInternalPage(page_id, data=data)
 
     def _save_page(self, page) -> None:
-        self.file.seek(page.page_id*PAGE_SIZE)
-        self.file.write(page.data)
+        buf = self.buffer_manager.fetch_page(page.page_id)
+        buf[:] = page.data
+        self.buffer_manager.mark_dirty(page.page_id)
+        self.buffer_manager.unpin_page(page.page_id)
 
-    def _allocate_page_id(self) -> int: # igual q en filemanager
-        self.file.seek(0,2)
-        file_size=self.file.tell()
-        page_id=file_size//PAGE_SIZE
-        self.file.write(b"\x00"*PAGE_SIZE)
-        return page_id
+    def _allocate_page_id(self) -> int:
+        return self.file_manager.allocate_page()
 
     # ---------- hooks de almacenamiento ----------
     # Implementación en subclases clusterd y unclustered, acá es donde se tiene

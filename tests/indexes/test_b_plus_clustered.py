@@ -1,9 +1,18 @@
 import os
+import struct
 
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
+from storage.files.sequential_file import (
+    FILE_HEADER_FORMAT,
+    FILE_HEADER_SIZE,
+    SequentialFile,
+)
 from indexes.b_plus_clustered import BPlusTreeClustered
 
 INDEX_FILE = "test_clustered_index.bin"
 DATA_FILE = "test_clustered_data.bin"
+SCHEMA = ["integer", "integer"]
 
 
 def limpiar():
@@ -12,13 +21,24 @@ def limpiar():
             os.remove(f)
 
 
-def crear_arbol():
-    return BPlusTreeClustered(INDEX_FILE, DATA_FILE, page_size=4096, record_format="ii", buffer_frames=20)
+def crear_arbol(page_size=4096, buffer_frames=20):
+    # prepara el archivo de datos con su header + página de overflow,
+    # igual que lo hace Table al crear una tabla sequential
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "wb") as f:
+            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0))
+            f.write(b"\x00" * page_size)
+
+    fm = FileManager(DATA_FILE, page_size, FILE_HEADER_SIZE)
+    bm = BufferManager(fm, buffer_frames)
+    sf = SequentialFile(bm, page_size, SCHEMA)
+    tree = BPlusTreeClustered(INDEX_FILE, sf, buffer_frames=buffer_frames)
+    return tree, bm
 
 
 def test_insert_y_search():
     limpiar()
-    tree = crear_arbol()
+    tree, bm = crear_arbol()
 
     for key in [10, 20, 30, 40, 50]:
         tree.insert(key, (key, key * 100))
@@ -32,12 +52,13 @@ def test_insert_y_search():
     print("OK: insert/search contra SequentialFile real")
 
     tree.close()
+    bm.close()
     limpiar()
 
 
 def test_muchos_registros_y_delete():
     limpiar()
-    tree = crear_arbol()
+    tree, bm = crear_arbol()
 
     claves = list(range(1, 1000))
     for key in claves:
@@ -66,6 +87,7 @@ def test_muchos_registros_y_delete():
     print(f"OK: {len(claves)} inserts + {len(a_borrar)} deletes contra SequentialFile real")
 
     tree.close()
+    bm.close()
     limpiar()
 
 
@@ -74,7 +96,7 @@ def test_orden_fisico_igual_al_indice():
     # SequentialFile (su cadena de next_rid) tiene que coincidir con
     # el orden de las claves del arbol
     limpiar()
-    tree = crear_arbol()
+    tree, bm = crear_arbol()
 
     claves = [50, 10, 80, 30, 90, 20, 70, 40, 60]
     for key in claves:
@@ -91,19 +113,21 @@ def test_orden_fisico_igual_al_indice():
     print("OK: el orden fisico del SequentialFile coincide con el orden del indice")
 
     tree.close()
+    bm.close()
     limpiar()
 
 
 def test_persistencia():
     limpiar()
-    tree = crear_arbol()
+    tree, bm = crear_arbol()
 
     for key in range(1, 500):
         tree.insert(key, (key, key))
 
     tree.close()
+    bm.close()
 
-    tree2 = crear_arbol()
+    tree2, bm2 = crear_arbol()
     for key in [1, 250, 499]:
         ref = tree2.search(key)
         assert ref is not None
@@ -112,6 +136,7 @@ def test_persistencia():
     print("OK: persiste bien tras cerrar y reabrir (indice + datos)")
 
     tree2.close()
+    bm2.close()
     limpiar()
 
 
@@ -119,7 +144,7 @@ def test_reindex_automatico_tras_reorganize():
     # page_size chico para que el overflow se llene rapido y dispare
     # SequentialFile.reorganize() varias veces durante los inserts
     limpiar()
-    tree = BPlusTreeClustered(INDEX_FILE, DATA_FILE, page_size=128, record_format="ii", buffer_frames=100)
+    tree, bm = crear_arbol(page_size=128, buffer_frames=100)
 
     veces_antes = tree.sequential_file.reorganize_count
     claves = list(range(1, 300))
@@ -136,6 +161,7 @@ def test_reindex_automatico_tras_reorganize():
     print(f"OK: reorganize se disparó {tree.sequential_file.reorganize_count} veces, el índice se reconstruyó solo y sigue consistente")
 
     tree.close()
+    bm.close()
     limpiar()
 
 

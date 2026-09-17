@@ -183,3 +183,20 @@ class BufferManager:
         self.flush_all()
         self.file_manager.close()
 
+    def invalidate_all(self):
+        """
+        Descarta todas las paginas cacheadas sin persistirlas. Se usa
+        cuando el archivo subyacente fue reescrito por fuera del buffer
+        pool (por ejemplo, al reconstruir un indice desde cero), asi
+        que cualquier pagina en cache quedaria apuntando a contenido
+        que ya no corresponde a lo que hay en disco.
+        """
+        for frame in self.frames:
+            frame.phys_page_id = -1
+            frame.page_bin = None
+            frame.pin_count = 0
+            frame.dirty = False
+            frame.reference = False
+
+        self.page_table = {}
+

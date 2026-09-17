@@ -52,7 +52,7 @@ def test_insert_y_search_simple():
     assert tree.search(999) is None
     print("OK: insert y search simples andan bien, sin forzar ningún split")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -74,7 +74,7 @@ def test_forzar_split_de_hoja():
 
     print(f"OK: split de hojas y creación de raíz nueva anduvieron, altura final = {tree.height}")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -91,7 +91,7 @@ def test_range_search():
     assert claves_encontradas == list(range(100, 121))
     print("OK: range_search devuelve las claves en orden, cruzando varias hojas")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -103,7 +103,7 @@ def test_persistencia():
         tree.insert(key, f"valor{key}")
 
     altura_previa = tree.height
-    tree.file.close()
+    tree.buffer_manager.close()
 
     # reabrimos el mismo archivo de índice desde cero, sin la
     # instancia vieja -- si algo dependiera de estado en RAM no
@@ -114,7 +114,7 @@ def test_persistencia():
 
     print("OK: la raíz y la altura se recuperan bien tras cerrar y reabrir el índice")
 
-    tree2.file.close()
+    tree2.buffer_manager.close()
     limpiar()
 
 
@@ -134,7 +134,7 @@ def test_delete_simple():
 
     print("OK: delete simple, sin forzar rebalanceo")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -170,7 +170,7 @@ def test_delete_forzando_rebalanceo():
 
     print(f"OK: {len(a_borrar)} deletes con rebalanceo, altura antes={altura_antes}, despues={tree.height}")
 
-    tree.file.close()
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -202,7 +202,78 @@ def test_delete_hasta_colapsar_raiz():
 
     print("OK: la raiz colapsa de vuelta a una hoja cuando se borra casi todo")
 
-    tree.file.close()
+    tree.buffer_manager.close()
+    limpiar()
+
+
+def test_string_keys_insert_search_delete():
+    limpiar()
+    tree = FakeBPlusTree(TEST_INDEX_FILE)
+
+    claves = ["pera", "manzana", "uva", "banana", "kiwi", "frutilla"]
+    for key in claves:
+        tree.insert(key, f"valor-{key}")
+
+    for key in claves:
+        ref = tree.search(key)
+        assert ref is not None
+        assert tree._fetch_record(ref) == f"valor-{key}"
+
+    assert tree.search("no existe") is None
+
+    resultados = tree.range_search("banana", "manzana")
+    claves_en_rango = sorted(key for key, _ in resultados)
+    assert claves_en_rango == ["banana", "frutilla", "kiwi", "manzana"]
+
+    assert tree.delete("kiwi") is True
+    assert tree.search("kiwi") is None
+    assert tree.search("pera") is not None
+
+    print("OK: keys de tipo string -- insert, search, range_search y delete")
+
+    tree.buffer_manager.close()
+    limpiar()
+
+
+def test_string_keys_forzar_split():
+    limpiar()
+    tree = FakeBPlusTree(TEST_INDEX_FILE)
+
+    # keys largas (~50 bytes) para forzar split con relativamente
+    # pocas entradas, ya que la capacidad por pagina ahora depende del
+    # tamaño de las keys
+    claves = [f"palabra-numero-{i:05d}-de-relleno-para-hacer-la-key-larga" for i in range(300)]
+    for key in claves:
+        tree.insert(key, f"valor-{key}")
+
+    assert tree.height > 0  # tuvo que crecer más allá de una sola hoja
+
+    for key in claves:
+        ref = tree.search(key)
+        assert ref is not None
+        assert tree._fetch_record(ref) == f"valor-{key}"
+
+    print(f"OK: split de hojas con keys string, altura final = {tree.height}")
+
+    tree.buffer_manager.close()
+    limpiar()
+
+
+def test_key_string_excede_max_key_size():
+    limpiar()
+    tree = FakeBPlusTree(TEST_INDEX_FILE)
+
+    key_demasiado_larga = "x" * 1000  # supera MAX_KEY_SIZE=512
+
+    try:
+        tree.insert(key_demasiado_larga, "no deberia insertarse")
+        assert False, "insert con key demasiado larga debia fallar"
+    except ValueError:
+        pass
+
+    print("OK: una key mas larga que MAX_KEY_SIZE se rechaza con un error claro")
+
+    tree.buffer_manager.close()
     limpiar()
 
 
@@ -214,6 +285,9 @@ tests = [
     test_delete_simple,
     test_delete_forzando_rebalanceo,
     test_delete_hasta_colapsar_raiz,
+    test_string_keys_insert_search_delete,
+    test_string_keys_forzar_split,
+    test_key_string_excede_max_key_size,
 ]
 
 for test in tests:

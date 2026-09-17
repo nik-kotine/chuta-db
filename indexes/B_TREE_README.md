@@ -2,9 +2,17 @@
 
 Este documento se va completando a medida que se implementa cada archivo.
 
+## `b_tree_key_codec.py` -- keys de tipo `int` o `str`
+
+Las keys del árbol soportan `int` o `str` (una misma instancia de árbol debe ser homogénea -- es un índice sobre una columna de un solo tipo, mezclar tipos en el mismo árbol revienta con `TypeError` al comparar). `encode_key`/`decode_key` codifican con un tag de 1 byte (`i`/`s`) seguido del payload (8 bytes big-endian para `int`, UTF-8 para `str`).
+
+Hay un tope: `MAX_KEY_SIZE = 512` bytes (incluye el tag). No es una limitación arbitraria -- viene de que cada página del árbol mide `PAGE_SIZE = 4096` bytes fijos, y sin un tope una sola key gigante (ej. un párrafo entero) podría no entrar ni en una página, o dejar muy pocas entradas por página y arruinar el fanout que le da al árbol su altura logarítmica. Todos los motores reales hacen lo mismo (Postgres corta ~2700 bytes, InnoDB ~767-3072 según el motor). Insertar una key que excede el tope levanta `ValueError` directo -- no se trunca ni se corrompe silenciosamente.
+
+**Fuera de alcance:** esto es soporte de string **en el árbol** (las keys de ruteo/búsqueda). `b_plus_unclustered.py` ya lo aprovecha de punta a punta (probado contra un `HeapFile` real, ver `test_b_plus_unclustered.py`). `b_plus_clustered.py` es más restringido: su key es un campo del `record_format` de `SequentialFile`, que sigue siendo un struct de tamaño fijo (`FixedLengthRecordSerializer`) -- soportar ahí una PK de tipo string es un cambio aparte, en la capa de storage, no en el árbol.
+
 ## `b_tree_leaf_page.py`
 
-En este archivo se maneja la pagina hoja de un B+ Tree: guarda un arreglo denso y **siempre ordenado por `key`** de entradas de tamaño fijo `(key, ref)`, donde `ref` es una referencia opaca al registro real (un `RID` hacia `HeapFile`, para la variante no agrupada, o hacia `SequentialFile`, para la variante agrupada). A diferencia de `SlottedPage` (`heapfile/page.py`), no usa un slot directory de largo variable: como las entradas son de tamaño fijo, insertar/eliminar se hace desplazando el arreglo, lo que permite hacer busqueda binaria dentro de la pagina y que `split()` pueda dividirla por la mitad de forma directa.
+En este archivo se maneja la pagina hoja de un B+ Tree: guarda un directorio denso y **siempre ordenado por `key`** de entradas `(key, ref)`, donde `ref` es una referencia opaca al registro real (un `RID` hacia `HeapFile`, para la variante no agrupada, o hacia `SequentialFile`, para la variante agrupada). Como la `key` es de largo variable (ver `b_tree_key_codec.py`), cada entrada del directorio guarda solo `(key_offset, key_len, ref)` de tamaño fijo, apuntando a los bytes reales de la key en un área que crece desde el final de la página -- mismo esquema que `SlottedPage` (`heapfile/page.py`), pero el directorio se mantiene siempre ordenado por key (no por orden de inserción) y sin tombstones: toda mutación (`insert`/`delete`/`split`/`borrow_*`/`merge_with_right`) reescribe la página entera compactada vía `_rewrite()` en vez de desplazar bytes in-place, porque el tamaño de cada entrada varía.
 
 Las hojas se encadenan entre si via `next_leaf_id`, formando una lista enlazada que permite recorrer el indice por rango sin volver a subir por el arbol.
 
@@ -42,7 +50,7 @@ Divide la pagina en dos mitades cuando no entra una insercion. La segunda mitad 
 
 5. `is_underflow` / `can_lend`
 
-Chequean si la hoja quedó por debajo del mínimo de entradas (`MIN_ENTRIES = MAX_ENTRIES // 2`) o si tiene de sobra para prestarle una a un hermano sin quedar ella misma corta.
+Como el tamaño de cada entrada varía, el umbral ya no es un conteo fijo (`MIN_ENTRIES`) sino ocupación en bytes: `is_underflow()` es `True` si la página usa menos del 25% de su capacidad (`MIN_USED_BYTES = CAPACITY_BYTES // 4`). `can_lend()` chequea el peor caso (asume que se presta la entrada más grande posible, `MAX_ENTRY_SIZE`, porque no se sabe de antemano cuál se va a prestar) y devuelve `True` solo si después de eso la página seguiría por encima del mínimo. El 25% (no el 50% clásico de arreglos de tamaño fijo) deja margen de sobra: dos hojas en underflow fusionándose ocupan como mucho ~50% de una página más una entrada, lejos de desbordar `PAGE_SIZE`.
 
 6. `borrow_from_left` / `borrow_from_right`
 
@@ -54,7 +62,7 @@ Fusiona el hermano derecho completo dentro de esta hoja, cuando ninguno de los d
 
 ## `b_tree_internal_page.py`
 
-Página interna del B+ Tree: guarda claves de ruteo y punteros a páginas hijas, sin ningún dato del archivo real (los nodos internos son puro directorio). Misma idea de arreglo denso y ordenado que la hoja, pero acá son dos arreglos paralelos: N claves y N+1 hijos.
+Página interna del B+ Tree: guarda claves de ruteo y punteros a páginas hijas, sin ningún dato del archivo real (los nodos internos son puro directorio). Mismo esquema de largo variable que la hoja para las claves (directorio ordenado + área de bytes al final de la página), pero los hijos (`child_page_id`) sí son de tamaño fijo -- van pegados justo después del directorio de claves, y su offset se recalcula cada vez que cambia la cantidad de claves.
 
 1. `find_child`
 
@@ -102,7 +110,7 @@ Igual que `find_child`, pero devuelve el índice del hijo en vez del `page_id`. 
 
 7. `is_underflow` / `can_lend` / `delete_key_at`
 
-Mismo rol que en la hoja, más `delete_key_at(index)`, que quita una clave y su hijo de la derecha tras una fusión.
+Mismo criterio por ocupación en bytes que en la hoja (ver esa sección), más `delete_key_at(index)`, que quita una clave y su hijo de la derecha tras una fusión.
 
 8. `borrow_from_left` / `borrow_from_right`
 
@@ -160,20 +168,30 @@ Variante agrupada: conecta `BPlusTreeBase` con `SequentialFile`, que mantiene lo
 
 **Reindexado automático:** `SequentialFile` puede reorganizarse sola (overflow lleno en `insert`, espacio desperdiciado en `delete`), y `reorganize()` reasigna el RID de todos los registros vivos. Si eso pasa a mitad de una operación del árbol, seguir como si nada dejaría el índice apuntando a RIDs viejos. Por eso `SequentialFile.py` ahora expone `reorganize_count` (contador en RAM, se incrementa cada vez que `reorganize()` corre), y `b_plus_clustered.py` lo chequea después de cada `insert`/`delete`: si cambió, corta la operación con una excepción interna (`_ReindexNeeded`) y reconstruye el índice entero desde cero releyendo `SequentialFile` (`_reindex`). Probado con `page_size` chico para forzar reorganizaciones seguidas -- ver `test_b_plus_clustered.py`.
 
+**Complejidad real de `SequentialFile` (no solo la del árbol):** la tabla de "Complejidad medida" más abajo mide el árbol B+ solo, contra storage falso en memoria -- no dice nada de lo que pasa por debajo en la variante `clustered`. `SequentialFile.insert()`, `search()` y `delete()` dependen de `_find_neighbors(key)` para ubicar dónde encadenar/leer el registro, y hasta ahora esa función recorría la cadena lógica completa desde `first_rid` (O(n)). Eso significaba que, aunque el índice B+ resolviera la búsqueda en O(log n), cada operación real sobre la variante `clustered` seguía costando O(n) por debajo -- el índice no compraba nada de complejidad. Se arregló portando el fix de la rama `insertion` (`SequentialFile.py`, commits `306ecf9`/`432edca`): `_find_neighbors` ahora combina búsqueda binaria sobre las páginas principales (que están ordenadas físicamente por clave -- `_last_page_lt`/`_main_neighbors`, O(log n_pages)) con un recorrido acotado de la página de overflow (`_overflow_neighbors`, a lo sumo `max_records_per_page` registros). De paso se corrigieron dos costos O(n) más en `delete()`: `_wasted_space_ratio()` pasó a O(1) (ya usa los contadores `n_records`/`n_deleted` del header en vez de escanear todas las páginas), y se agregó `reorganize()` cuando una página principal se queda sin registros vivos, para que `_main_neighbors` no tenga que saltar cada vez más páginas vacías.
+
 ## `b_plus_unclustered.py`
 
 Variante no agrupada: conecta `BPlusTreeBase` con un `HeapFile` ya abierto (para que se pueda compartir entre varios índices no agrupados de la misma tabla). Usa un `RecordPacker` propio para empaquetar/desempaquetar los registros, porque `HeapFile.add()` pide bytes ya codificados (a diferencia de `SequentialFile`, que empaqueta solo).
 
 ## Tests
 
-- `test_b_tree_base.py`: lógica del árbol sola (storage falso en memoria) -- insert/search, split de hoja forzado, `range_search` cruzando hojas, persistencia, delete simple, delete forzando redistribución/fusión, y colapso de la raíz.
+- `test_b_tree_base.py`: lógica del árbol sola (storage falso en memoria) -- insert/search, split de hoja forzado, `range_search` cruzando hojas, persistencia, delete simple, delete forzando redistribución/fusión, colapso de la raíz, y (nuevo) keys de tipo `str`: insert/search/range_search/delete, split forzado con keys largas, y que una key que excede `MAX_KEY_SIZE` se rechace con `ValueError` en vez de corromper la página.
 - `test_b_plus_clustered.py`: contra `SequentialFile` real -- insert/search/delete, que el orden físico coincida con el del índice, persistencia, y el reindexado automático tras un `reorganize()` forzado.
-- `test_b_plus_unclustered.py`: contra `HeapFile` real -- insert/search/delete, que `range_search` ordene bien aunque el heap esté desordenado, y dos índices compartiendo el mismo `HeapFile`.
-- `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` y `delete()`, espacio en disco y RAM retenida, a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad.
+- `test_b_plus_unclustered.py`: contra `HeapFile` real -- insert/search/delete, que `range_search` ordene bien aunque el heap esté desordenado, y dos índices compartiendo el mismo `HeapFile`. Probado también de punta a punta con keys de tipo `str` (ver `b_tree_key_codec.py`).
+- `test_b_tree_complexity.py`: mide páginas de índice leídas por `search()` y `delete()`, espacio en disco y RAM retenida, a medida que crece N (100 a 100 000 registros), para confirmar empíricamente el costo `D·log_(R/2)(M)` de la slide de complejidad. **Nota:** desde que las páginas pasaron a largo variable, `MAX_ENTRIES`/`MAX_KEYS` (que este test importa) ya no son la capacidad real de una página sino el peor caso (todas las keys al tope de `MAX_KEY_SIZE`) -- con las keys `int` chicas que usa este test la capacidad real es mucho mayor. La tabla de abajo sigue siendo válida porque mide directo `páginas leídas`, no se apoya en esos valores. Sigue teniendo el `assert` a nivel de módulo ya conocido como flaky (ver más abajo), sin relación con este cambio.
+
+## `b_tree_base.py` y el buffer pool
+
+`BPlusTreeBase` ya no maneja su archivo de índice con `open()`/`struct` directo: usa su propio `FileManager`/`BufferManager` (mismas clases que `SequentialFile`/`HeapFile`, `storage/file_manager.py` y `storage/buffer_manager.py`), con `buffer_frames` configurable (default 50, pasado por las subclases). `_load_leaf`/`_load_internal`/`_save_page` hacen pin+unpin dentro del mismo método en vez de quedarse con una página "prestada" del pool -- necesario porque una sola operación (`insert`/`delete`) puede sostener varias páginas a la vez (el camino descendido, hermanos durante rebalanceo), y con el pool lleno eso podría gatillar evicciones a mitad de la operación. Cada mutación llama a `mark_dirty()` antes de soltar el pin, así que aunque el clock-sweep evicte una página entre que se lee y se vuelve a guardar, el contenido nuevo no se pierde.
+
+De paso, el header del archivo de índice (dónde está la raíz y su altura) dejó de ocupar una página entera de 4096 bytes -- ahora vive en el header compacto de 6 bytes que ya maneja `FileManager` (mismo esquema que `SequentialFile`). Por eso el tamaño en disco bajó (ver tabla más abajo, N=100 pasó de 8.0 KB a 4.0 KB).
+
+**Reindexado y el buffer pool:** cuando `_reindex()` (ver más abajo) llama a `_init_empty_index()` a mitad de la vida del árbol, el archivo subyacente se trunca y se reescribe entero -- pero el buffer pool podía seguir teniendo cacheadas páginas viejas con esos mismos `page_id`, y devolverlas como si fueran las nuevas. Por eso `BufferManager` ahora expone `invalidate_all()`, que `_init_empty_index()` llama antes de truncar.
 
 ## Complejidad medida
 
-Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈ 511), corriendo `test_b_tree_complexity.py`:
+Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈ 511), corriendo `test_b_tree_complexity.py` (medido después de migrar `b_tree_base.py` a `BufferManager`/`FileManager`):
 
 **Páginas leídas por operación (memoria secundaria):**
 
@@ -185,16 +203,21 @@ Con `MAX_ENTRIES = 340` por hoja y `MAX_KEYS = 510` por nodo interno (fanout ≈
 | 50 000 | 1 | 2.00 | 2.00 |
 | 100 000 | 1 | 2.00 | 2.00 |
 
-N creció 1000x (de 100 a 100 000) y las páginas leídas por búsqueda/borrado solo crecieron de 1 a 2 -- confirma que el costo es logarítmico (`D·log_(R/2)(M)`), no lineal. Que `páginas/delete` se mantenga igual de chico que `páginas/search` confirma también que el **rebalanceo funciona**: si `delete()` no reequilibrara bien el árbol, este número se iría degradando con cada borrado. Con este fanout, un único nodo raíz interno alcanza para indexar hasta ~511 × 340 ≈ 173 000 registros en altura 1; recién con más de eso el árbol pasaría a altura 2.
+N creció 1000x (de 100 a 100 000) y las páginas leídas por búsqueda/borrado solo crecieron de 1 a 2 -- confirma que el costo es logarítmico (`D·log_(R/2)(M)`), no lineal. Que `páginas/delete` se mantenga igual de chico que `páginas/search` confirma también que el **rebalanceo funciona**: si `delete()` no reequilibrara bien el árbol, este número se iría degradando con cada borrado. Con este fanout, un único nodo raíz interno alcanza para indexar hasta ~511 × 340 ≈ 173 000 registros en altura 1; recién con más de eso el árbol pasaría a altura 2. Estos números no cambiaron con la migración al buffer pool -- el pin/unpin es contable aparte, no agrega lecturas de página extra.
 
 **Espacio en disco y RAM:**
 
 | N | disco (KB) | bytes/registro | RAM del árbol (bytes) |
 |---|---|---|---|
-| 100 | 8.0 | 81.92 | 8 766 |
-| 1 000 | 24.0 | 24.58 | 8 766 |
-| 10 000 | 160.0 | 16.38 | 8 766 |
-| 50 000 | 904.0 | 18.51 | 8 766 |
+| 100 | 4.0 | 41.02 | ~590 |
+| 1 000 | 20.0 | 20.49 | ~590 |
+| 10 000 | 160.0 | 16.38 | ~580 |
+| 50 000 | 912.0 | 18.68 | ~575 |
+| 100 000 | 1 900.0 | 19.46 | ~565 |
+
+El disco bajó frente a la medición anterior (era 8.0/24.0/160.0/904.0 KB) por el header compacto explicado arriba. La "RAM del árbol" también bajó fuerte (de ~8766 a ~590 bytes) pero es en buena parte un artefacto de medición: `ram_del_arbol()` en el test usa `sys.getsizeof` superficial sobre los atributos del árbol, y antes eso incluía a `self.file`, un objeto `io.BufferedRandom` cuyo buffer interno de E/S (~8 KB) se contaba entero; ahora son `self.file_manager`/`self.buffer_manager`, objetos chicos cuyo contenido (`frames`, con las páginas cacheadas) no se cuenta porque `sys.getsizeof` no es recursivo.
+
+**Aviso -- test roto, no arreglado en esta migración:** `test_b_tree_complexity.py` tiene un `assert` a nivel de módulo (`max(ram_valores) - min(ram_valores) == 0`) que espera que la RAM medida sea *exactamente* igual en cada corrida para todo N. Nunca lo fue de forma exacta (ya fallaba antes de esta migración, con una diferencia de ~30 bytes) porque `sys.getsizeof` no es perfectamente determinístico entre corridas. Sigue rompiendo la colección de tests (`pytest tests/`) con ese archivo incluido; hay que correrlo con `--ignore=tests/test_b_tree_complexity.py` mientras alguien no relaje esa aserción (por ejemplo, con una tolerancia en vez de igualdad exacta).
 | 100 000 | 1 840.0 | 18.84 | 8 766 |
 
 El disco crece proporcional a N (con overhead esperable de páginas no 100% llenas tras splits -- el valor real de una entrada es 12 bytes). La **RAM se mantiene fija** sin importar N, porque `BPlusTreeBase` no cachea páginas entre llamadas: cada `_load_leaf`/`_load_internal` relee de disco, así que el árbol nunca retiene en memoria más que el objeto en sí (equivalente al patrón que ya usa `HeapFile`).

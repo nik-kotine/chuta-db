@@ -1,9 +1,6 @@
-import os
-import struct
-
 from indexes.b_tree_base import BPlusTreeBase
 from indexes.b_tree_leaf_page import RID
-from storage.files.sequential_file import SequentialFile, FILE_HEADER_FORMAT, FILE_HEADER_SIZE
+from storage.files.sequential_file import SequentialFile
 
 
 # señal interna: se usa para cortar insert()/delete() a mitad de
@@ -20,38 +17,22 @@ class BPlusTreeClustered(BPlusTreeBase):
     # que mantiene los registros ordenados físicamente por la misma
     # clave (por eso "agrupado", orden del índice = orden del dato).
 
-    @staticmethod
-    def _normalize_record_format(record_format):
-        if isinstance(record_format, (list, tuple)):
-            return list(record_format)
-
-        struct_types = {
-            "i": "integer",
-            "q": "bigint",
-            "h": "smallint",
-            "f": "real",
-            "d": "double precision",
-            "?": "boolean",
-        }
-        if record_format in struct_types:
-            return [struct_types[record_format]]
-        if record_format and all(token in struct_types for token in record_format):
-            return [struct_types[token] for token in record_format]
-        return [record_format]
-
-    def __init__(self, index_filename: str, sequential_file:SequentialFile):
-        super().__init__(index_filename)
-
-        # el archivo de datos necesita su propio header + página de
-        # overflow antes de abrirlo con FileManager, igual que hace
-        # create_sequential() en TestSequentialFile.py
+    def __init__(
+        self,
+        index_filename: str,
+        sequential_file: SequentialFile,
+        buffer_frames: int = 50
+    ):
+        super().__init__(index_filename, buffer_frames)
+        # el SequentialFile se inyecta ya construido (lo comparte la
+        # tabla, que es quien realmente lo crea)
         self.sequential_file = sequential_file
         self._reorganize_count = self.sequential_file.reorganize_count
 
     def _store_record(self, params):
-        # SequentialFile devuelve una tupla plana (page_id, slot_id),
-        # sin .page_id/.slot_id -- la envolvemos en RID para que la
-        # hoja la pueda guardar bien
+        # SequentialFile devuelve un RID (page_id, slot_id); como el
+        # orden físico coincide con el del índice, la hoja lo guarda
+        # tal cual
         page_id, slot_id = self.sequential_file.insert(params)
         self._check_reindex()
         return RID(page_id, slot_id)
@@ -107,4 +88,4 @@ class BPlusTreeClustered(BPlusTreeBase):
         self._reorganize_count = self.sequential_file.reorganize_count
 
     def close(self):
-        self.file.close()
+        self.buffer_manager.close()
