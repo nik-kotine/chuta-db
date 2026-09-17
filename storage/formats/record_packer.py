@@ -1,15 +1,16 @@
 import struct
 from storage.formats.record_format import RecordFormat
-
-"""
-Esta clase se encarga de convertir los registros a binario
-De momento, soporta los siguientes tipos en un objeto: int, float y string.
-"""
+from storage.formats.data_types import return_format
 
 class RecordPacker(RecordFormat):
+    """
+    Empaquetador de registros con cabecera de offsets para HeapFile/SlottedPage.
+    Soporta tanto la interfaz RecordFormat (encode/decode) como los alias 
+    record_encoder/record_decoder requeridos por la suite de pruebas.
+    """
     def __init__(self, schema: list[str]):
-        # ex: schema = ['int', 'float', 'string', 'float']
         self.schema = schema
+        self.parsed_schema = [return_format(token) for token in schema]
 
     def record_encoder(self, values: list) -> bytes:
         if len(values) != len(self.schema):
@@ -19,65 +20,53 @@ class RecordPacker(RecordFormat):
         data_bytes = bytearray()
         offsets = []
 
-        # Empaquetamos los datos segun el tipo definido en `schema`
-        for value, type_ in zip(values, self.schema):
-            if type_ == "int": 
-                data_bytes.extend(struct.pack(">i", value)) # 4 bytes
-            elif type_ == "float":
-                data_bytes.extend(struct.pack(">f", value)) # 4 bytes
-            elif type_ == "string":
-                encoded = value.encode("utf-8")
+        for val, (fmt, size) in zip(values, self.parsed_schema):
+            if size == -1:  # Longitud variable/ilimitada (ej. text, string)
+                encoded = val.encode("utf-8") if isinstance(val, str) else bytes(val)
                 data_bytes.extend(encoded)
-            else:
-                raise ValueError(f"Unsupported type: {type_}")
+            elif "s" in fmt:  # Cadenas de tamaño acotado (ej. varchar(20))
+                encoded = val.encode("utf-8") if isinstance(val, str) else bytes(val)
+                padded_encoded = encoded.ljust(size, b"\x00")
+                data_bytes.extend(struct.pack(f">{size}s", padded_encoded))
+            else:  # Tipos fijos (int, float, boolean, etc.)
+                clean_fmt = fmt if fmt.startswith(">") else ">" + fmt
+                data_bytes.extend(struct.pack(clean_fmt, val))
+            
             offsets.append(len(data_bytes))
 
-        # Empaquetamos la cabecera del registro
+        # Cabecera del registro: [num_fields (2 bytes)] + [offsets de campos (2 bytes c/u)]
         header_format = f">H {num_fields}H"
         header_bytes = struct.pack(header_format, num_fields, *offsets)
 
         return header_bytes + data_bytes
 
-    def record_decoder(self, record_bytes: bytes):
-        # Leemos la cantidad de campos
-        num_fields = struct.unpack(">H", record_bytes[:2])[0]
+    def record_decoder(self, data: bytes) -> list:
+        num_fields = struct.unpack_from(">H", data, 0)[0]
         if num_fields != len(self.schema):
-            raise ValueError(f"Expected {len(self.schema)} but received {num_fields}")
+            raise ValueError(f"Expected {len(self.schema)} fields in schema but received {num_fields}")
 
-        # Los dos primeros bytes ocupados por la cant de fields. Posteriormente, la lista de offsets.
-        header_size = 2 + (num_fields*2)
-        offsets_format = f">{num_fields}H"
-        offsets = struct.unpack(offsets_format, record_bytes[2:header_size])
+        header_size = 2 + (num_fields * 2)
+        offsets = struct.unpack_from(f">{num_fields}H", data, 2)
 
         values = []
         data_start = header_size
-        prev_offset =0
+        prev_offset = 0
 
-        for i, type_ in enumerate(self.schema):
+        for i, (fmt, size) in enumerate(self.parsed_schema):
             curr_offset = offsets[i]
-            value_bytes = record_bytes[data_start + prev_offset: data_start+curr_offset]
+            value_bytes = data[data_start + prev_offset : data_start + curr_offset]
             prev_offset = curr_offset
 
-            if type_ == "int":
-                values.append(struct.unpack(">i", value_bytes)[0])
-            elif type_ == "float":
-                values.append(struct.unpack(">f", value_bytes)[0])
-            elif type_ == "string":
-                values.append(value_bytes.decode("utf-8"))
+            if size == -1 or "s" in fmt:
+                values.append(value_bytes.decode("utf-8").rstrip("\x00"))
+            else:
+                clean_fmt = fmt if fmt.startswith(">") else ">" + fmt
+                values.append(struct.unpack(clean_fmt, value_bytes)[0])
 
         return values
 
-    def encode(self, values):
+    def encode(self, values: list) -> bytes:
         return self.record_encoder(values)
 
     def decode(self, data: bytes) -> list:
         return self.record_decoder(data)
- 
-if __name__ == "__main__":
-    l = ['int', 'float', 'int','int','int','int','int','int','int','int','int','int','int','int','int','int']
-    x = [5,3.5,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
-
-    r = RecordPacker(l)
-    a = r.record_encoder(x)
-    print(a)
-    print(r.record_decoder(a))

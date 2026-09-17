@@ -68,7 +68,7 @@ def test_heap_file_cumple_record_file():
     fm = FileManager(filename, PAGE_SIZE, HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
     # HeapFile configurado
-    rf = HeapFile(filename, bm, record_format=["int", "int"])
+    rf = HeapFile(filename, bm, record_format=["integer", "integer"])
 
     print("Probando HeapFile bajo interfaz RecordFile...", end=" ")
     probar_contrato_record_file(rf)
@@ -82,8 +82,7 @@ def test_sequential_file_cumple_record_file():
 
     fm = FileManager(filename, PAGE_SIZE, HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
-    # SequentialFile configurado (formato "ii" -> 2 enteros)
-    rf = SequentialFile(bm, PAGE_SIZE, record_format="ii")
+    rf = SequentialFile(bm, PAGE_SIZE, record_format=["integer","integer"])
 
     print("Probando SequentialFile bajo interfaz RecordFile...", end=" ")
     probar_contrato_record_file(rf)
