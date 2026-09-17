@@ -33,7 +33,8 @@ class StorageManager:
         name: str, 
         schema: list[str], 
         file_type: str = "heap", 
-        key_index: int = 0
+        key_index: int = 0,
+        column_names: list[str] = None
     ) -> Table:
         """
         Registra una tabla en las tablas del sistema y la abre.
@@ -41,7 +42,7 @@ class StorageManager:
         if self.catalog.get_table_info(name) is not None:
             raise ValueError(f"La tabla '{name}' ya existe en el catálogo.")
 
-        self.catalog.register_table(name, schema, file_type, key_index)
+        self.catalog.register_table(name, schema, file_type, key_index, column_names)
         return self.open_table(name)
 
     def open_table(self, name: str) -> Table:
@@ -64,7 +65,8 @@ class StorageManager:
             schema=meta["schema"],
             buffer_manager=bm,
             file_type=meta["file_type"],
-            key_index=meta["key_index"]
+            key_index=meta["key_index"],
+            column_names=meta["column_names"]
         )
 
         self.tables[name] = table

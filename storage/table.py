@@ -18,10 +18,22 @@ class Table:
         key_index: int = 0,
         not_null_columns: list[int] = None,
         unique_columns: list[int] = None,
-        check_constraints: list[callable] = None
+        check_constraints: list[callable] = None,
+        column_names: list[str] = None,
+        check_primary_key: bool = True
     ):
         self.name = name
         self.schema = schema
+        # Nombres de las columnas, en el mismo orden que schema. Son
+        # opcionales: si no se pasan se generan col0, col1, ... para no
+        # romper a quien construya la tabla solo con tipos.
+        if column_names is None:
+            column_names = [f"col{i}" for i in range(len(schema))]
+        if len(column_names) != len(schema):
+            raise ValueError(
+                f"La tabla '{name}' tiene {len(schema)} tipos pero {len(column_names)} nombres de columna"
+            )
+        self.column_names = column_names
         self.buffer_manager = buffer_manager
         self.file_type = file_type.lower()
         self.key_index = key_index
@@ -31,7 +43,8 @@ class Table:
             table=self,
             not_null_columns=not_null_columns,
             unique_columns=unique_columns,
-            check_constraints=check_constraints
+            check_constraints=check_constraints,
+            check_primary_key=check_primary_key
         )
 
         # Referencia al índice primario agrupado (si existe)
@@ -48,6 +61,20 @@ class Table:
             self.data_file.key_index = self.key_index
         else:
             raise ValueError(f"Organización de archivo no soportada: {self.file_type}")
+
+    def column_index(self, column_name: str) -> int:
+        """
+        Traduce el nombre de una columna a su posicion dentro del registro.
+        Es lo que permite resolver 'SELECT cliente' o 'WHERE id = 5',
+        porque el resto del motor trabaja siempre con posiciones.
+        """
+        try:
+            return self.column_names.index(column_name)
+        except ValueError:
+            raise KeyError(
+                f"La columna '{column_name}' no existe en la tabla '{self.name}'. "
+                f"Columnas disponibles: {self.column_names}"
+            )
 
     def attach_index(self, column_index: int, index_obj):
         """Enlaza un índice secundario para actualización automática."""
