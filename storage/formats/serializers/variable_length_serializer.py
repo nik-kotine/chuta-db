@@ -52,7 +52,7 @@ class VariableLengthRecordSerializer(RecordSerializer):
                 length = size
                 fmt_str = f">{length}s"
                 val_bytes = struct.unpack(fmt_str, data[unpacking_index:unpacking_index + length])[0]
-                output.append(val_bytes.decode("utf-8"))
+                output.append(val_bytes.decode("utf-8").rstrip("\x00"))
                 unpacking_index += length
             else:
                 # Campo numérico o tipo fijo

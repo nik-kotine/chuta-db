@@ -169,7 +169,7 @@ def test_fixed_length_serializer_with_strings():
         data = seq.serializer.serialize(("ab", 7))
 
         assert len(data) == 4 + 4
-        assert seq.serializer.deserialize(data) == ("ab\x00\x00", 7)
+        assert seq.serializer.deserialize(data) == ("ab", 7)
         assert seq.serializer.record_size == 8
         assert seq.serializer.slot_size == 8 + 8 + 1
 
