@@ -49,7 +49,8 @@ class SchemaCatalog:
         # modela. Con la PK simple activada, la segunda columna de cualquier
         # tabla se rechazaria por "clave duplicada".
         return Table(name, schema, bm, file_type="heap",
-                     column_names=column_names, check_primary_key=False)
+                     column_names=column_names, check_primary_key=False,
+                     file_manager=fm)
 
     def _clean_str(self, val) -> str:
         """Limpia caracteres nulos y espacios de relleno en cadenas fixed/padded."""

@@ -1,4 +1,5 @@
 from storage.buffer_manager import BufferManager
+from storage.file_manager import FileManager
 from storage.rid import RID
 from storage.files.heap_file import HeapFile 
 from storage.files.sequential_file import SequentialFile
@@ -20,7 +21,8 @@ class Table:
         unique_columns: list[int] = None,
         check_constraints: list[callable] = None,
         column_names: list[str] = None,
-        check_primary_key: bool = True
+        check_primary_key: bool = True,
+        file_manager: FileManager = None
     ):
         self.name = name
         self.schema = schema
@@ -35,6 +37,11 @@ class Table:
             )
         self.column_names = column_names
         self.buffer_manager = buffer_manager
+        # El buffer pool es global (singleton), asi que la tabla guarda
+        # aparte el FileManager de SU archivo para identificar sus paginas.
+        self.file_manager = file_manager or getattr(buffer_manager, "active_file", None)
+        if self.file_manager is None:
+            raise ValueError(f"La tabla '{name}' necesita un FileManager para operar")
         self.file_type = file_type.lower()
         self.key_index = key_index
         self.filename = f"{self.name}.dat"
@@ -54,10 +61,12 @@ class Table:
         self.secondary_indexes: dict[int, list] = {}
 
         if self.file_type == "heap":
-            self.data_file = HeapFile(self.filename, self.buffer_manager, self.schema)
+            self.data_file = HeapFile(self.filename, self.buffer_manager, self.schema,
+                                      file_manager=self.file_manager)
         elif self.file_type == "sequential":
-            page_size = self.buffer_manager.file_manager.page_size
-            self.data_file = SequentialFile(self.buffer_manager, page_size, self.schema)
+            page_size = self.file_manager.page_size
+            self.data_file = SequentialFile(self.buffer_manager, page_size, self.schema,
+                                            file_manager=self.file_manager)
             self.data_file.key_index = self.key_index
         else:
             raise ValueError(f"Organización de archivo no soportada: {self.file_type}")

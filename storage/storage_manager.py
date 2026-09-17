@@ -66,7 +66,8 @@ class StorageManager:
             buffer_manager=bm,
             file_type=meta["file_type"],
             key_index=meta["key_index"],
-            column_names=meta["column_names"]
+            column_names=meta["column_names"],
+            file_manager=fm
         )
 
         self.tables[name] = table

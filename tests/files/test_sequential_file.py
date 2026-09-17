@@ -50,11 +50,9 @@ def create_sequential(record_format=VARIABLE_FORMAT, page_size=PAGE_SIZE):
 
 
 def close_file(fm, bm):
-    for phys_page_id in list(bm.page_table.keys()):
-        bm.flush_page(phys_page_id)
-
-    fm.flush()
-    fm.close()
+    # el buffer pool es global: cerrar el archivo implica persistir y
+    # descartar SOLO las paginas de ese FileManager
+    bm.close(fm)
 
 
 def close_sequential(filename, fm, bm):
