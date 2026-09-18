@@ -2,6 +2,7 @@ import os
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 from storage.table import Table
+from storage.files.sequential_file import FILE_HEADER_SIZE
 
 PAGE_SIZE = 4096
 HEADER_SIZE = 16
@@ -53,7 +54,7 @@ def test_table_sequential():
     filename = "test_tabla_seq.dat"
     limpiar(filename)
 
-    fm = FileManager(filename, PAGE_SIZE, HEADER_SIZE)
+    fm = FileManager(filename, PAGE_SIZE, FILE_HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
     schema = ["integer", "integer"]
 

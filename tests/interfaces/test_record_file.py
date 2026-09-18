@@ -3,7 +3,7 @@ from storage.record_file import RecordFile
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 from storage.files.heap_file import HeapFile
-from storage.files.sequential_file import SequentialFile
+from storage.files.sequential_file import SequentialFile, FILE_HEADER_SIZE
 
 PAGE_SIZE = 4096
 HEADER_SIZE = 16
@@ -80,7 +80,7 @@ def test_sequential_file_cumple_record_file():
     filename = "test_contract_seq.bin"
     limpiar_archivos(filename)
 
-    fm = FileManager(filename, PAGE_SIZE, HEADER_SIZE)
+    fm = FileManager(filename, PAGE_SIZE, FILE_HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
     rf = SequentialFile(bm, PAGE_SIZE, record_format=["integer","integer"])
 

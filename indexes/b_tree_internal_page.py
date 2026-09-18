@@ -142,15 +142,25 @@ class BTreeInternalPage:
         keys[index] = key
         self._rewrite(keys, children)
 
-    # Igual que la búsqueda binaria en la hoja
+    # Tiene que desempatar IGUAL que find_child_index (contar cuantas
+    # claves existentes son <= key, no las que son < key): insert_key()
+    # usa esto para decidir donde meter un separador nuevo, y ese
+    # separador tiene que quedar coherente con como find_child_index
+    # despues lo va a usar para bajar. Con desempate al reves (como
+    # estaba antes, lower_bound en vez de upper_bound), cada separador
+    # nuevo con una clave ya repetida se insertaba ANTES de los
+    # existentes en vez de despues -- con muchos splits seguidos de la
+    # misma clave, eso deja los children en orden invertido/corrupto
+    # (confirmado insertando 3000 duplicados: quedaban como
+    # [0, 31, 30, ..., 3, 1, 32] en vez de ordenados).
     def _find_key_index(self, key) -> int:
         lo, hi = 0, self.n_keys
         while lo < hi:
             mid = (lo + hi) // 2
-            if self._read_key(mid) < key:
-                lo = mid + 1
-            else:
+            if key < self._read_key(mid):
                 hi = mid
+            else:
+                lo = mid + 1
         return lo
 
     # Retorna el indice del hijo por el que hay que bajar para buscar
@@ -173,6 +183,31 @@ class BTreeInternalPage:
 
     def find_child(self, key) -> int:
         return self._read_child(self.find_child_index(key))
+
+    # Variante de find_child_index para operaciones que necesitan la
+    # PRIMERA hoja donde podria empezar a aparecer key, no la hoja donde
+    # insert() la colocaria. Con muchos duplicados exactos, varios
+    # splits seguidos empujan la MISMA clave como separador varias veces
+    # (ej. separadores [7,7,7]); find_child_index (desempate a la
+    # derecha, necesario para que insert()/split() sean consistentes)
+    # atraviesa TODOS esos separadores iguales y aterriza en el ultimo
+    # hijo del grupo -- el mas nuevo, no el primero. find_leftmost_child
+    # desempata a la izquierda en su lugar, aterrizando en el primer
+    # hijo cuyo subarbol puede contener key, para que un
+    # descenso-y-scan-hacia-adelante (search()/range_search()) no se
+    # pierda las hojas anteriores del grupo.
+    def find_leftmost_child_index(self, key) -> int:
+        lo, hi = 0, self.n_keys
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._read_key(mid) < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def find_leftmost_child(self, key) -> int:
+        return self._read_child(self.find_leftmost_child_index(key))
 
 
     def insert_key(self, key, right_child_page_id: int) -> bool:

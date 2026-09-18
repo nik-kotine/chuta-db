@@ -34,17 +34,20 @@ class BPlusTreeUnclustered(BPlusTreeBase):
         cadena de hojas para conservar los duplicados; mantiene el retorno de
         un RID para claves que siempre fueron únicas por compatibilidad.
         """
-        # mismo descenso que el arbol base: find_child(key) manda las
-        # claves iguales a un separador hacia la derecha (ver
-        # find_child_index), igual que insert() al decidir en que mitad
-        # cae un split -- por eso esta es la UNICA hoja donde puede
-        # empezar a aparecer key, nunca una hoja anterior.
+        # find_leftmost_child (no find_child): con muchos duplicados
+        # exactos, varios splits seguidos de la misma clave dejan varios
+        # separadores identicos, y find_child (desempate a la derecha,
+        # el que usa insert()) aterrizaria en la hoja mas nueva del
+        # grupo, no en la primera -- el scan hacia adelante de abajo se
+        # perderia las hojas anteriores. find_leftmost_child desempata a
+        # la izquierda, asi que siempre aterriza en la primera hoja
+        # donde key puede empezar a aparecer.
         page_id = self.root_page_id
         depth = self.height
 
         while depth > 0:
             node = self._load_internal(page_id)
-            page_id = node.find_child(key)
+            page_id = node.find_leftmost_child(key)
             depth -= 1
 
         matches = []
@@ -80,12 +83,17 @@ class BPlusTreeUnclustered(BPlusTreeBase):
         la misma clave y el método delete(key) del árbol base solo identifica
         la primera coincidencia.
         """
+        # find_leftmost_child, no _read_child(0): antes bajaba siempre
+        # por el hijo mas izquierdo del ARBOL ENTERO (ignorando key por
+        # completo) y escaneaba todo desde la primera hoja -- O(N) en
+        # vez de aterrizar cerca de key y recorrer solo el grupo de
+        # duplicados real.
         page_id = self.root_page_id
         depth = self.height
 
         while depth > 0:
             node = self._load_internal(page_id)
-            page_id = node._read_child(0)
+            page_id = node.find_leftmost_child(key)
             depth -= 1
 
         while True:

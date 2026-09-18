@@ -325,12 +325,16 @@ class BPlusTreeBase:
             self._rebalance_internal(parent, path[:-1])
 
     def range_search(self, start_key, end_key):
-        # un solo descenso hasta la hoja donde arrancaría start_key
+        # un solo descenso hasta la hoja donde arrancaría start_key.
+        # find_leftmost_child (no find_child) porque si start_key tiene
+        # muchos duplicados repartidos en mas de una hoja, find_child
+        # aterrizaria en la ULTIMA (desempata a la derecha, pensado para
+        # insert()) y el scan hacia adelante se perderia las anteriores.
         page_id = self.root_page_id
         depth = self.height
         while depth > 0:
             node = self._load_internal(page_id)
-            page_id = node.find_child(start_key)
+            page_id = node.find_leftmost_child(start_key)
             depth -= 1
 
         leaf = self._load_leaf(page_id)
