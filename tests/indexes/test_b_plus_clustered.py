@@ -26,7 +26,7 @@ def crear_arbol(page_size=4096, buffer_frames=20):
     # igual que lo hace Table al crear una tabla sequential
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "wb") as f:
-            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0))
+            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
             f.write(b"\x00" * page_size)
 
     fm = FileManager(DATA_FILE, page_size, FILE_HEADER_SIZE)

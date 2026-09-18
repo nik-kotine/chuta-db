@@ -65,7 +65,7 @@ def crear_clustered():
     # mismo setup que Table haria para una tabla "sequential": header +
     # una pagina de overflow antes de que SequentialFile abra el archivo
     with open(CLUSTERED_DATA_FILE, "wb") as f:
-        f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0))
+        f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
         f.write(b"\x00" * PAGE_SIZE)
 
     fm = FileManager(CLUSTERED_DATA_FILE, PAGE_SIZE, FILE_HEADER_SIZE)

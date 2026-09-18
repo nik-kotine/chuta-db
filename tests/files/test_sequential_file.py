@@ -12,7 +12,7 @@ import tempfile
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 
-from storage.files.sequential_file import SequentialFile
+from storage.files.sequential_file import SequentialFile, FILE_HEADER_FORMAT
 from storage.pages.seq_page import Page
 from storage.pages.fixed_page import FixedPage
 from storage.pages.variable_page import VariablePage
@@ -25,7 +25,7 @@ from storage.formats.serializers.variable_length_serializer import VariableLengt
 
 PAGE_SIZE = 128
 FIXED_PAGE_SIZE = 64
-HEADER_SIZE = 16
+HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT)
 BUFFER_FRAMES = 10
 
 FIXED_FORMAT = ["integer"]          # todo fijo -> FixedPage
@@ -37,7 +37,7 @@ def create_sequential(record_format=VARIABLE_FORMAT, page_size=PAGE_SIZE):
     os.close(fd)
 
     with open(filename, "wb") as f:
-        f.write(struct.pack(">iiii", 0, -1, 0, 0))
+        f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
         # página 0 = overflow, entregada como bloque de ceros (la lazy
         # initialization de VariablePage se ejercita así)
         f.write(b"\x00" * page_size)
@@ -495,14 +495,19 @@ def test_delete_existing():
     filename, fm, bm, seq = create_sequential(FIXED_FORMAT, FIXED_PAGE_SIZE)
 
     try:
-        for key in [10, 20, 30]:
+        # 10 registros para que borrar 1 solo no cruce OVERFLOW_RATIO/
+        # WASTED_RATIO (0.3) y dispare un reorganize a mitad del test --
+        # con solo 3 registros, 1/3 ya lo cruza (ver INDEX_BENCHMARK /
+        # historial: WASTED_RATIO se bajo de 0.5 a 0.3 a proposito)
+        claves = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        for key in claves:
             seq.insert((key,))
 
-        assert seq.delete(20) is True
-        assert seq.search(20) == []
-        assert logical_keys(seq) == [10, 30]
+        assert seq.delete(50) is True
+        assert seq.search(50) == []
+        assert logical_keys(seq) == [k for k in claves if k != 50]
 
-        assert seq.n_records == 2
+        assert seq.n_records == 9
         assert seq.n_deleted == 1
 
     finally:
@@ -544,14 +549,15 @@ def test_delete_same_key_twice():
     filename, fm, bm, seq = create_sequential(VARIABLE_FORMAT, PAGE_SIZE)
 
     try:
-        seq.insert((10, "ten"))
-        seq.insert((20, "twenty"))
-        seq.insert((30, "thirty"))
+        # suficientes registros para que el delete no cruce WASTED_RATIO
+        # (0.3) y dispare un reorganize antes del segundo delete
+        for i in range(10):
+            seq.insert((i * 10, f"val{i}"))
 
-        assert seq.delete(30) is True
-        assert seq.delete(30) is False
+        assert seq.delete(90) is True
+        assert seq.delete(90) is False
 
-        assert seq.n_records == 2
+        assert seq.n_records == 9
         assert seq.n_deleted == 1
 
     finally:

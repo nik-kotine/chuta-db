@@ -4,18 +4,23 @@ from storage.buffer_manager import BufferManager
 from storage.table import Table
 from storage.schema_catalog import SchemaCatalog
 from storage.index_manager import IndexManager
+from storage.files.sequential_file import FILE_HEADER_SIZE
 
 
 class StorageManager:
     """
-    Administrador central que coordina el catálogo del sistema en disco 
+    Administrador central que coordina el catálogo del sistema en disco
     y el acceso/caché a las tablas físicas.
     """
     def __init__(
-        self, 
-        page_size: int = 4096, 
-        buffer_frames: int = 10, 
-        header_size: int = 16
+        self,
+        page_size: int = 4096,
+        buffer_frames: int = 10,
+        # un mismo header_size se usa para el archivo de CUALQUIER tabla
+        # (heap o sequential) -- HeapFile es indiferente al valor exacto,
+        # asi que tiene que alcanzar para lo que SI le importa el
+        # contenido: el header real de SequentialFile.
+        header_size: int = FILE_HEADER_SIZE
     ):
         self.page_size = page_size
         self.buffer_frames = buffer_frames

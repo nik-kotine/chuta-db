@@ -72,7 +72,7 @@ def test_table_with_clustered_index():
     # Preparar el archivo físico secuencial base con su cabecera y espacio inicial
     if not os.path.exists(data_filename):
         with open(data_filename, "wb") as f:
-            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0))
+            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
             f.write(b"\x00" * PAGE_SIZE)
 
     fm = FileManager(data_filename, PAGE_SIZE, FILE_HEADER_SIZE)
