@@ -26,15 +26,13 @@ SAMPLE_SIZE = 30  # claves muestreadas para busqueda exacta / puntos de rango
 
 # Tamaños de N configurables por linea de comandos para pruebas rapidas,
 
-# El clustered escala ~O(N^2) con este SequentialFile: la pagina de
-# overflow tiene capacidad fija (no crece con N), asi que dispara un
-# reorganize() cada ~250 inserts SIEMPRE, y cada reorganize (mas el
-# reindex completo que hace BPlusTreeClustered para seguirlo) cuesta
-# O(N_actual). N=10_000 ya tarda minutos y N=100_000 tardaria horas 
-#  Por eso el default se mantiene chico; para numeros mas grandes correr 
-# a mano:
-# python -m benchmark.indices.index_benchmark 10000
-SIZES = [int(a) for a in sys.argv[1:]] or [500, 2_000, 5_000]
+# El SequentialFile escalaba ~O(N^2) (pagina de overflow de tamano fijo,
+# reorganize a intervalo constante) -- ya se arreglo (ver README, seccion
+# "Antes/despues"), asi que estos tamanos son factibles de correr en
+# minutos, no horas. N=50_000 tarda unos 5-8 minutos en total (la mayor
+# parte en construir el clustered). Para una corrida rapida de prueba:
+# python -m benchmark.indices.index_benchmark 500 2000
+SIZES = [int(a) for a in sys.argv[1:]] or [1_000, 10_000, 50_000]
 
 HASH_FILE_HEADER_SIZE = 16
 HASH_DEFAULT_BUCKET_SIZE = 16

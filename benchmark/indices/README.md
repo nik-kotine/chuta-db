@@ -9,8 +9,8 @@ adicional y comportamiento bajo inserciones/eliminaciones frecuentes.
 **Cómo reproducirlo** (desde la raíz del repo):
 
 ```bash
-python -m benchmark.indices.index_benchmark          # tamaños por defecto: 500, 2000, 5000
-python -m benchmark.indices.index_benchmark 1000 3000 # tamaños custom
+python -m benchmark.indices.index_benchmark          # tamaños por defecto: 1000, 10000, 50000
+python -m benchmark.indices.index_benchmark 500 2000  # tamaños custom (corrida rapida)
 python -m benchmark.indices.plot_index_benchmark      # regenera las graficas desde el JSON
 ```
 
@@ -25,37 +25,47 @@ pide el enunciado.
 
 ### Construcción y espacio adicional
 
-| índice          |     N | construcción (ms) | ms/insert | datos (KB) | índice (KB) |
-| --------------- | ----: | ----------------: | --------: | ---------: | ----------: |
-| B+ clustered    |   500 |             598.7 |     1.198 |       12.0 |        20.0 |
-| B+ unclustered  |   500 |             175.4 |     0.351 |       20.0 |        20.0 |
-| Hash extensible |   500 |              41.7 |     0.083 |       20.0 |   **400.0** |
-| B+ clustered    | 2,000 |           3,083.4 |     1.542 |       40.0 |        68.0 |
-| B+ unclustered  | 2,000 |             807.5 |     0.404 |       56.0 |        68.0 |
-| Hash extensible | 2,000 |             196.3 |     0.098 |       56.0 | **1,440.0** |
-| B+ clustered    | 5,000 |           9,250.6 |     1.850 |       88.0 |       184.0 |
-| B+ unclustered  | 5,000 |           2,231.2 |     0.446 |      128.0 |       136.0 |
-| Hash extensible | 5,000 |             571.2 |     0.114 |      128.0 | **3,680.0** |
+| índice          |      N | construcción (ms) | ms/insert | datos (KB) | índice (KB) |
+| --------------- | -----: | -----------------: | --------: | ---------: | ----------: |
+| B+ clustered    |  1,000 |            1,503.4 |     1.503 |       24.0 |        36.0 |
+| B+ unclustered  |  1,000 |              408.7 |     0.409 |       32.0 |        36.0 |
+| Hash extensible |  1,000 |               87.8 |     0.088 |       32.0 |   **752.0** |
+| B+ clustered    | 10,000 |           19,500.7 |     1.950 |      172.0 |       372.0 |
+| B+ unclustered  | 10,000 |            4,556.9 |     0.456 |      252.0 |       276.0 |
+| Hash extensible | 10,000 |            1,451.4 |     0.145 |      252.0 | **7,456.0** |
+| B+ clustered    | 50,000 |           94,118.9 |     1.882 |      840.0 |     1,552.0 |
+| B+ unclustered  | 50,000 |           48,500.3 |     0.970 |    1,232.0 |     1,520.0 |
+| Hash extensible | 50,000 |           25,328.3 |     0.507 |    1,232.0 | **35,712.0** |
 
 > Números post-fix del `SequentialFile` (ver sección "Antes/después" más
 > abajo) — el clustered pasó de ~O(N²) a O(N) real en construcción/inserción.
+> Tamaños subidos de 500/2,000/5,000 a 1,000/10,000/50,000 una vez arreglado
+> el O(N²): a esta escala se nota mucho mejor la curva logarítmica del B+
+> frente al O(1) del hash (ver "Tiempo de consulta" abajo).
 
 ![Tiempo de construcción](construccion_ms.png)
 ![Espacio adicional](espacio_indice_kb.png)
 
 ### Tiempo de consulta
 
-| índice          |     N | µs/exacta |     µs/rango | ms/orden completo |
-| --------------- | ----: | --------: | -----------: | ----------------: |
-| B+ clustered    |   500 |      15.8 |         82.9 |              0.61 |
-| B+ unclustered  |   500 |     119.4 |        113.9 |              0.86 |
-| Hash extensible |   500 |      41.7 |  **1,506.2** |              1.46 |
-| B+ clustered    | 2,000 |      24.4 |        133.4 |              3.90 |
-| B+ unclustered  | 2,000 |      73.2 |         96.1 |              2.70 |
-| Hash extensible | 2,000 |      61.3 |  **6,011.0** |              6.65 |
-| B+ clustered    | 5,000 |      26.4 |        172.8 |              9.31 |
-| B+ unclustered  | 5,000 |     142.2 |        204.8 |              7.59 |
-| Hash extensible | 5,000 |      57.3 | **17,040.7** |             18.68 |
+| índice          |      N | µs/exacta |      µs/rango | ms/orden completo |
+| --------------- | -----: | --------: | ------------: | -----------------: |
+| B+ clustered    |  1,000 |      18.8 |         123.3 |               1.65 |
+| B+ unclustered  |  1,000 |     106.0 |          84.0 |               1.44 |
+| Hash extensible |  1,000 |      56.0 |   **3,312.2** |               3.72 |
+| B+ clustered    | 10,000 |      31.6 |         268.9 |              18.07 |
+| B+ unclustered  | 10,000 |     121.0 |         246.1 |              18.48 |
+| Hash extensible | 10,000 |      49.0 |  **31,496.8** |              34.37 |
+| B+ clustered    | 50,000 |      36.6 |         980.7 |             115.28 |
+| B+ unclustered  | 50,000 |     147.7 |       1,294.6 |             141.71 |
+| Hash extensible | 50,000 |      71.1 | **234,549.8** |             289.96 |
+
+Punto clave: aunque el B+ crece con N (log N) y el hash en teoría se
+mantiene O(1), a N=50,000 el hash (71.1µs) **sigue perdiendo** contra el
+clustered (36.6µs) en búsqueda exacta — ver la explicación en "Tabla
+resumen" y "Verificación de complejidad" más abajo (el hash tiene un costo
+fijo de 5 páginas por operación; el B+ con este fanout no llega a
+necesitar tantas ni siquiera a N=50,000).
 
 ![Búsqueda exacta](busqueda_exacta_us.png)
 ![Búsqueda por rango](busqueda_rango_us.png)
@@ -63,17 +73,17 @@ pide el enunciado.
 
 ### Rendimiento con inserciones/eliminaciones frecuentes (churn)
 
-| índice          |     N | churn ops |  ops/seg | µs/exacta post-churn |
-| --------------- | ----: | --------: | -------: | -------------------: |
-| B+ clustered    |   500 |       200 |    609.5 |                 20.0 |
-| B+ unclustered  |   500 |       200 |  2,461.8 |                 82.2 |
-| Hash extensible |   500 |       200 | 12,678.3 |                 42.0 |
-| B+ clustered    | 2,000 |       400 |    352.9 |                 25.3 |
-| B+ unclustered  | 2,000 |       400 |  2,781.7 |                101.3 |
-| Hash extensible | 2,000 |       400 |  7,503.6 |                 52.3 |
-| B+ clustered    | 5,000 |     1,000 |    750.9 |                 25.9 |
-| B+ unclustered  | 5,000 |     1,000 |  2,318.4 |                113.9 |
-| Hash extensible | 5,000 |     1,000 |  6,443.5 |                 67.1 |
+| índice          |      N | churn ops |  ops/seg | µs/exacta post-churn |
+| --------------- | -----: | --------: | -------: | -------------------: |
+| B+ clustered    |  1,000 |       200 |    347.8 |                 19.9 |
+| B+ unclustered  |  1,000 |       200 |  2,376.9 |                 95.5 |
+| Hash extensible |  1,000 |       200 | 10,162.0 |                 49.4 |
+| B+ clustered    | 10,000 |     2,000 |    535.7 |                 33.7 |
+| B+ unclustered  | 10,000 |     2,000 |  1,905.1 |                141.4 |
+| Hash extensible | 10,000 |     2,000 |  6,533.1 |                 77.2 |
+| B+ clustered    | 50,000 |     2,000 |    378.9 |                 72.1 |
+| B+ unclustered  | 50,000 |     2,000 |    950.3 |                150.8 |
+| Hash extensible | 50,000 |     2,000 |  2,118.2 |                108.6 |
 
 ![Throughput con churn](churn_ops_seg.png)
 ![Degradación post-churn](degradacion_post_churn_us.png)
@@ -82,9 +92,9 @@ pide el enunciado.
 
 | Técnica             | Fuerte en                                                                                              | Débil en                                                                                                                                                                                        | Usar cuando...                                                                                                                                             |
 | ------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **B+ clustered**    | Rango y orden más baratos (los datos ya están físicamente ordenados); búsqueda exacta rápida y estable; construcción O(N) tras el fix de `SequentialFile` (ver "Antes/después") | Sigue siendo el más caro en construcción/churn de los tres (aunque ya no cuadrático) — cada insert reordena físicamente el archivo | La tabla se lee mucho más de lo que se escribe, y las consultas son por rango/orden (ej. reportes, series de tiempo) sobre la clave primaria               |
-| **B+ unclustered**  | Balance razonable en todo; no sufre el costo de reorganización del clustered; soporta rango y orden    | Búsqueda exacta más lenta que el hash a estos tamaños (indirección extra hacia el heap)                                                                                                         | Índices secundarios sobre columnas que no son la clave física, o cuando hay muchas inserciones/eliminaciones y no se puede pagar el costo del clustered    |
-| **Hash extensible** | Construcción e inserción individual más rápidas de las tres; buen throughput bajo churn                | **No soporta rango ni orden** — sin eso cae a un scan completo del heap (de ~1.5ms a ~17.0ms según crece N); espacio del índice mucho mayor (pre-asigna buckets por capacidad, no por uso real) | Solo hay búsquedas por igualdad exacta (ej. lookup de un ID único) y nunca se necesita `WHERE col BETWEEN`, `ORDER BY` esa columna, ni recorrerla en orden |
+| **B+ clustered**    | Rango y orden más baratos (los datos ya están físicamente ordenados); búsqueda exacta la más rápida de las tres incluso contra el hash a estos N (ver "Tiempo de consulta"); construcción O(N) tras el fix de `SequentialFile` (ver "Antes/después") | Sigue siendo el más caro en construcción/churn de los tres (aunque ya no cuadrático) — cada insert reordena físicamente el archivo | La tabla se lee mucho más de lo que se escribe, y las consultas son por rango/orden (ej. reportes, series de tiempo) sobre la clave primaria               |
+| **B+ unclustered**  | Balance razonable en todo; no sufre el costo de reorganización del clustered; soporta rango y orden    | Búsqueda exacta la más lenta de las tres a estos tamaños (indirección extra hacia el heap: primero el índice, después el `HeapFile`)                                                                                                         | Índices secundarios sobre columnas que no son la clave física, o cuando hay muchas inserciones/eliminaciones y no se puede pagar el costo del clustered    |
+| **Hash extensible** | Construcción e inserción individual más rápidas de las tres; buen throughput bajo churn                | **No soporta rango ni orden** — sin eso cae a un scan completo del heap (de ~56µs a ~234ms según crece N); espacio del índice mucho mayor (pre-asigna buckets por capacidad, no por uso real); búsqueda exacta pierde contra el B+ clustered incluso a N=50,000 (costo fijo de 5 páginas por operación, ver "Verificación de complejidad") | Solo hay búsquedas por igualdad exacta (ej. lookup de un ID único) y nunca se necesita `WHERE col BETWEEN`, `ORDER BY` esa columna, ni recorrerla en orden |
 
 ## Verificación de complejidad (páginas leídas por operación)
 
@@ -105,6 +115,15 @@ de complejidad que no depende de qué tan rápida esté la máquina:
 Ambos corren solos con `run_all_tests.py` (viven en `tests/`, a diferencia
 del benchmark de arriba).
 
+**Por qué el hash pierde en búsqueda exacta contra el B+ pese a ser O(1):**
+las 5 páginas del hash son un costo *fijo*, no cero. El B+ con este fanout
+(~8 hijos por nodo interno) necesita 1-3 páginas hasta N=100,000 — menos
+que 5. El hash recién le ganaría al B+ cuando la altura del árbol supere
+las 5 páginas, algo que con este fanout no pasa ni remotamente cerca de
+los tamaños que se pueden probar en un benchmark razonable. Es un caso
+real de "la constante importa más que el Big-O dentro del rango que
+realmente se mide".
+
 ## Antes/después: el fix de `SequentialFile` (rama `seqfile-reorganize-fix`)
 
 El punto #1 de limitaciones más abajo (el O(N²) del clustered) **ya se
@@ -122,13 +141,20 @@ del "antes". Medido con `SequentialFile` solo (sin el árbol B+ encima),
 se mantiene prácticamente plano en el mismo rango (0.35→0.41ms) y sigue
 plano hasta N=100,000 — O(N) real, no O(N²). El punto de 100,000 para
 "antes" no se corrió literalmente (tomaría horas); es la extrapolación de
-la curva cuadrática medida en los otros dos puntos, marcada como tal. Con
-el índice clustered encima (que es lo que muestran las tablas de este
-documento), construcción a N=5,000:
+la curva cuadrática medida en los otros dos puntos, marcada como tal.
 
-| | antes | después | mejora |
+Con el índice clustered encima, esta es la comparación en los dos tamaños
+donde sí se corrió el código viejo completo (antes de subir la escala del
+benchmark oficial a 1,000/10,000/50,000):
+
+| N | antes (medido) | después (medido) | mejora |
+| --: | --: | --: | --: |
+| 500 | 693.4 ms | 598.7 ms | 1.2x |
+| 5,000 | 23,749.7 ms | 9,250.6 ms | 2.6x |
+| 50,000 | ~40 min (extrapolado del O(N²) medido) | 94,118.9 ms (**1.6 min**, medido) | ~25x |
+
+| | antes (N=5,000) | después (N=5,000) | mejora |
 | --- | --: | --: | --: |
-| tiempo de construcción | 23,749.7 ms | 9,250.6 ms | 2.6x |
 | throughput bajo churn (ops/seg) | 143.5 | 750.9 | 5.2x |
 
 **Qué cambió, en dos partes:**
@@ -197,5 +223,5 @@ Una hash table no mantiene ningún orden entre claves, es esperable, no un
 defecto de la implementación. `HashIndexAdapter` (en el benchmark) resuelve
 `range_search`/orden con un scan completo del `HeapFile` subyacente porque
 es la única forma correcta de responderlos sin un índice ordenado. El costo
-medido (~1.5ms → ~17.0ms de N=500 a N=5,000) es el precio real de intentar
-usar un hash para algo que no es su caso de uso.
+medido (~56µs → ~234.5ms de N=1,000 a N=50,000) es el precio real de
+intentar usar un hash para algo que no es su caso de uso.
