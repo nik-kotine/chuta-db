@@ -151,40 +151,45 @@ documento), construcción a N=5,000:
 
 `tests/files/test_sequential_file.py` (49 tests) sigue pasando completo.
 
+## Antes/después: routing de duplicados en el B+ (rama `storage-fixes`)
+
+El punto #2 de limitaciones más abajo **también se arregló**, en dos capas:
+
+1. **Routing en `search()`/`range_search()`/`delete_ref()`:** se agregó
+   `find_leftmost_child()` en `BTreeInternalPage` — una variante de
+   `find_child()` que desempata a la **izquierda** en vez de a la derecha,
+   para aterrizar en la *primera* hoja de un grupo de duplicados en vez de
+   la última. `find_child()` no se tocó (`insert()` sigue necesitando
+   desempatar a la derecha para ser consistente con `split()`).
+2. **El bug real de fondo, más profundo de lo documentado originalmente:**
+   al confirmar el fix de arriba con 3,000 duplicados, seguía fallando —
+   `_find_key_index` (la que decide dónde insertar un separador nuevo
+   cuando un split empuja una clave hacia el padre) desempataba al
+   **revés** que `find_child_index`. Con muchos splits seguidos de la
+   misma clave, cada separador nuevo se insertaba *antes* de los
+   existentes en vez de después, dejando la lista de `children` del nodo
+   padre en un orden corrupto (confirmado imprimiéndola:
+   `[0, 31, 30, 29, ..., 3, 1, 32]` en vez de creciente). Ningún fix de
+   routing podía arreglar la búsqueda mientras esto siguiera roto. Se
+   corrigió `_find_key_index` para que desempate igual que
+   `find_child_index`.
+
+Verificado con 3,000 duplicados de una misma clave: `search()`,
+`range_search()` y `delete_ref()` encuentran los 3,000 (antes: 97, luego
+194, con cada capa del fix), y el recorrido global queda ordenado.
+`_find_key_index` vive en `BTreeInternalPage`, compartida por clustered y
+unclustered, así que el fix beneficia a ambos (sin cambiar nada para el
+caso sin duplicados masivos, que es el que ya cubrían los tests).
+
 ## Limitaciones conocidas y mejoras planteadas
 
 ### 1. ~~`BPlusTreeClustered` escala ~O(N²) en construcción/inserción masiva~~ — RESUELTO
 
-Ver la sección "Antes/después" arriba.
+Ver la sección "Antes/después: el fix de `SequentialFile`" arriba.
 
-### 2. `BPlusTreeUnclustered`: routing incorrecto con muchos duplicados de la misma clave
+### 2. ~~`BPlusTreeUnclustered`: routing incorrecto con muchos duplicados de la misma clave~~ — RESUELTO
 
-**Ya corregido en esta rama** (`search()` bajaba siempre por el hijo más
-izquierdo y escaneaba el árbol entero — O(N) en vez de O(log N); ahora
-desciende por la clave real, igual que `range_search`).
-
-**Lo que queda pendiente:** si una misma clave dispara **más de un split**
-(muchos duplicados exactos), el nodo interno termina con varios
-separadores idénticos, y la regla de desempate "clave igual va a la
-derecha" (necesaria para que `insert()` funcione) hace que `find_child()`
-aterrice en la **última** hoja del grupo, no en la primera. Un
-descenso-y-scan-hacia-adelante (lo que usan `search()` y `range_search()`)
-se pierde las hojas anteriores del grupo. Confirmado con una prueba manual:
-insertando 3,000 copias de una misma clave, `search()`/`range_search()`
-sólo encontraban 97.
-
-No afecta a este benchmark (claves únicas), pero sí a cualquier uso real de
-este índice como secundario sobre una columna con muchos valores repetidos.
-
-**Cómo se debería arreglar (2 alternativas):**
-
-- **Clave compuesta** `(valor, RID)` en vez de `valor` sola, nunca hay
-  separadores repetidos, y "todas las filas con valor=K" pasa a ser un
-  `range_search` de `(K, mínimo)` a `(K, máximo)`. Es el enfoque estándar
-  para índices secundarios no únicos.
-- **Dos reglas de descenso separadas**: mantener la clave simple, pero
-  agregar un descenso "más a la izquierda posible" específico para
-  búsqueda/rango, sin tocar el descenso que usa `insert()`.
+Ver la sección "Antes/después: routing de duplicados en el B+" arriba.
 
 ### 3. Hash extensible: sin soporte de rango/orden (por diseño, no es un bug)
 

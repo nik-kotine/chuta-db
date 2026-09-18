@@ -154,9 +154,13 @@ assert crecimiento_paginas < 10, "las páginas por búsqueda no deberían crecer
 assert max(r["paginas_por_delete"] for r in resultados) < 10, "las páginas por delete no deberían crecer con N -- indicaría que el rebalanceo no está manteniendo el árbol balanceado"
 
 # la RAM que retiene el objeto arbol no debe depender de N, porque no
-# cachea páginas de datos entre llamadas (las relee de disco cada vez)
+# cachea páginas de datos entre llamadas (las relee de disco cada vez).
+# Margen de 8 bytes: con N=100 el arbol es una sola hoja (height=0), y
+# en CPython sys.getsizeof(0) pesa 4 bytes menos que sys.getsizeof(1)
+# (un int no-cero reserva un "digito" interno de 30 bits), asi que ese
+# salto puntual al pasar de height=0 a height>=1 no es cacheo real.
 ram_valores = [r["ram_arbol_bytes"] for r in resultados]
-assert max(ram_valores) - min(ram_valores) == 0, "la RAM del árbol no debería variar con N -- indicaría que algo se está cacheando sin límite"
+assert max(ram_valores) - min(ram_valores) <= 8, "la RAM del árbol no debería variar con N -- indicaría que algo se está cacheando sin límite"
 
 print("\nOK: páginas por operación (search y delete) crecen de forma logarítmica, no lineal -- confirma D*log_(R/2)(M) de la slide de costos.")
 print("OK: el espacio en disco crece proporcional a N sin desperdicio excesivo.")
