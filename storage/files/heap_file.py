@@ -1,14 +1,17 @@
 import os
 import struct
-from collections import namedtuple
 from storage.record_file import RecordFile
 from storage.formats.data_types import return_format
 from storage.formats.serializers.fixed_length_serializer import FixedLengthRecordSerializer
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
-from storage.rid import RID
-from storage.pages.slotted_page import SlottedPage, PAGE_SIZE, HEADER_SIZE, SLOT_SIZE, NULL_SLOT
+from storage.rid import RID, RID_SIZE, DELETED_SIZE
+from storage.seq_record import Record
+from storage.pages.variable_page import VariablePage, SLOT_SIZE
 from storage.buffer_manager import BufferManager
 from storage.file_manager import FileManager
+
+PAGE_SIZE = 4096
+HEADER_SIZE = VariablePage.PAGE_HEADER_SIZE
 
 # Pagina 0 del archivo: directorio persistente. Guarda cuantas paginas de
 # datos hay y, para cada una, su free_space_bytes actual. Evita re-escanear
@@ -25,8 +28,10 @@ ENTRIES_PER_DIR_PAGE = (PAGE_SIZE - DIR_HEADER_SIZE) // DIR_ENTRY_SIZE
 NULL_DIR_PAGE = 0  # pagina 0 nunca es "la siguiente" de nadie, sirve de centinela
 
 # Mayor registro que puede llegar a caber en una pagina recien creada
-# (sin fragmentacion, sin otros slots).
-MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE
+# (sin fragmentacion, sin otros slots). Se resta tambien el next_rid y el
+# flag de deleted porque VariablePage los guarda junto a cada registro,
+# aunque el heap no los use (next_rid siempre queda en None).
+MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE - RID_SIZE - DELETED_SIZE
 
 class HeapFile(RecordFile):
     def __init__(self, filename: str, buffer_manager: BufferManager, record_format: list[str] | str,
@@ -132,11 +137,13 @@ class HeapFile(RecordFile):
     def _page_offset(self, page_id: int) -> int:
         return page_id * PAGE_SIZE  # page_id 0 = directorio, 1..N = datos
 
-    def _load(self, page_id: int) -> SlottedPage:
+    def _load(self, page_id: int) -> VariablePage:
         raw = self.buffer_manager.fetch_page(page_id, self.file_manager)
-        return SlottedPage(page_id, data=raw)
+        page = VariablePage(raw, PAGE_SIZE, self.serializer)
+        page.page_id = page_id
+        return page
 
-    def _sync_page(self, page: SlottedPage):
+    def _sync_page(self, page: VariablePage):
         # Marcar la página de datos, actualizar su espacio libre y despinarla
         self.buffer_manager.mark_dirty(page.page_id, self.file_manager)
         self.buffer_manager.unpin_page(page.page_id, self.file_manager)
@@ -184,7 +191,7 @@ class HeapFile(RecordFile):
         # realidad una pagina de directorio (esas tambien consumen ids).
         return 1 <= page_id < self.next_page_id and page_id not in self._dir_page_ids
 
-    def _new_page(self) -> SlottedPage:
+    def _new_page(self) -> VariablePage:
         # Crea una pagina de datos vacia nueva al final del archivo,
         # incrementa page_count, la sincroniza a disco y la devuelve.
         # Si a la pagina de directorio actual ya no le quedan entradas
@@ -195,14 +202,10 @@ class HeapFile(RecordFile):
 
         new_page_id = self.file_manager.allocate_page()
         raw_data = self.buffer_manager.fetch_page(new_page_id, self.file_manager)
-        page = SlottedPage(new_page_id, data=raw_data)
+        page = VariablePage(raw_data, PAGE_SIZE, self.serializer)
 
         page.page_id = new_page_id
-        page.slot_count = 0
-        page.free_space_high = PAGE_SIZE
-        page.first_free_slot = NULL_SLOT  # Usamos la constante oficial de SlottedPage (0xFFFF)
-        
-        page.save_header()
+        page.reset()
 
         self.page_count += 1
         self._update_page_count()
@@ -213,52 +216,55 @@ class HeapFile(RecordFile):
     # ---------- API publica ----------
 
     def insert(self, values) -> RID:
-        # record_data puede pesar cualquier cosa <= MAX_RECORD_SIZE
+        # values puede pesar cualquier cosa <= MAX_RECORD_SIZE
         # (heapfile.py no sabe ni le importa si es de largo fijo o
-        # variable, eso ya lo resolvio record.py).
+        # variable, eso ya lo resolvio el serializer).
         # 1. Si no entra en ninguna pagina vacia, ValueError.
         # 2. Buscar en el directorio (sin tocar disco) una pagina con
         #    free_space_bytes suficiente; delegar el insert real en
-        #    SlottedPage.insert.
+        #    VariablePage.insert.
         # 3. Si ninguna alcanza, pedir pagina nueva con _new_page.
         # Devuelve el RID (page_id, slot_id) del registro insertado.
-        record_data = self.serializer.encode(values)
+        record = Record(values)
+        record_data_size = self.serializer.get_size_of(values)
 
-        if len(record_data) > MAX_RECORD_SIZE:
-            raise ValueError(f"Record's length exceeds maximum: {len(record_data)} bytes, maximum {MAX_RECORD_SIZE}")
+        if record_data_size > MAX_RECORD_SIZE:
+            raise ValueError(f"Record's length exceeds maximum: {record_data_size} bytes, maximum {MAX_RECORD_SIZE}")
 
-        needed = len(record_data) + SLOT_SIZE
+        needed = record_data_size + RID_SIZE + DELETED_SIZE + SLOT_SIZE
         for page_id in range(1, self.next_page_id):
             if page_id in self._dir_page_ids:
                 continue
             if self._get_free_space(page_id) < needed:
                 continue
             page = self._load(page_id)
-            slot_id = page.insert(record_data)
+            slot_id = page.insert(record)
             self._sync_page(page)
             return RID(page_id, slot_id)
-        
+
         page = self._new_page()
-        slot_id = page.insert(record_data)
+        slot_id = page.insert(record)
         self._sync_page(page)
         return RID(page.page_id, slot_id)
-    
+
     def fetch(self, rid: RID):
-        # Devuelve los bytes del registro en rid, o None si no existe
-        # o esta borrado. Delegado en SlottedPage.get_record.
+        # Devuelve los valores del registro en rid, o None si no existe
+        # o esta borrado. Delegado en VariablePage.get_record.
         page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return None
         page = self._load(page_id)
-        record_bytes = page.get_record(slot_id)
+        record = page.get_record(slot_id)
         self.buffer_manager.unpin_page(page_id, self.file_manager)
-        if record_bytes is None:
+        if record is None:
             return None
-        return self.serializer.decode(record_bytes)
+        return list(record.params)
 
     def delete(self, rid: RID) -> bool:
-        # Borra el registro en rid (delegado en SlottedPage.delete_record)
-        # y sincroniza la pagina/directorio si el borrado fue efectivo.
+        # Borra el registro en rid (delegado en VariablePage.delete_record,
+        # que lo engancha a la free list para que un insert futuro lo
+        # recicle) y sincroniza la pagina/directorio si el borrado fue
+        # efectivo.
         page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return False
@@ -289,19 +295,19 @@ class HeapFile(RecordFile):
             self.compact(page_id)
 
     def scan(self):
-        # devuelve (RID, record_bytes) para todos los registros vivos
+        # devuelve (RID, valores) para todos los registros vivos
         for page_id in range(1, self.next_page_id):
             if page_id in self._dir_page_ids:
                 continue
-            
+
             page = self._load(page_id)
-            
+
             # Recorremos todos los slots de esta pagina
-            for slot_id in range(page.slot_count):
+            for slot_id in range(page.n_records):
                 record = page.get_record(slot_id)
                 if record is not None:
-                    yield RID(page_id, slot_id), self.serializer.decode(record)
-                    
+                    yield RID(page_id, slot_id), list(record.params)
+
             self.buffer_manager.unpin_page(page_id, self.file_manager)
 
     def close(self):

@@ -4,7 +4,7 @@ from storage.formats.data_types import return_format
 
 class RecordPacker(RecordFormat):
     """
-    Empaquetador de registros con cabecera de offsets para HeapFile/SlottedPage.
+    Empaquetador de registros con cabecera de offsets para HeapFile/VariablePage.
     Soporta tanto la interfaz RecordFormat (encode/decode) como los alias 
     record_encoder/record_decoder requeridos por la suite de pruebas.
     """
