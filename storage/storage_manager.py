@@ -3,6 +3,7 @@ from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 from storage.table import Table
 from storage.schema_catalog import SchemaCatalog
+from storage.index_manager import IndexManager
 
 
 class StorageManager:
@@ -26,6 +27,7 @@ class StorageManager:
             header_size=self.header_size,
             buffer_frames=self.buffer_frames
         )
+        self.index_manager = IndexManager(self.catalog)
         self.tables: dict[str, Table] = {}  # Caché de tablas abiertas en memoria
 
     def create_table(
@@ -70,6 +72,11 @@ class StorageManager:
             file_manager=fm
         )
 
+        # Reacopla los indices B+ que el catalogo diga que esta tabla tiene
+        # (creados en una sesion anterior o en esta misma), para que las
+        # consultas los puedan usar y el CRUD los mantenga al dia.
+        self.index_manager.load_indexes_for_table(table)
+
         self.tables[name] = table
         return table
 
@@ -100,6 +107,8 @@ class StorageManager:
         self.tables.clear()
 
         self.catalog.close()
+
+        self.index_manager.close()
 
     def __enter__(self):
         return self
