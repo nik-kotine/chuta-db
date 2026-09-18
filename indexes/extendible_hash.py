@@ -367,7 +367,7 @@ class HashIndex:
     def max_directory_page_capacity(self):
         return (PAGE_SIZE//DIRECTORY_ENTRY_SIZE) * self.n_directory_pages # 1024 * self.n_directory_pages
 
-    def __init__(self, table_name, column_name, key_format, key_variable, buffer_manager, max_bucket_size, depth, seed): #TODO QUE DEJEN DE SER CLASES BUCKET
+    def __init__(self, table_name, column_name, key_format, key_variable, buffer_manager, max_bucket_size, depth, seed, file_manager=None): #TODO QUE DEJEN DE SER CLASES BUCKET
         self.table_name = table_name
         self.column_name = column_name
         self.max_bucket_size = max_bucket_size
@@ -375,7 +375,17 @@ class HashIndex:
         self.seed = seed
         self.bucket_count = 0
         self.buffer_manager = buffer_manager
-        self.file_manager = buffer_manager.file_manager
+        # En la arquitectura actual el buffer pool es global (singleton), asi
+        # que el indice guarda aparte el FileManager de SU archivo para
+        # identificar sus paginas: misma idea que Table/B+.
+        if file_manager is None:
+            file_manager = getattr(buffer_manager, "active_file", None)
+        if file_manager is None:
+            raise ValueError(
+                "HashIndex necesita un FileManager: pasalo o registra uno "
+                "en el buffer pool"
+            )
+        self.file_manager = file_manager
         self.key_format = key_format
         self.key_variable = key_variable
         self.serializer = KVSerializer(self.key_format, self.key_variable)
@@ -388,8 +398,8 @@ class HashIndex:
             metadata_page.set(i, directory_page_id)
         for i in range(self.max_capacity):
             self._append_bucket(i, self.depth, is_overflow=False) #ya actualiza directory
-        self.buffer_manager.mark_dirty(0)
-        self.buffer_manager.unpin_page(0)
+        self.buffer_manager.mark_dirty(0, self.file_manager)
+        self.buffer_manager.unpin_page(0, self.file_manager)
 
 
 
@@ -400,8 +410,8 @@ class HashIndex:
         directory_page_id = metadata_page.get(index // 1024)
         directory_page = self._load_directory_page(directory_page_id)
         output = directory_page.get_first(index % 1024)
-        self.buffer_manager.unpin_page(0)
-        self.buffer_manager.unpin_page(directory_page_id)
+        self.buffer_manager.unpin_page(0, self.file_manager)
+        self.buffer_manager.unpin_page(directory_page_id, self.file_manager)
         return output
 
     def _locate_last_bucket(self, index: int) -> int | None:
@@ -411,8 +421,8 @@ class HashIndex:
         directory_page_id = metadata_page.get(index // 1024)
         directory_page = self._load_directory_page(directory_page_id)
         output = directory_page.get_second(index % 1024)
-        self.buffer_manager.unpin_page(0)
-        self.buffer_manager.unpin_page(directory_page_id)
+        self.buffer_manager.unpin_page(0, self.file_manager)
+        self.buffer_manager.unpin_page(directory_page_id, self.file_manager)
         return output
 
     def _set_bucket_page(self, index: int, page_id: int):
@@ -423,10 +433,10 @@ class HashIndex:
         directory_page = self._load_directory_page(directory_page_id)
         try:
             directory_page.set_first(index % 1024, page_id)
-            self.buffer_manager.mark_dirty(directory_page_id)
+            self.buffer_manager.mark_dirty(directory_page_id, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(0)
-            self.buffer_manager.unpin_page(directory_page_id)
+            self.buffer_manager.unpin_page(0, self.file_manager)
+            self.buffer_manager.unpin_page(directory_page_id, self.file_manager)
 
     def _set_last_bucket_page(self, index: int, page_id: int):
         if self.max_directory_page_capacity <= index:
@@ -436,10 +446,10 @@ class HashIndex:
         directory_page = self._load_directory_page(directory_page_id)
         try:
             directory_page.set_second(index % 1024, page_id)
-            self.buffer_manager.mark_dirty(directory_page_id)
+            self.buffer_manager.mark_dirty(directory_page_id, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(0)
-            self.buffer_manager.unpin_page(directory_page_id)
+            self.buffer_manager.unpin_page(0, self.file_manager)
+            self.buffer_manager.unpin_page(directory_page_id, self.file_manager)
 
     def _split_bucket(self, bucket_to_split: int): #Cuando se llame a esta función, el bucket no puede ser de máximo depth, sino bota error
         old_page_id = self._locate_bucket(bucket_to_split)
@@ -485,11 +495,11 @@ class HashIndex:
             if bucket.local_depth != new_bucket.local_depth:
                 raise ValueError("Local depths of newly split buckets do not match")
 
-            self.buffer_manager.mark_dirty(new_page_id)
-            self.buffer_manager.mark_dirty(old_page_id)
+            self.buffer_manager.mark_dirty(new_page_id, self.file_manager)
+            self.buffer_manager.mark_dirty(old_page_id, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(new_page_id)
-            self.buffer_manager.unpin_page(old_page_id)
+            self.buffer_manager.unpin_page(new_page_id, self.file_manager)
+            self.buffer_manager.unpin_page(old_page_id, self.file_manager)
 
 
     def _add_overflow_bucket(self, bucket_number: int):
@@ -498,8 +508,8 @@ class HashIndex:
         new_page_id = self._append_bucket(bucket_number, old_bucket.local_depth, is_overflow=True)
         old_bucket.next_bucket_page = new_page_id
         self._set_last_bucket_page(bucket_number, new_page_id)
-        self.buffer_manager.mark_dirty(old_page_id)
-        self.buffer_manager.unpin_page(old_page_id)
+        self.buffer_manager.mark_dirty(old_page_id, self.file_manager)
+        self.buffer_manager.unpin_page(old_page_id, self.file_manager)
 
 
     def _double_in_size(self):
@@ -521,18 +531,18 @@ class HashIndex:
         """
         if page_id is None:
             raise IndexError("Bucket not found")
-        page_ba = self.buffer_manager.fetch_page(page_id)
+        page_ba = self.buffer_manager.fetch_page(page_id, self.file_manager)
         return VariableBucketPage(page_ba, PAGE_SIZE, self.serializer, is_new)
 
 
     def _load_directory_page(self, page_id: int) -> DirectoryPage:
         if page_id is None:
             raise IndexError("Directory page not found")
-        page_ba = self.buffer_manager.fetch_page(page_id)
+        page_ba = self.buffer_manager.fetch_page(page_id, self.file_manager)
         return DirectoryPage(page_ba)
 
     def _load_metadata_page(self):
-        page_ba = self.buffer_manager.fetch_page(0)
+        page_ba = self.buffer_manager.fetch_page(0, self.file_manager)
         return MetadataPage(page_ba)
 
 
@@ -551,9 +561,9 @@ class HashIndex:
             bucket.offset = new_bucket_size
             bucket.local_depth = local_depth
             bucket.next_bucket_page = -1
-            self.buffer_manager.mark_dirty(page_id)  # página física del nuevo bucket
+            self.buffer_manager.mark_dirty(page_id, self.file_manager)  # página física del nuevo bucket
         finally:
-            self.buffer_manager.unpin_page(page_id)
+            self.buffer_manager.unpin_page(page_id, self.file_manager)
         return page_id
 
 
@@ -563,9 +573,9 @@ class HashIndex:
         metadata_page.set(self.n_directory_pages, phys_page_id)
         self.n_directory_pages += 1
         try:
-            self.buffer_manager.mark_dirty(0)
+            self.buffer_manager.mark_dirty(0, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(0)
+            self.buffer_manager.unpin_page(0, self.file_manager)
         return phys_page_id
 
 
@@ -576,7 +586,7 @@ class HashIndex:
         try:
             return bucket.get_kv_by_slot_id(slot_id)
         finally:
-            self.buffer_manager.unpin_page(bucket_page)
+            self.buffer_manager.unpin_page(bucket_page, self.file_manager)
 
 
     def _iter_kvs_in_bucket(self, bucket_number: int):
@@ -592,7 +602,7 @@ class HashIndex:
                 for i in range(bucket_size):
                     yield bucket.get_kv_by_slot_id(i)
             finally:
-                self.buffer_manager.unpin_page(bucket_page)
+                self.buffer_manager.unpin_page(bucket_page, self.file_manager)
                 bucket_page = next_bucket_page
 
 
@@ -612,15 +622,15 @@ class HashIndex:
 
         if bucket.size >= self.max_bucket_size or (not bucket.has_space_int(kv_size)): #considerar cambiar
             bucket.compact()
-            self.buffer_manager.mark_dirty(original_bucket_page)
+            self.buffer_manager.mark_dirty(original_bucket_page, self.file_manager)
 
         while bucket.size >= self.max_bucket_size or (not bucket.has_space_int(kv_size)): #considerar cambiar
             if bucket.local_depth == self.depth:
                 if self.depth >= MAX_DEPTH:
                     self._add_overflow_bucket(bucket_to_insert)
-                    self.buffer_manager.mark_dirty(bucket_page)
+                    self.buffer_manager.mark_dirty(bucket_page, self.file_manager)
                     if bucket_page != original_bucket_page: #solo si procede después de un split, porque sino ya se hace unpin al final (será == original_bucket_page)
-                        self.buffer_manager.unpin_page(bucket_page)
+                        self.buffer_manager.unpin_page(bucket_page, self.file_manager)
                     bucket_page = bucket.next_bucket_page
                     bucket = self._load_bucket(bucket_page, is_new=False)
                     break
@@ -632,16 +642,16 @@ class HashIndex:
             if bucket_page_next is None:
                 raise RuntimeError("Somehow new bucket was either deleted or not appended by duplication of size")
             if bucket_page != bucket_page_next:
-                self.buffer_manager.unpin_page(bucket_page)
+                self.buffer_manager.unpin_page(bucket_page, self.file_manager)
                 bucket_page = bucket_page_next
                 bucket = self._load_bucket(bucket_page, is_new=False)
         try:
             bucket.insert(kv)
-            self.buffer_manager.mark_dirty(bucket_page)
+            self.buffer_manager.mark_dirty(bucket_page, self.file_manager)
         finally:
-            self.buffer_manager.unpin_page(bucket_page)
+            self.buffer_manager.unpin_page(bucket_page, self.file_manager)
             if original_bucket_page != bucket_page:
-                self.buffer_manager.unpin_page(original_bucket_page)
+                self.buffer_manager.unpin_page(original_bucket_page, self.file_manager)
 
 
     def search(self, key):
@@ -672,9 +682,54 @@ class HashIndex:
                     if kv is not None and kv.key == key and (not kv.deleted):
                         bucket.delete_slot(i)
                         deleted_count += 1
-                self.buffer_manager.mark_dirty(bucket_page)
+                self.buffer_manager.mark_dirty(bucket_page, self.file_manager)
             finally:
                 previous_bucket_page = bucket_page
                 bucket_page = bucket.next_bucket_page
-                self.buffer_manager.unpin_page(previous_bucket_page)
+                self.buffer_manager.unpin_page(previous_bucket_page, self.file_manager)
         return deleted_count
+
+
+    def _insert_ref(self, key, ref):
+        """
+        Mantenimiento desde Table.insert: inserta un par (clave, RID).
+        El indice hash permite claves duplicadas (otra fila distinta puede
+        tener el mismo valor), asi que cada RID es su propia entrada.
+        """
+        return self.insert(key, ref)
+
+
+    def delete_ref(self, key, rid):
+        """
+        Mantenimiento desde Table.delete: borra SOLO la entrada de esta
+        fila (clave, RID), en vez de todas las filas con esa clave como
+        hace delete().
+        """
+        hashed_key = hash_key(key, self.key_format, self.seed)
+        bucket_number = hashed_key % self.max_capacity
+        bucket_page = self._locate_bucket(bucket_number)
+        if bucket_page is None:
+            raise IndexError("Bucket redirection from locator dictionary is wrong or capacity is too big")
+        was_deleted = False
+        while bucket_page != -1:
+            bucket = self._load_bucket(bucket_page, is_new=False)
+            try:
+                for i in range(bucket.size):
+                    kv = bucket.get_kv_by_slot_id(i)
+                    if kv is not None and kv.key == key and kv.rid == rid and (not kv.deleted):
+                        if bucket.delete_slot(i):
+                            was_deleted = True
+                self.buffer_manager.mark_dirty(bucket_page, self.file_manager)
+            finally:
+                previous_bucket_page = bucket_page
+                bucket_page = bucket.next_bucket_page
+                self.buffer_manager.unpin_page(previous_bucket_page, self.file_manager)
+        return was_deleted
+
+
+    def close(self):
+        """
+        Cierra el archivo del indice: persiste sus paginas modificadas y
+        las descarta del buffer pool global.
+        """
+        self.buffer_manager.close(self.file_manager)

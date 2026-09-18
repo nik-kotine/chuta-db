@@ -25,12 +25,10 @@ from visitor import Visitor
 from storage.storage_manager import StorageManager
 from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
-from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
-from indexes.external_hash import ExternalHasher
+from indexes.extendible_hash import HashIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 
 EXTERNAL_SORT_BUDGET = 1000
-EXTERNAL_HASH_BUCKETS = 16
 EXTERNAL_HASH_BUCKETS = 16
 
 class ExecutionError(Exception):
@@ -201,10 +199,13 @@ class ExecuteVisitor(Visitor):
         pos = tabla.column_index(stm.columna)
 
         if stm.tipo == IndexKind.HASH_IDX:
-            raise ExecutionError(
-                "indices HASH no estan implementados aun; use USING BTREE"
-            )
-        if stm.clustered:
+            # El parser ya rechaza HASH CLUSTERED; aquí solo se valida que
+            # la tabla sea Heap (igual que un B+ no agrupado).
+            if tabla.file_type != "heap":
+                raise ExecutionError(
+                    "un indice HASH exige una tabla USING HEAP"
+                )
+        elif stm.clustered:
             if tabla.file_type != "sequential":
                 raise ExecutionError(
                     "un indice CLUSTERED exige una tabla USING SEQUENTIAL"
@@ -219,17 +220,26 @@ class ExecuteVisitor(Visitor):
             )
 
         nombre = f"idx_{stm.tabla}_{stm.columna}"
-        if stm.clustered:
+        if stm.tipo == IndexKind.HASH_IDX:
+            self.sm.index_manager.create_hash_index(
+                nombre, tabla, pos, stm.columna
+            )
+            tipo_nombre = "HASH"
+            org = "no agrupado"
+        elif stm.clustered:
             self.sm.index_manager.create_clustered_index(
                 nombre, tabla, stm.columna
             )
+            tipo_nombre = "B+"
+            org = "CLUSTERED"
         else:
             self.sm.index_manager.create_unclustered_index(
                 nombre, tabla, pos, stm.columna
             )
-        org = "CLUSTERED" if stm.clustered else "no agrupado"
+            tipo_nombre = "B+"
+            org = "no agrupado"
         self.resultado = Resultado(
-            f"Indice B+ {org} '{nombre}' creado sobre {stm.tabla}({stm.columna})"
+            f"Indice {tipo_nombre} {org} '{nombre}' creado sobre {stm.tabla}({stm.columna})"
         )
 
     def visit_transaction_stmt(self, stm):
@@ -350,8 +360,12 @@ class ExecuteVisitor(Visitor):
             indice = self._indice_para(tabla, pos)
             if indice is None:
                 return None
+            org, _ = indice
+            es_hash = org == "hash"
 
             if isinstance(cond, BetweenCond):
+                if es_hash:
+                    return None  # el hash no responde rangos
                 return ("RANGO", indice, pos,
                         (self._valor(cond.inferior), self._valor(cond.superior)))
             if not isinstance(cond, CompareCond):
@@ -360,6 +374,8 @@ class ExecuteVisitor(Visitor):
             valor = self._valor(cond.valor)
             if cond.op == RelOp.EQ_OP:
                 return ("EQ", indice, pos, (valor,))
+            if es_hash:
+                return None  # el hash solo sirve para búsqueda por punto
             if not self._es_numerico(tabla, pos):
                 return None
             if cond.op == RelOp.GE_OP:
@@ -379,14 +395,21 @@ class ExecuteVisitor(Visitor):
 
     def _indice_para(self, tabla, pos):
         """
-        Devuelve ('clustered'|'unclustered', indice) para la columna
-        pos si hay un indice B+ sobre ella, o None.
+        Devuelve ('clustered'|'unclustered'|'hash', indice) para la
+        columna pos si hay un indice sobre ella, o None.
+
+        Si la columna tiene varios indices secundarios se prefiere el B+
+        (responde busquedas por punto Y por rango); el hash se usa como
+        alternativa cuando es el unico indice postulante.
         """
         if tabla.clustered_index is not None and pos == tabla.key_index:
             return ("clustered", tabla.clustered_index)
         secundarios = tabla.secondary_indexes.get(pos)
         if secundarios:
-            return ("unclustered", secundarios[0])
+            for idx in secundarios:
+                if not isinstance(idx, HashIndex):
+                    return ("unclustered", idx)
+            return ("hash", secundarios[0])
         return None
 
     def _candidatos_con_indice(self, tabla, plan):
@@ -395,6 +418,15 @@ class ExecuteVisitor(Visitor):
         búsqueda por punto (EQ) o rango (RANGO via range_search).
         """
         tipo, (org, indice), pos, valores = plan
+
+        if org == "hash":
+            # El hash guarda pares (clave, RID): se trae la fila del heap
+            # por su RID, igual que hace el B+ no agrupado.
+            for kv in indice.search(valores[0]):
+                registro = tabla.data_file.fetch(kv.rid)
+                if registro is not None:
+                    yield list(registro)
+            return
 
         if tipo == "EQ":
             refs = indice.search(valores[0])

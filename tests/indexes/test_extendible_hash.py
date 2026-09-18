@@ -4,10 +4,10 @@ import struct
 import tempfile
 from collections import Counter
 
-from FileManager import FileManager
-from BufferManager import BufferManager
-import extendible_hash as EHI
-from extendible_hash import HashIndex
+from storage.file_manager import FileManager
+from storage.buffer_manager import BufferManager
+from indexes import extendible_hash as EHI
+from indexes.extendible_hash import HashIndex
 
 
 PAGE_SIZE = 8192
@@ -65,13 +65,13 @@ def create_index(
 def flush_and_close(filename, fm, bm, remove=True):
     """
     Cierra FileManager/BufferManager y opcionalmente elimina el archivo.
-    """
-    # Copiamos las keys porque flush_page puede modificar page_table.
-    for phys_page_id in list(bm.page_table.keys()):
-        bm.flush_page(phys_page_id)
 
-    fm.flush()
-    fm.close()
+    En la arquitectura actual el buffer pool es global: cada página se
+    identifica por (file_manager, phys_page_id), así que se persisten y
+    cierran las páginas de ESTE archivo con bm.close(fm).
+    """
+    bm.flush_file(fm)
+    bm.close(fm)
 
     if remove and os.path.exists(filename):
         os.remove(filename)
@@ -145,7 +145,8 @@ def index_keys(index):
                 index.buffer_manager.unpin_page(
                     bucket_page
                     if bucket_page in seen_pages
-                    else next(iter(seen_pages))
+                    else next(iter(seen_pages)),
+                    index.file_manager,
                 )
 
                 # El código anterior no permite conservar fácilmente
@@ -202,7 +203,7 @@ def all_accessible_kvs(index):
                         )
 
             finally:
-                index.buffer_manager.unpin_page(current_page)
+                index.buffer_manager.unpin_page(current_page, index.file_manager)
 
             bucket_page = next_page
     return result
@@ -256,7 +257,7 @@ def directory_snapshot(index):
         try:
             local_depth = bucket.local_depth
         finally:
-            index.buffer_manager.unpin_page(first)
+            index.buffer_manager.unpin_page(first, index.file_manager)
 
         result[i] = (first, last, local_depth)
 
@@ -307,7 +308,7 @@ def assert_directory_consistency(index):
             pattern = directory_index & mask
 
         finally:
-            index.buffer_manager.unpin_page(first_page)
+            index.buffer_manager.unpin_page(first_page, index.file_manager)
 
         # Si ya vimos este bucket primario, debe representar
         # exactamente el mismo patrón.
@@ -357,7 +358,7 @@ def assert_directory_consistency(index):
                 assert bucket.local_depth == local_depth
 
             finally:
-                index.buffer_manager.unpin_page(current_page)
+                index.buffer_manager.unpin_page(current_page, index.file_manager)
 
             if next_page == -1:
                 assert current_page == expected_last_page
@@ -467,7 +468,7 @@ def assert_bucket_records_match_hash(index):
             expected_pattern = directory_index & mask
 
         finally:
-            index.buffer_manager.unpin_page(first_page)
+            index.buffer_manager.unpin_page(first_page, index.file_manager)
 
         # Si ya verificamos físicamente esta cadena, no la recorremos
         # otra vez aunque otra entrada del directorio apunte a ella.
@@ -509,7 +510,7 @@ def assert_bucket_records_match_hash(index):
                 next_page = bucket.next_bucket_page
 
             finally:
-                index.buffer_manager.unpin_page(bucket_page)
+                index.buffer_manager.unpin_page(bucket_page, index.file_manager)
 
             bucket_page = next_page
 
@@ -581,7 +582,7 @@ def test_initial_bucket_state():
                 assert bucket.offset == PAGE_SIZE
 
             finally:
-                index.buffer_manager.unpin_page(page)
+                index.buffer_manager.unpin_page(page, index.file_manager)
 
         assert len(pages) == 4
 
@@ -926,10 +927,10 @@ def test_compaction():
                     # No exigimos un tamaño concreto porque las claves
                     # pueden estar distribuidas entre varios buckets.
                     bucket.compact()
-                    index.buffer_manager.mark_dirty(bucket_page)
+                    index.buffer_manager.mark_dirty(bucket_page, index.file_manager)
 
                 finally:
-                    index.buffer_manager.unpin_page(bucket_page)
+                    index.buffer_manager.unpin_page(bucket_page, index.file_manager)
 
                 bucket_page = next_page
 
@@ -1025,7 +1026,7 @@ def test_overflow_at_max_depth():
                     found_overflow = True
                     assert last != first
             finally:
-                index.buffer_manager.unpin_page(first)
+                index.buffer_manager.unpin_page(first, index.file_manager)
 
         assert found_overflow, (
             "No se creó ningún bucket de overflow aunque se alcanzó "
@@ -1114,7 +1115,7 @@ def test_variable_string_serializer():
     Esto no usa HashIndex porque el índice de test anterior está
     configurado con enteros.
     """
-    from cleanerextendiblehash import KV, KVSerializer
+    from indexes.extendible_hash import KV, KVSerializer
 
     serializer = KVSerializer("s", True)
 
@@ -1144,7 +1145,7 @@ def test_variable_string_serializer():
 
 
 def test_fixed_string_serializer():
-    from cleanerextendiblehash import KV, KVSerializer
+    from indexes.extendible_hash import KV, KVSerializer
 
     serializer = KVSerializer("20s", False)
 
@@ -1211,8 +1212,8 @@ def test_deleted_flag_persists_in_page():
             assert found
 
         finally:
-            index.buffer_manager.mark_dirty(page_id)
-            index.buffer_manager.unpin_page(page_id)
+            index.buffer_manager.mark_dirty(page_id, index.file_manager)
+            index.buffer_manager.unpin_page(page_id, index.file_manager)
 
         assert index.search(key) == []
 
@@ -1279,8 +1280,11 @@ def test_random_operations():
 
             # Suficientemente amplio para producir duplicados,
             # pero evitando concentrar cientos de registros en unas
-            # pocas claves.
-            key = rng.randint(0, 1000)
+            # pocas claves. Rango mas amplio que 0..1000: con un rango
+            # chico, colisiones de bits bajos del hash hacen crecer el
+            # directorio hasta MAX_DEPTH (miles de entradas) con pocos
+            # buckets fisicos, y el test se vuelve inutilmente lento.
+            key = rng.randint(0, 5000)
 
             # -----------------------------------------------------------
             # INSERT
