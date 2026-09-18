@@ -537,6 +537,15 @@ class SequentialFile(RecordFile):
             if not record.deleted:
                 yield rid, list(record.params)
 
+    def close(self):
+        self.buffer_manager.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
     def _truncate(self, n_main_pages: int):
         self.buffer_manager.flush_file(self.file_manager)
         self.file_manager.truncate(

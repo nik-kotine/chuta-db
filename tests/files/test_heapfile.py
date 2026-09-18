@@ -2,9 +2,11 @@ import os
 import sys
 
 from storage.formats.record_packer import RecordPacker
+from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
-from storage.pages.slotted_page import SlottedPage, PAGE_SIZE
+from storage.seq_record import Record
+from storage.pages.variable_page import VariablePage
 from storage.files.heap_file import HeapFile, MAX_RECORD_SIZE
 
 TEST_FILE = "test_heap.bin"
@@ -34,19 +36,21 @@ def test_record():
     print("OK: el roundtrip encoder/decoder devuelve los mismos valores")
 
 
-# ---------- 2. page.py: una sola pagina, sin heapfile de por medio ----------
+# ---------- 2. variable_page.py: una sola pagina, sin heapfile de por medio ----------
 
 def test_page():
-    print("\n--- page.py ---")
-    page = SlottedPage(page_id=1)
+    print("\n--- variable_page.py ---")
+    serializer = VariableLengthRecordSerializer(["text"])
+    page = VariablePage(bytearray(PAGE_SIZE), PAGE_SIZE, serializer)
+    page.reset()
 
-    slot_a = page.insert(b"primer registro")
-    slot_b = page.insert(b"segundo registro")
+    slot_a = page.insert(Record(["primer registro"]))
+    slot_b = page.insert(Record(["segundo registro"]))
     print("insert ->", slot_a, slot_b)
     print("espacio libre tras 2 inserts:", page.free_space_bytes)
 
-    assert page.get_record(slot_a) == b"primer registro"
-    assert page.get_record(slot_b) == b"segundo registro"
+    assert page.get_record(slot_a).params == ["primer registro"]
+    assert page.get_record(slot_b).params == ["segundo registro"]
     print("OK: get_record devuelve lo insertado")
 
     assert page.delete_record(slot_a) is True
@@ -58,6 +62,11 @@ def test_page():
     print("espacio libre antes/despues de defragment:", espacio_antes, page.free_space_bytes)
     assert page.free_space_bytes >= espacio_antes
     print("OK: defragment recupera el espacio del registro borrado")
+
+    slot_c = page.insert(Record(["tercer registro"]))
+    assert slot_c == slot_a
+    assert page.get_record(slot_c).params == ["tercer registro"]
+    print("OK: la free list recicla el slot muerto en el siguiente insert")
 
 
 # ---------- 3. heapfile.py: integracion completa, con record_format encima ----------
