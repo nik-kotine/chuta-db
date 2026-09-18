@@ -1,0 +1,8 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600&display=swap');
+
+:root { --ink: #1d2728; --muted: #6d7773; --paper: #e9e5d9; --panel: #f5f2e9; --line: #c9c7bc; --amber: #b47a32; --amber-soft: #e7d6b7; --green: #58745e; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: #d5d2c7; color: var(--ink); font-family: 'Space Grotesk', sans-serif; }
+button, textarea { font: inherit; }
+button { cursor: pointer; }
