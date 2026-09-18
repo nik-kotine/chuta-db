@@ -15,7 +15,7 @@ SLOT_ID_BITS = 16
 FILE_HEADER_FORMAT = ">iiii"
 FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT)
 
-WASTED_RATIO = 0.5
+WASTED_RATIO = 0.3
 
 class SequentialFile(RecordFile):
     def __init__(
