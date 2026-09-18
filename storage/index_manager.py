@@ -1,13 +1,23 @@
 import os
 from indexes.b_plus_unclustered import BPlusTreeUnclustered
 from indexes.b_plus_clustered import BPlusTreeClustered
+from indexes.extendible_hash import HashIndex
+from indexes.extendible_hash import PAGE_SIZE as HASH_PAGE_SIZE
+from storage.buffer_manager import BufferManager
+from storage.file_manager import FileManager
 from storage.schema_catalog import SchemaCatalog
 from storage.table import Table
 
 
+HASH_FILE_HEADER_SIZE = 16
+HASH_DEFAULT_BUCKET_SIZE = 16
+HASH_DEFAULT_DEPTH = 1
+HASH_DEFAULT_SEED = 0
+
+
 class IndexManager:
     """
-    Administra la creación, apertura y eliminación de índices B+ en la base de datos.
+    Administra la creación, apertura y eliminación de índices B+ y hash en la base de datos.
     """
     def __init__(self, catalog: SchemaCatalog):
         self.catalog = catalog
@@ -82,6 +92,94 @@ class IndexManager:
         table.set_clustered_index(index)
         return index
 
+    def create_hash_index(
+        self, 
+        index_name: str, 
+        table: Table, 
+        column_index: int, 
+        column_name: str = "col"
+    ) -> HashIndex:
+        """
+        Crea un índice hash no agrupado (extendible hashing) sobre una
+        columna. Solo tiene sentido sobre tablas Heap (igual que el B+
+        no agrupado). Si la tabla ya tiene datos, se encarga de leerlos
+        e indexarlos.
+        """
+        self.catalog.register_index(
+            index_name=index_name,
+            table_name=table.name,
+            column_name=column_name,
+            column_index=column_index,
+            index_type="hash"
+        )
+        return self._build_hash_index(index_name, table, column_index, column_name)
+
+    def _hash_key_config(self, table: Table, column_index: int):
+        """
+        Traduce el tipo de la columna a la configuración del KVSerializer
+        del índice hash: formato struct de la clave y si es variable.
+        """
+        col_type = table.schema[column_index].strip().lower()
+        if col_type in ("int", "integer", "int4", "smallint", "int2", "date"):
+            return (">i", False)
+        if col_type in ("bigint", "int8"):
+            return (">q", False)
+        if col_type in ("float", "real", "float4", "double precision", "float8"):
+            # ">d" en vez de ">f": el hash y la igualdad trabajan sobre el
+            # float de Python, y con 8 bytes no se pierde precisión extra.
+            return (">d", False)
+        if col_type in ("bool", "boolean"):
+            return (">?", False)
+        if col_type.startswith("varchar") or col_type in ("text", "string", "str"):
+            return ("s", True)
+        raise ValueError(
+            f"El tipo '{table.schema[column_index]}' no es soportado por "
+            f"el índice hash sobre '{table.name}'"
+        )
+
+    def _build_hash_index(
+        self, 
+        index_name: str, 
+        table: Table, 
+        column_index: int, 
+        column_name: str
+    ) -> HashIndex:
+        """
+        Construye el índice hash desde cero y lo enlaza a la tabla.
+
+        El hash no tiene persistencia de páginas (a diferencia del B+):
+        siempre se reconstruye barriendo la tabla, así que se descartan
+        páginas viejas en caché y se truncate el archivo .idx antes de
+        arrancar, para que una sesión anterior no deje basura.
+        """
+        index_filename = f"{index_name}.idx"
+        key_format, key_variable = self._hash_key_config(table, column_index)
+
+        fm = FileManager(index_filename, HASH_PAGE_SIZE, HASH_FILE_HEADER_SIZE)
+        bm = BufferManager(fm)
+        bm.invalidate_all(fm)
+        fm.truncate(fm.file_header_size)
+
+        index = HashIndex(
+            table_name=table.name,
+            column_name=column_name,
+            key_format=key_format,
+            key_variable=key_variable,
+            buffer_manager=bm,
+            max_bucket_size=HASH_DEFAULT_BUCKET_SIZE,
+            depth=HASH_DEFAULT_DEPTH,
+            seed=HASH_DEFAULT_SEED,
+            file_manager=fm
+        )
+
+        # Poblar el índice con los registros existentes en la tabla
+        for rid, record_params in table.scan():
+            index._insert_ref(record_params[column_index], rid)
+
+        self.open_indexes[index_name] = index
+        table.attach_index(column_index, index)
+        return index
+
     def load_indexes_for_table(self, table: Table):
         """
         Carga los índices registrados en el catálogo para una tabla dada
@@ -104,6 +202,16 @@ class IndexManager:
                     idx = BPlusTreeClustered(index_filename, table.data_file)
                     self.open_indexes[index_name] = idx
                     table.set_clustered_index(idx)
+
+                elif idx_type == "hash":
+                    # El hash no persiste sus páginas: se reconstruye
+                    # desde la tabla en cada apertura.
+                    self._build_hash_index(
+                        index_name,
+                        table,
+                        col_idx,
+                        meta["column_name"]
+                    )
 
     def drop_index(self, index_name: str):
         """Elimina un índice y su archivo físico .idx."""

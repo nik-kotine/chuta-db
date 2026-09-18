@@ -1,6 +1,6 @@
 """
-Pruebas del executor con indices (B+ agrupado y no agrupado) y algoritmos
-externos (External Sort / External Hash) conectados al parser.
+Pruebas del executor con indices (B+ agrupado, B+ no agrupado y HASH) y
+algoritmos externos (External Sort / External Hash) conectados al parser.
 PYTHONPATH=. python3 tests/table/test_executor_avanzado.py  (o run_all_tests.py)
 """
 
@@ -235,10 +235,10 @@ def test_create_index_rechaza_usos_invalidos():
     correr(sm, "INSERT INTO emp VALUES (1, 'Ana');")
 
     try:
-        correr(sm, "CREATE INDEX ON ventas (monto) USING HASH;")
-        assert False, "un indice HASH no esta implementado y debia fallar"
+        correr(sm, "CREATE INDEX ON emp (nombre) USING HASH;")
+        assert False, "un indice HASH (no agrupado) sobre una tabla sequential debia fallar"
     except ExecutionError as e:
-        assert "HASH" in str(e)
+        assert "HEAP" in str(e)
 
     try:
         correr(sm, "CREATE INDEX ON ventas (id) USING BTREE CLUSTERED;")
@@ -257,12 +257,113 @@ def test_create_index_rechaza_usos_invalidos():
     print("test_create_index_rechaza_usos_invalidos: OK")
 
 
+def test_select_usa_indice_hash():
+    """SELECT por igualdad sobre una columna con indice HASH debe resolver
+    via el indice (0 scaneos de la tabla) y devolver bien las filas; un
+    rango sobre esa misma columna NO usa el hash (no responde rangos) y
+    cae al scan, pero devuelve filas correctas."""
+    limpiar()
+    sm = StorageManager()
+
+    correr(sm, "CREATE TABLE ventas (id INT PRIMARY KEY, cliente VARCHAR(20), monto FLOAT) USING HEAP;")
+    correr(sm, "INSERT INTO ventas VALUES (1, 'Ana', 100.0);")
+    correr(sm, "INSERT INTO ventas VALUES (2, 'Beto', 250.0);")
+    correr(sm, "INSERT INTO ventas VALUES (3, 'Carlos', 300.0);")
+    correr(sm, "CREATE INDEX ON ventas (monto) USING HASH;")
+
+    tabla = sm.open_table("ventas")
+
+    llamadas, original = _prohibir_scan(tabla)
+    try:
+        res = correr(sm, "SELECT cliente FROM ventas WHERE monto = 250.0;")[0]
+        assert res.filas == [["Beto"]]
+    finally:
+        tabla.scan = original
+    assert llamadas["n"] == 0, f"el indice hash debia servir la consulta, scan: {llamadas['n']}"
+
+    # punto que no existe: el indice responde vacio sin barrer la tabla
+    llamadas, original = _prohibir_scan(tabla)
+    try:
+        res = correr(sm, "SELECT cliente FROM ventas WHERE monto = 999.0;")[0]
+        assert res.filas == []
+    finally:
+        tabla.scan = original
+    assert llamadas["n"] == 0, f"el indice hash debia responder vacio, scan: {llamadas['n']}"
+
+    # rango sobre columna hash: no hay plan con indice, se barre la tabla
+    res = correr(sm, "SELECT cliente FROM ventas WHERE monto BETWEEN 100 AND 300;")[0]
+    assert sorted(f[0] for f in res.filas) == ["Ana", "Beto", "Carlos"]
+
+    sm.close()
+    limpiar()
+    print("test_select_usa_indice_hash: OK")
+
+
+def test_indice_hash_poblado_con_registros_existentes():
+    """CREATE INDEX ... USING HASH sobre datos ya insertados debe
+    indexarlos, incluidas las filas con el mismo valor."""
+    limpiar()
+    sm = StorageManager()
+
+    correr(sm, "CREATE TABLE ventas (id INT PRIMARY KEY, cliente VARCHAR(20), monto FLOAT) USING HEAP;")
+    correr(sm, "INSERT INTO ventas VALUES (1, 'Ana', 250.0);")
+    correr(sm, "INSERT INTO ventas VALUES (2, 'Beto', 250.0);")
+    correr(sm, "INSERT INTO ventas VALUES (3, 'Carlos', 100.0);")
+    correr(sm, "CREATE INDEX ON ventas (monto) USING HASH;")
+
+    # monto=250.0 tiene dos filas: ambas deben aparecer via el indice
+    res = correr(sm, "SELECT cliente FROM ventas WHERE monto = 250.0;")[0]
+    assert sorted(f[0] for f in res.filas) == ["Ana", "Beto"]
+
+    sm.close()
+    limpiar()
+    print("test_indice_hash_poblado_con_registros_existentes: OK")
+
+
+def test_indice_hash_persiste_y_mantiene_el_crud():
+    """El indice hash no persiste sus paginas (se rearma desde la tabla al
+    abrir la base), pero el catalogo si recuerda que existe y debe seguir
+    al dia con INSERT y DELETE hechos por SQL en la sesion siguiente."""
+    limpiar()
+    sm = StorageManager()
+
+    correr(sm, "CREATE TABLE ventas (id INT PRIMARY KEY, cliente VARCHAR(20), monto FLOAT) USING HEAP;")
+    correr(sm, "INSERT INTO ventas VALUES (1, 'Ana', 100.0);")
+    correr(sm, "INSERT INTO ventas VALUES (2, 'Beto', 250.0);")
+    correr(sm, "CREATE INDEX ON ventas (monto) USING HASH;")
+    sm.close()
+
+    sm2 = StorageManager()
+    tabla = sm2.open_table("ventas")
+    assert tabla.secondary_indexes.get(2), "el indice hash no se recargo del catalogo"
+
+    res = correr(sm2, "SELECT cliente FROM ventas WHERE monto = 100.0;")[0]
+    assert res.filas == [["Ana"]]
+
+    # INSERT post-reapertura: el indice debe ver la fila nueva
+    correr(sm2, "INSERT INTO ventas VALUES (3, 'Carlos', 100.0);")
+    res = correr(sm2, "SELECT cliente FROM ventas WHERE monto = 100.0;")[0]
+    assert sorted(f[0] for f in res.filas) == ["Ana", "Carlos"]
+
+    # DELETE post-reapertura: el indice debe dejar de ver la fila borrada
+    correr(sm2, "DELETE FROM ventas WHERE id = 3;")
+    res = correr(sm2, "SELECT cliente FROM ventas WHERE monto = 100.0;")[0]
+    assert res.filas == [["Ana"]]
+
+    sm2.close()
+    limpiar()
+    print("test_indice_hash_persiste_y_mantiene_el_crud: OK")
+
+
 if __name__ == "__main__":
-    print("=== PROBANDO INDICES (B+ AGUPADO / NO AGUPADO) Y EXTERNAL ALGOS ===")
+    print("=== PROBANDO INDICES (B+ AGUPADO / NO AGUPADO / HASH) Y EXTERNAL ALGOS ===")
     test_select_usa_indice_unclustered()
     test_select_usa_indice_clustered()
     test_indice_poblado_con_registros_existentes()
     test_indices_persisten_y_mantienen_el_crud()
     test_join_y_groupby_y_orderby_por_sql()
     test_create_index_rechaza_usos_invalidos()
+    test_select_usa_indice_hash()
+    test_indice_hash_poblado_con_registros_existentes()
+    test_indice_hash_persiste_y_mantiene_el_crud()
     print("¡Todas las pruebas del executor avanzado pasaron con éxito!")
