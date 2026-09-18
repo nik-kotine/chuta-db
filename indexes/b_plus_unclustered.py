@@ -34,25 +34,37 @@ class BPlusTreeUnclustered(BPlusTreeBase):
         cadena de hojas para conservar los duplicados; mantiene el retorno de
         un RID para claves que siempre fueron únicas por compatibilidad.
         """
+        # mismo descenso que el arbol base: find_child(key) manda las
+        # claves iguales a un separador hacia la derecha (ver
+        # find_child_index), igual que insert() al decidir en que mitad
+        # cae un split -- por eso esta es la UNICA hoja donde puede
+        # empezar a aparecer key, nunca una hoja anterior.
         page_id = self.root_page_id
         depth = self.height
 
         while depth > 0:
             node = self._load_internal(page_id)
-            page_id = node._read_child(0)
+            page_id = node.find_child(key)
             depth -= 1
 
         matches = []
+        leaf = self._load_leaf(page_id)
         while True:
-            leaf = self._load_leaf(page_id)
+            fin_de_rango = False
             for index in range(leaf.n_entries):
                 entry_key, ref = leaf._read_entry(index)
+                if entry_key > key:
+                    fin_de_rango = True
+                    break
                 if entry_key == key:
                     matches.append(ref)
 
-            if leaf.next_leaf_id == 0:
+            # las hojas estan ordenadas y encadenadas en orden global, asi
+            # que en cuanto aparece una clave mayor ya no puede haber mas
+            # coincidencias mas adelante
+            if fin_de_rango or leaf.next_leaf_id == 0:
                 break
-            page_id = leaf.next_leaf_id
+            leaf = self._load_leaf(leaf.next_leaf_id)
 
         if not matches:
             return None
