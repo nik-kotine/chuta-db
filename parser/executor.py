@@ -60,10 +60,11 @@ def buscar_key_index(columnas) -> int:
 class Resultado:
     """Salida de una sentencia: filas, columnas y una descripcion del plan."""
 
-    def __init__(self, mensaje="", columnas=None, filas=None):
+    def __init__(self, mensaje="", columnas=None, filas=None, plan=None):
         self.mensaje = mensaje
         self.columnas = columnas or []
         self.filas = filas or []
+        self.plan = plan or []
 
     def __str__(self):
         if not self.columnas:
@@ -82,10 +83,12 @@ class ExecuteVisitor(Visitor):
     def __init__(self, storage_manager: StorageManager):
         self.sm = storage_manager
         self.resultado = None
+        self.plan = []
 
     def ejecutar(self, programa) -> list:
         salidas = []
         for stmt in programa.slist:
+            self.plan = []
             stmt.accept(self)
             salidas.append(self.resultado)
         return salidas
@@ -129,8 +132,10 @@ class ExecuteVisitor(Visitor):
     def visit_select_stmt(self, stm):
         tabla = self._abrir(stm.tabla)
         derecha = None
+        self.plan = [{"node": "SELECT", "table": stm.tabla, "operation": "project"}]
 
         if stm.join is not None:
+            self.plan.append({"node": "HASH JOIN", "table": stm.join.tabla, "operation": "join"})
             derecha = self._abrir(stm.join.tabla)
             tablas = [(stm.tabla, tabla), (stm.join.tabla, derecha)]
             resolver = self._resolver_columnas(tablas)
@@ -139,6 +144,7 @@ class ExecuteVisitor(Visitor):
             )
             filas = self._filas_join(tabla, derecha, stm, resolver, serializador)
             if not self._tiene_agregados(stm) and stm.order_by is not None:
+                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort"})
                 filas = self._ordenar_externo(
                     filas, resolver, stm.order_by,
                     stm.direccion == SortDir.DESC_DIR, serializador,
@@ -148,6 +154,7 @@ class ExecuteVisitor(Visitor):
             resolver = self._resolver_columnas(tablas)
             serializador = tabla.data_file.serializer
             if not self._tiene_agregados(stm) and stm.order_by is not None:
+                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort"})
                 filas = self._select_ordenado(
                     tabla, stm.condicion, resolver, stm.order_by,
                     stm.direccion == SortDir.DESC_DIR,
@@ -156,6 +163,7 @@ class ExecuteVisitor(Visitor):
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
 
         if self._tiene_agregados(stm):
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
             nombres, filas = self._proyeccion_agregada(
                 stm, filas, resolver, serializador
             )
@@ -181,7 +189,8 @@ class ExecuteVisitor(Visitor):
                     posiciones.append(resolver(item.columna))
                 filas = [[fila[p] for p in posiciones] for fila in filas]
 
-        self.resultado = Resultado(columnas=nombres, filas=filas)
+        self.plan.append({"node": "OUTPUT", "operation": "return_rows", "rows": len(filas)})
+        self.resultado = Resultado(columnas=nombres, filas=filas, plan=self.plan)
 
     def visit_delete_stmt(self, stm):
         tabla = self._abrir(stm.tabla)
@@ -320,11 +329,21 @@ class ExecuteVisitor(Visitor):
         plan = self._plan_indice(tabla, condicion, resolver)
 
         if plan is None:
+            self.plan.append({"node": "SEQUENTIAL SCAN", "table": tabla.name, "operation": "scan"})
             for _, registro in tabla.scan():
                 if condicion is None or self._evaluar(condicion, registro, resolver):
                     yield registro
             return
 
+        tipo, (organizacion, indice), posicion, _ = plan
+        self.plan.append({
+            "node": "INDEX SCAN",
+            "table": tabla.name,
+            "index": organizacion,
+            "access": tipo.lower(),
+            "operation": "index_scan",
+            "column": tabla.column_names[posicion],
+        })
         for registro in self._candidatos_con_indice(tabla, plan):
             if condicion is None or self._evaluar(condicion, registro, resolver):
                 yield registro
