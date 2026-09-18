@@ -13,35 +13,18 @@ from storage.file_manager import FileManager
 PAGE_SIZE = 4096
 HEADER_SIZE = VariablePage.PAGE_HEADER_SIZE
 
-# Pagina 0 del archivo: directorio persistente. Guarda cuantas paginas de
-# datos hay y, para cada una, su free_space_bytes actual. Evita re-escanear
-# todas las paginas cada vez que se abre el archivo.
-# Una sola pagina de directorio solo tiene espacio para trackear un numero
-# limitado de paginas de datos (ENTRIES_PER_DIR_PAGE). Cuando se llena, se
-# encadena una pagina de directorio nueva via next_dir_page_id -- asi el
-# heap file no tiene techo de paginas, el unico limite real es el disco.
-DIR_HEADER_FORMAT = ">II"  # (page_count, next_dir_page_id)
+DIR_HEADER_FORMAT = ">II"
 DIR_HEADER_SIZE = struct.calcsize(DIR_HEADER_FORMAT)
-DIR_ENTRY_FORMAT = ">H"  # free_space_bytes de una pagina
+DIR_ENTRY_FORMAT = ">H"
 DIR_ENTRY_SIZE = struct.calcsize(DIR_ENTRY_FORMAT)
 ENTRIES_PER_DIR_PAGE = (PAGE_SIZE - DIR_HEADER_SIZE) // DIR_ENTRY_SIZE
-NULL_DIR_PAGE = 0  # pagina 0 nunca es "la siguiente" de nadie, sirve de centinela
+NULL_DIR_PAGE = 0
 
-# Mayor registro que puede llegar a caber en una pagina recien creada
-# (sin fragmentacion, sin otros slots). Se resta tambien el next_rid y el
-# flag de deleted porque VariablePage los guarda junto a cada registro,
-# aunque el heap no los use (next_rid siempre queda en None).
 MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE - RID_SIZE - DELETED_SIZE
 
 class HeapFile(RecordFile):
     def __init__(self, filename: str, buffer_manager: BufferManager, record_format: list[str] | str,
                  file_manager: FileManager = None):
-        # Si el archivo no existe: crearlo e inicializar la pagina 0
-        # (page_count = 0) vacia.
-        # Si ya existe: abrirlo y cargar TODA la cadena de paginas de
-        # directorio a memoria (self._dir_pages, una por cada pagina de
-        # directorio que exista) siguiendo next_dir_page_id, para no tener
-        # que releerlas de disco en cada operacion.
         self.filename=filename
         self.buffer_manager = buffer_manager
         self.file_manager = file_manager or getattr(buffer_manager, "active_file", None)
@@ -90,13 +73,7 @@ class HeapFile(RecordFile):
                     break
                 page_id=next_dir_page_id
 
-
-    # ---------- directorio de espacio libre (pagina 0) ----------
-
     def _entry_location(self, page_id: int):
-        # Ubica en que pagina de directorio (indice dentro de
-        # self._dir_pages) y en que offset dentro de ella vive la entrada
-        # de free_space_bytes de una pagina de datos dada.
         flat_index = page_id - 1
         dir_index = flat_index // ENTRIES_PER_DIR_PAGE
         entry_index = flat_index % ENTRIES_PER_DIR_PAGE
@@ -104,8 +81,6 @@ class HeapFile(RecordFile):
         return dir_index, offset
 
     def _get_free_space(self, page_id: int) -> int:
-        # Lee de la pagina de directorio correspondiente el free_space_bytes
-        # guardado para page_id.
         dir_index, offset = self._entry_location(page_id)
         dir_page_id = self._dir_page_ids[dir_index]
 
@@ -115,8 +90,6 @@ class HeapFile(RecordFile):
         return free_space
 
     def _set_free_space(self, page_id: int, free_bytes: int):
-        # Escribe en la pagina de directorio correspondiente el
-        # free_space_bytes de page_id
         dir_index, offset = self._entry_location(page_id)
         dir_page_id = self._dir_page_ids[dir_index]
 
@@ -132,10 +105,8 @@ class HeapFile(RecordFile):
         self.buffer_manager.mark_dirty(0, self.file_manager)
         self.buffer_manager.unpin_page(0, self.file_manager)
 
-    # ---------- I/O de paginas de datos ----------
-
     def _page_offset(self, page_id: int) -> int:
-        return page_id * PAGE_SIZE  # page_id 0 = directorio, 1..N = datos
+        return page_id * PAGE_SIZE
 
     def _load(self, page_id: int) -> VariablePage:
         raw = self.buffer_manager.fetch_page(page_id, self.file_manager)
@@ -144,34 +115,24 @@ class HeapFile(RecordFile):
         return page
 
     def _sync_page(self, page: VariablePage):
-        # Marcar la página de datos, actualizar su espacio libre y despinarla
         self.buffer_manager.mark_dirty(page.page_id, self.file_manager)
         self.buffer_manager.unpin_page(page.page_id, self.file_manager)
         self._set_free_space(page.page_id, page.free_space_bytes)
 
     @property
     def next_page_id(self) -> int:
-        # El proximo id de pagina libre en el archivo (sea de datos o de
-        # directorio-overflow). Los ids se reparten secuencialmente entre
-        # ambos tipos, asi que es simplemente cuantas paginas de directorio
-        # y de datos existen hasta ahora.
         return len(self._dir_page_ids) + self.page_count
 
     def _needs_new_dir_page(self) -> bool:
-        # True si la proxima pagina de datos no entra en ninguna pagina
-        # de directorio existente (se les acabaron las entradas).
         dir_index = (self.next_page_id - 1) // ENTRIES_PER_DIR_PAGE
         return dir_index >= len(self._dir_page_ids)
 
     def _add_dir_page(self):
-        # Encadena una pagina de directorio nueva al final de la cadena:
-        # le pone el next_dir_page_id a la ultima pagina de la cadena y
-        # reserva la pagina nueva (vacia, con next_dir_page_id=0/NULL).
         new_dir_id = self.next_page_id
         last_dir_id = self._dir_page_ids[-1]
 
         last_data = self.buffer_manager.fetch_page(last_dir_id, self.file_manager)
-        struct.pack_into(">I", last_data, 4, new_dir_id)  # 2do campo del header = next_dir_page_id
+        struct.pack_into(">I", last_data, 4, new_dir_id)
         self.buffer_manager.mark_dirty(last_dir_id, self.file_manager)
         self.buffer_manager.unpin_page(last_dir_id, self.file_manager)
 
@@ -180,23 +141,16 @@ class HeapFile(RecordFile):
             new_dir_id = allocated_id
 
         new_data =self.buffer_manager.fetch_page(new_dir_id, self.file_manager)
-        struct.pack_into(DIR_HEADER_FORMAT, new_data, 0, 0, NULL_DIR_PAGE) # (pc: 0, next:NULL=0)
+        struct.pack_into(DIR_HEADER_FORMAT, new_data, 0, 0, NULL_DIR_PAGE)
         self.buffer_manager.mark_dirty(new_dir_id, self.file_manager)
         self.buffer_manager.unpin_page(new_dir_id, self.file_manager)
 
         self._dir_page_ids.append(new_dir_id)
 
     def _is_data_page(self, page_id: int) -> bool:
-        # Un page_id es valido si cae dentro del rango usado y no es en
-        # realidad una pagina de directorio (esas tambien consumen ids).
         return 1 <= page_id < self.next_page_id and page_id not in self._dir_page_ids
 
     def _new_page(self) -> VariablePage:
-        # Crea una pagina de datos vacia nueva al final del archivo,
-        # incrementa page_count, la sincroniza a disco y la devuelve.
-        # Si a la pagina de directorio actual ya no le quedan entradas
-        # libres, primero encadena una pagina de directorio nueva -- ya
-        # no hay un tope duro de paginas, solo el espacio en disco.
         if self._needs_new_dir_page():
             self._add_dir_page()
 
@@ -213,18 +167,7 @@ class HeapFile(RecordFile):
 
         return page
     
-    # ---------- API publica ----------
-
     def insert(self, values) -> RID:
-        # values puede pesar cualquier cosa <= MAX_RECORD_SIZE
-        # (heapfile.py no sabe ni le importa si es de largo fijo o
-        # variable, eso ya lo resolvio el serializer).
-        # 1. Si no entra en ninguna pagina vacia, ValueError.
-        # 2. Buscar en el directorio (sin tocar disco) una pagina con
-        #    free_space_bytes suficiente; delegar el insert real en
-        #    VariablePage.insert.
-        # 3. Si ninguna alcanza, pedir pagina nueva con _new_page.
-        # Devuelve el RID (page_id, slot_id) del registro insertado.
         record = Record(values)
         record_data_size = self.serializer.get_size_of(values)
 
@@ -248,8 +191,6 @@ class HeapFile(RecordFile):
         return RID(page.page_id, slot_id)
 
     def fetch(self, rid: RID):
-        # Devuelve los valores del registro en rid, o None si no existe
-        # o esta borrado. Delegado en VariablePage.get_record.
         page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return None
@@ -261,10 +202,6 @@ class HeapFile(RecordFile):
         return list(record.params)
 
     def delete(self, rid: RID) -> bool:
-        # Borra el registro en rid (delegado en VariablePage.delete_record,
-        # que lo engancha a la free list para que un insert futuro lo
-        # recicle) y sincroniza la pagina/directorio si el borrado fue
-        # efectivo.
         page_id, slot_id = rid
         if not self._is_data_page(page_id):
             return False
@@ -277,9 +214,6 @@ class HeapFile(RecordFile):
         return ok
 
     def compact(self, page_id: int):
-        # Fuerza defragment() sobre una pagina puntual y sincroniza.
-        # Util para recuperar espacio muerto que quedo tras varios
-        # remove() sin un add() posterior que lo reclame.
         if not self._is_data_page(page_id):
             return
         page=self._load(page_id)
@@ -287,22 +221,18 @@ class HeapFile(RecordFile):
         self._sync_page(page)
 
     def reorganize(self):
-        # compact() sobre todas las paginas de datos del archivo (saltando
-        # las paginas de directorio, que tambien viven en este rango de ids).
         for page_id in range(1,self.next_page_id):
             if page_id in self._dir_page_ids:
                 continue
             self.compact(page_id)
 
     def scan(self):
-        # devuelve (RID, valores) para todos los registros vivos
         for page_id in range(1, self.next_page_id):
             if page_id in self._dir_page_ids:
                 continue
 
             page = self._load(page_id)
 
-            # Recorremos todos los slots de esta pagina
             for slot_id in range(page.n_records):
                 record = page.get_record(slot_id)
                 if record is not None:

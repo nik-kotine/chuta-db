@@ -1,50 +1,17 @@
 import struct
 from indexes.b_tree_key_codec import encode_key, decode_key, MAX_KEY_SIZE
 
-# Pag de nodo interno
-# Necesitan directorio de indices
-# no tienen records
-#
-# Mismo esquema de largo variable que b_tree_leaf_page.py (ver el
-# comentario ahi): las keys de ruteo se guardan aparte, en un area que
-# crece desde el final de la pagina, y el directorio de keys se
-# mantiene siempre ordenado y compacto justo despues del header. Los
-# hijos (child_page_id) SI son de tamaño fijo -- van pegados despues
-# del directorio de keys, y se recalculan sus offsets cada vez que
-# cambia la cantidad de keys (porque el directorio de keys crece o se
-# achica antes que ellos).
-
 PAGE_SIZE = 4096
-
-# int     page_id
-# short   n_keys
-# short   free_space_high: offset donde empieza el area de bytes de
-# las keys
 HEADER_FORMAT = ">IHH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-
-# Directorio por key: donde estan sus bytes (offset, largo)
 KEY_DIR_FORMAT = ">HH"
 KEY_DIR_SIZE = struct.calcsize(KEY_DIR_FORMAT)
-
-# int   child_page_id: puntero a una pagina hija, que puede ser otro
-# nodo interno o una hoja (esta clase no distingue cual)
 CHILD_FORMAT = ">I"
 CHILD_SIZE = struct.calcsize(CHILD_FORMAT)
-
-# tamaño de la entrada (key + su hijo) mas grande posible
 MAX_ENTRY_SIZE = KEY_DIR_SIZE + CHILD_SIZE + MAX_KEY_SIZE
-
-# cuantas keys entran en un nodo en el PEOR caso (todas al tope de
-# MAX_KEY_SIZE) -- solo informativo, ver mismo comentario en
-# b_tree_leaf_page.py
 MAX_KEYS = (PAGE_SIZE - HEADER_SIZE - CHILD_SIZE) // MAX_ENTRY_SIZE
-
-# umbral de ocupacion (en bytes) por debajo del cual un nodo esta en
-# underflow -- mismo razonamiento del 25% que en la hoja
 CAPACITY_BYTES = PAGE_SIZE - HEADER_SIZE - CHILD_SIZE
 MIN_USED_BYTES = CAPACITY_BYTES // 4
-
 
 class BTreeInternalPage:
 
@@ -65,9 +32,6 @@ class BTreeInternalPage:
     def load_header(self):
         self.page_id, self.n_keys, self.free_space_high = struct.unpack_from(HEADER_FORMAT, self.data, 0)
 
-    # El directorio de keys ocupa n_keys slots justo despues del
-    # header, y los hijos (n_keys+1) ocupan slots fijos despues del
-    # directorio -- por eso su offset depende de n_keys.
     def _key_dir_offset(self, index: int) -> int:
         return HEADER_SIZE + index * KEY_DIR_SIZE
 
@@ -85,8 +49,6 @@ class BTreeInternalPage:
         return struct.unpack_from(CHILD_FORMAT, self.data, self._child_offset(index))[0]
 
     def _write_child(self, index: int, child_page_id: int):
-        # los hijos son de tamaño fijo: sobreescribir en el lugar no
-        # afecta a nadie mas, no hace falta reescribir toda la pagina
         struct.pack_into(CHILD_FORMAT, self.data, self._child_offset(index), child_page_id)
 
     def _all_keys(self) -> list:
@@ -103,10 +65,6 @@ class BTreeInternalPage:
         free = self.free_space_high - (self._children_base() + (self.n_keys + 1) * CHILD_SIZE)
         return free >= needed
 
-    # Reescribe la pagina entera a partir de una lista de keys (ya
-    # ordenada, N elementos) y una lista de hijos (N+1 elementos).
-    # Igual que en la hoja, toda mutacion pasa por aca porque el
-    # tamaño de cada key varia.
     def _rewrite(self, keys: list, children: list):
         assert len(children) == len(keys) + 1
 
@@ -119,8 +77,6 @@ class BTreeInternalPage:
 
         for index, (offset, encoded) in enumerate(encoded_keys):
             self.data[offset:offset + len(encoded)] = encoded
-            # _key_dir_offset(index) no depende de n_keys, asi que es
-            # valido escribir el directorio antes de actualizarlo abajo
             struct.pack_into(KEY_DIR_FORMAT, self.data, self._key_dir_offset(index), offset, len(encoded))
 
         self.n_keys = len(keys)
@@ -132,27 +88,12 @@ class BTreeInternalPage:
         self.free_space_high = cursor
         self.save_header()
 
-    # sobreescribe la key en index sin tocar los hijos -- usado por
-    # b_tree_base.py para actualizar la clave separadora en el padre
-    # despues de un borrow, sin necesidad de saber que hijo va con
-    # cada uno
     def _write_key(self, index: int, key):
         keys = self._all_keys()
         children = self._all_children()
         keys[index] = key
         self._rewrite(keys, children)
 
-    # Tiene que desempatar IGUAL que find_child_index (contar cuantas
-    # claves existentes son <= key, no las que son < key): insert_key()
-    # usa esto para decidir donde meter un separador nuevo, y ese
-    # separador tiene que quedar coherente con como find_child_index
-    # despues lo va a usar para bajar. Con desempate al reves (como
-    # estaba antes, lower_bound en vez de upper_bound), cada separador
-    # nuevo con una clave ya repetida se insertaba ANTES de los
-    # existentes en vez de despues -- con muchos splits seguidos de la
-    # misma clave, eso deja los children en orden invertido/corrupto
-    # (confirmado insertando 3000 duplicados: quedaban como
-    # [0, 31, 30, ..., 3, 1, 32] en vez de ordenados).
     def _find_key_index(self, key) -> int:
         lo, hi = 0, self.n_keys
         while lo < hi:
@@ -163,14 +104,6 @@ class BTreeInternalPage:
                 lo = mid + 1
         return lo
 
-    # Retorna el indice del hijo por el que hay que bajar para buscar
-    # key: primer indice cuya clave es estrictamente mayor a key (o
-    # n_keys si key es mayor o igual a todas). Con esto se cumple la
-    # invariante: child[0] cubre < key[0], child[i] cubre
-    # [key[i-1], key[i]) para 0 < i < n_keys, y child[n_keys] cubre
-    # >= key[n_keys-1]. Separado de find_child() porque
-    # b_tree_base.py necesita el indice (no solo el page_id) para
-    # saber que hermanos son adyacentes durante el rebalanceo.
     def find_child_index(self, key) -> int:
         lo, hi = 0, self.n_keys
         while lo < hi:
@@ -184,18 +117,6 @@ class BTreeInternalPage:
     def find_child(self, key) -> int:
         return self._read_child(self.find_child_index(key))
 
-    # Variante de find_child_index para operaciones que necesitan la
-    # PRIMERA hoja donde podria empezar a aparecer key, no la hoja donde
-    # insert() la colocaria. Con muchos duplicados exactos, varios
-    # splits seguidos empujan la MISMA clave como separador varias veces
-    # (ej. separadores [7,7,7]); find_child_index (desempate a la
-    # derecha, necesario para que insert()/split() sean consistentes)
-    # atraviesa TODOS esos separadores iguales y aterriza en el ultimo
-    # hijo del grupo -- el mas nuevo, no el primero. find_leftmost_child
-    # desempata a la izquierda en su lugar, aterrizando en el primer
-    # hijo cuyo subarbol puede contener key, para que un
-    # descenso-y-scan-hacia-adelante (search()/range_search()) no se
-    # pierda las hojas anteriores del grupo.
     def find_leftmost_child_index(self, key) -> int:
         lo, hi = 0, self.n_keys
         while lo < hi:
@@ -223,10 +144,6 @@ class BTreeInternalPage:
         self._rewrite(keys, children)
         return True
 
-    # Inicializa esta pagina (recien creada y todavia vacia) como una
-    # raiz nueva con una sola clave y sus dos hijos. Único caso en que
-    # un nodo interno arranca con contenido sin pasar por insert_key
-    # (que siempre asume que ya hay un hijo a la izquierda).
     def init_as_root(self, left_child_page_id: int, key, right_child_page_id: int):
         self._rewrite([key], [left_child_page_id, right_child_page_id])
 
@@ -244,20 +161,14 @@ class BTreeInternalPage:
 
         return pushed_up_key, new_page
 
-    # true si quedo por debajo del minimo despues de sacarle una clave
     def is_underflow(self) -> bool:
         return self.used_bytes() < MIN_USED_BYTES
 
-    # true si tiene de sobra como para prestarle una clave a un
-    # hermano sin quedar el mismo en underflow (peor caso, igual
-    # criterio que en la hoja)
     def can_lend(self) -> bool:
         if self.n_keys <= 1:
             return False
         return self.used_bytes() - MAX_ENTRY_SIZE >= MIN_USED_BYTES
 
-    # quita keys[index] y children[index+1] (el par que queda huerfano
-    # tras una fusion), desplazando el resto del arreglo
     def delete_key_at(self, index: int):
         keys = self._all_keys()
         children = self._all_children()
@@ -265,9 +176,6 @@ class BTreeInternalPage:
         del children[index + 1]
         self._rewrite(keys, children)
 
-    # pide prestada la ULTIMA clave+hijo del hermano izquierdo. La
-    # clave separadora del padre baja como primera clave aca, y la
-    # ultima clave del hermano sube a ser la nueva separadora
     def borrow_from_left(self, left_sibling: "BTreeInternalPage", separator_key) :
         left_keys = left_sibling._all_keys()
         left_children = left_sibling._all_children()
@@ -283,9 +191,6 @@ class BTreeInternalPage:
 
         return borrowed_key
 
-    # pide prestada la PRIMERA clave+hijo del hermano derecho. La
-    # separadora del padre baja como ultima clave aca, y la primera
-    # clave del hermano sube a ser la nueva separadora
     def borrow_from_right(self, right_sibling: "BTreeInternalPage", separator_key):
         borrowed_key = right_sibling._read_key(0)
         borrowed_child = right_sibling._read_child(0)
@@ -300,10 +205,6 @@ class BTreeInternalPage:
 
         return borrowed_key
 
-    # fusiona el hermano derecho entero dentro de este nodo, bajando
-    # en el medio la clave separadora del padre (a diferencia de la
-    # hoja, acá SI hace falta esa clave porque los nodos internos no
-    # guardan directamente ningun dato, solo separadores)
     def merge_with_right(self, right_sibling: "BTreeInternalPage", separator_key):
         keys = self._all_keys() + [separator_key] + right_sibling._all_keys()
         children = self._all_children() + right_sibling._all_children()

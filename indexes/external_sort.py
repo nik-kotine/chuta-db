@@ -1,14 +1,3 @@
-"""
-External Sorting (k-way merge) para el ORDER BY.
-
-Tiene dos "fases" separadas;
-    - Leer la entrada en bloques que SI caben en memoria, ordenar cada bloque y
-    escribirlo como un archivo temporario (run).
-    - Conservar un min-heap con la cabeza de cada run y extraer el menor de
-    todos repetidamente. La cantidad de runs que se mezclan a la vez es el "k"
-    del k-way merge.
-"""
-
 import heapq
 import os
 import struct
@@ -60,9 +49,6 @@ def _decode_float(data: bytes) -> float:
 
 
 def encode_key(key) -> bytes:
-    """
-    Codifica una clave a bytes preservando el orden de los valores.
-    """
     if isinstance(key, bool):
         return _TAG_BOOL + (b"\x01" if key else b"\x00")
     if isinstance(key, int):
@@ -78,9 +64,6 @@ def encode_key(key) -> bytes:
 
 
 def decode_key(data: bytes):
-    """
-    Devuelve el valor original de una clave codificada con encode_key().
-    """
     tag, payload = data[:1], data[1:]
     if tag == _TAG_INT:
         return _decode_int(payload)
@@ -94,13 +77,6 @@ def decode_key(data: bytes):
 
 
 class _ReverseKey:
-    """
-    Envuelve una clave invirtiendo su comparacion.
-    Permite que el min-heap del merge entregue la clave MAYOR primero:
-    con reverse=True los runs se escriben descendentes y el heap los
-    mezcla como si todos compararan al reves.
-    """
-
     __slots__ = ("value",)
 
     def __init__(self, value):
@@ -111,14 +87,6 @@ class _ReverseKey:
 
 
 class ExternalSorter:
-    """
-    ORDEN BY con External Sorting (k-way merge).
-    Entrada: un iterable de pares (clave, value_bytes). Salida: un
-    iterador con los pares ya ordenados por clave. Solo se retiene en
-    memoria hasta `budget` items a la vez durante la generacion de runs
-    y, durante el merge, un item por run (la cabeza del heap).
-    """
-
     def __init__(self, budget: int = DEFAULT_BUDGET, reverse: bool = False,
                  run_dir: str = None):
         if budget < 1:
@@ -221,14 +189,6 @@ class ExternalSorter:
 
 
     def sort(self, items):
-        """
-        Ordena un iterable de (clave, value_bytes) y rinde los pares
-        ya ordenados, sin materializar el input completo.
-
-        Si todo el input entra en `budget` items, el resultado sale de
-        un solo sort en memoria (camino rapido, sin tocar disco). Si no,
-        se generan runs a disco y se mezclan con el k-way merge.
-        """
         run_paths = []
         buffer = []
         try:
@@ -254,8 +214,6 @@ class ExternalSorter:
             self._drop_runs()
 
     def cleanup(self):
-        """Cierra streams y borra los runs a disco. Idempotente: se
-        puede llamar desde el executor ademas del finally de sort()."""
         self._drop_runs()
 
     def _drop_runs(self, run_paths=None):

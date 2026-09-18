@@ -36,19 +36,16 @@ class IndexManager:
         """
         index_filename = f"{index_name}.idx"
 
-        # Instanciar el árbol B+ Unclustered enlazado al HeapFile de la tabla
         index = BPlusTreeUnclustered(
             index_filename=index_filename,
             heap_file=table.data_file,
             schema=table.schema
         )
     
-        # Poblar el índice con los registros existentes en la tabla
         for rid, record_params in table.scan():
             key = record_params[column_index]
             index._insert_ref(key, rid)
 
-        # Registrar en el catálogo
         self.catalog.register_index(
             index_name=index_name,
             table_name=table.name,

@@ -1,12 +1,8 @@
 class IntegrityError(Exception):
-    """Excepción lanzada cuando se viola una restricción de integridad."""
     pass
 
 
 class ConstraintsManager:
-    """
-    Gestiona y valida restricciones avanzadas: PRIMARY KEY, NOT NULL, UNIQUE y CHECK.
-    """
     def __init__(
         self, 
         table, 
@@ -23,19 +19,11 @@ class ConstraintsManager:
         self.check_constraints = check_constraints or []
 
     def validate_insert(self, values: list):
-        """
-        Valida todas las reglas de restricciones antes de permitir la inserción.
-        Lanza IntegrityError si se infringe alguna política.
-        """
-        # Validar la longitud del esquema
         if len(values) != len(self.table.schema):
             raise ValueError(
                 f"La tabla '{self.table.name}' espera {len(self.table.schema)} valores, recibió {len(values)}"
             )
 
-        # Primary Key: Implica NOT NULL estricto y UNICIDAD global.
-        # Las tablas del sistema (sys_columns, sys_indexes) tienen clave
-        # compuesta, que este manager no modela, asi que se les desactiva.
         if self.check_primary_key:
             pk_value = values[self.primary_key_index]
             if pk_value is None:
@@ -49,25 +37,21 @@ class ConstraintsManager:
                     f"Violación de clave primaria: Ya existe un registro con la llave '{pk_value}' en '{self.table.name}'."
                 )
 
-        # Restricciones NOT NULL en columnas configuradas
         for col_idx in self.not_null_columns:
             if values[col_idx] is None:
                 raise IntegrityError(
                     f"Violación NOT NULL: La columna en el índice {col_idx} es obligatoria y no puede ser nula."
                 )
 
-        # Restricciones UNIQUE en columnas adicionales
         for col_idx in self.unique_columns:
             val = values[col_idx]
             if val is not None:
-                # Escaneamos los registros vivos para comprobar unicidad
                 for _, existing_params in self.table.scan():
                     if existing_params[col_idx] == val:
                         raise IntegrityError(
                             f"Violación UNIQUE: El valor '{val}' ya está registrado en la columna {col_idx}."
                         )
 
-        # Restricciones CHECK 
         for check_fn in self.check_constraints:
             if not check_fn(values):
                 raise IntegrityError(

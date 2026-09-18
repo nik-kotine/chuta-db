@@ -7,21 +7,16 @@ SYS_TABLES_NAME = "sys_tables"
 SYS_COLUMNS_NAME = "sys_columns"
 SYS_INDEXES_NAME = "sys_indexes"
 
-# Esquemas de las tablas del sistema
-SYS_TABLES_SCHEMA = ["varchar(64)", "varchar(20)", "integer"]  # (table_name, file_type, key_index)
-SYS_COLUMNS_SCHEMA = ["varchar(64)", "varchar(64)", "varchar(64)", "integer"]  # (table_name, column_name, data_type, column_order)
-# (index_name, table_name, column_name, column_index, index_type)
+SYS_TABLES_SCHEMA = ["varchar(64)", "varchar(20)", "integer"]
+SYS_COLUMNS_SCHEMA = ["varchar(64)", "varchar(64)", "varchar(64)", "integer"]
 SYS_INDEXES_SCHEMA = ["varchar(64)", "varchar(64)", "varchar(64)", "integer", "varchar(20)"]
 
-# Nombres de columna de las propias tablas del sistema
 SYS_TABLES_COLUMNS = ["table_name", "file_type", "key_index"]
 SYS_COLUMNS_COLUMNS = ["table_name", "column_name", "data_type", "column_order"]
 SYS_INDEXES_COLUMNS = ["index_name", "table_name", "column_name", "column_index", "index_type"]
+
 class SchemaCatalog:
-    """
-    Catálogo del sistema que gestiona la metadata de la base de datos
-    utilizando tablas físicas de tipo HeapFile (sys_tables y sys_columns).
-    """
+
     def __init__(
         self, 
         page_size: int = 4096, 
@@ -32,34 +27,27 @@ class SchemaCatalog:
         self.header_size = header_size
         self.buffer_frames = buffer_frames
 
-        # Instanciamos directamente las tablas del sistema
         self.sys_tables = self._init_sys_table(SYS_TABLES_NAME, SYS_TABLES_SCHEMA, SYS_TABLES_COLUMNS)
         self.sys_columns = self._init_sys_table(SYS_COLUMNS_NAME, SYS_COLUMNS_SCHEMA, SYS_COLUMNS_COLUMNS)
         self.sys_indexes = self._init_sys_table(SYS_INDEXES_NAME, SYS_INDEXES_SCHEMA, SYS_INDEXES_COLUMNS)
 
-        # Auto-registro inicial si el catálogo es nuevo
         self._bootstrap_if_needed()
 
     def _init_sys_table(self, name: str, schema: list[str], column_names: list[str]) -> Table:
         filename = f"{name}.dat"
         fm = FileManager(filename, self.page_size, self.header_size)
         bm = BufferManager(fm, self.buffer_frames)
-        # check_primary_key=False: sys_columns y sys_indexes tienen clave
-        # compuesta (table_name + column_order), que ConstraintsManager no
-        # modela. Con la PK simple activada, la segunda columna de cualquier
-        # tabla se rechazaria por "clave duplicada".
+
         return Table(name, schema, bm, file_type="heap",
                      column_names=column_names, check_primary_key=False,
                      file_manager=fm)
 
     def _clean_str(self, val) -> str:
-        """Limpia caracteres nulos y espacios de relleno en cadenas fixed/padded."""
         if isinstance(val, str):
             return val.rstrip("\x00").strip()
         return str(val)
 
     def _bootstrap_if_needed(self):
-        """Registra las propias tablas del sistema en el catálogo si es la primera vez."""
         if self.get_table_info(SYS_TABLES_NAME) is None:
             self.register_table(SYS_TABLES_NAME, SYS_TABLES_SCHEMA, "heap", 0, SYS_TABLES_COLUMNS)
             self.register_table(SYS_COLUMNS_NAME, SYS_COLUMNS_SCHEMA, "heap", 0, SYS_COLUMNS_COLUMNS)
@@ -67,24 +55,19 @@ class SchemaCatalog:
 
     def register_table(self, name: str, schema: list[str], file_type: str, key_index: int,
                        column_names: list[str] = None):
-        """Registra la metadata de una nueva tabla en sys_tables y sys_columns."""
         if self.get_table_info(name) is not None:
             raise ValueError(f"La tabla '{name}' ya existe en el catálogo.")
 
-        # Insertar en sys_tables
         self.sys_tables.insert([name, file_type.lower(), key_index])
 
-        # Insertar cada columna en sys_columns
         if column_names is None:
             column_names = [f"col{i}" for i in range(len(schema))]
         for idx, col_type in enumerate(schema):
             self.sys_columns.insert([name, column_names[idx], col_type, idx])
 
     def get_table_info(self, name: str) -> dict | None:
-        """Busca y reconstruye la metadata de una tabla desde sys_tables y sys_columns."""
         target_table = None
 
-        # Escanear sys_tables
         for _, params in self.sys_tables.scan():
             tbl_name = self._clean_str(params[0])
             if tbl_name == name:
@@ -100,7 +83,6 @@ class SchemaCatalog:
         if target_table is None:
             return None
 
-        # Escanear sys_columns para recuperar el esquema ordenado
         columns = []
         for _, params in self.sys_columns.scan():
             tbl_name = self._clean_str(params[0])
@@ -121,12 +103,10 @@ class SchemaCatalog:
         if name in (SYS_TABLES_NAME, SYS_COLUMNS_NAME):
             raise ValueError("No se pueden eliminar las tablas del catálogo del sistema.")
 
-        # Eliminar de sys_tables
         for rid, params in list(self.sys_tables.scan()):
             if self._clean_str(params[0]) == name:
                 self.sys_tables.delete(rid)
 
-        # Eliminar de sys_columns
         for rid, params in list(self.sys_columns.scan()):
             if self._clean_str(params[0]) == name:
                 self.sys_columns.delete(rid)

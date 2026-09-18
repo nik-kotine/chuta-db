@@ -16,10 +16,6 @@ class StorageManager:
         self,
         page_size: int = 4096,
         buffer_frames: int = 10,
-        # un mismo header_size se usa para el archivo de CUALQUIER tabla
-        # (heap o sequential) -- HeapFile es indiferente al valor exacto,
-        # asi que tiene que alcanzar para lo que SI le importa el
-        # contenido: el header real de SequentialFile.
         header_size: int = FILE_HEADER_SIZE
     ):
         self.page_size = page_size

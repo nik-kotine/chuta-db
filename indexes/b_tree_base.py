@@ -5,14 +5,11 @@ from indexes.b_tree_internal_page import BTreeInternalPage
 from storage.file_manager import FileManager
 from storage.buffer_manager import BufferManager
 
-# Header del archivo de índice, guarda dónde está la raíz y su altura
-ROOT_HEADER_FORMAT = ">I?B"  # root_page_id, root_is_leaf, height
+ROOT_HEADER_FORMAT = ">I?B"
 ROOT_HEADER_SIZE = struct.calcsize(ROOT_HEADER_FORMAT)
 
 
 class BPlusTreeBase:
-    # Lógica común del árbol (búsqueda, inserción, borrado). No sabe
-    # de HeapFile ni SequentialFile, eso lo llenan las subclases.
 
     def __init__(self, index_filename: str, buffer_frames: int = 50):
 
@@ -27,15 +24,7 @@ class BPlusTreeBase:
         else:
             self._load_root_header()
 
-    # crea (o recrea) un indice vacio: la pagina 0 es la hoja vacia
-    # que arranca como raiz (el header de la raiz vive aparte, en el
-    # header del archivo). Separado de __init__ para que _reindex() en
-    # las subclases lo pueda reusar cuando haga falta reconstruir el
-    # indice desde cero (por ejemplo, si SequentialFile.reorganize()
-    # invalido los RID guardados)
     def _init_empty_index(self):
-        # el archivo subyacente se reescribe entero -- cualquier pagina
-        # que el buffer pool tuviera cacheada de antes queda invalida
         self.buffer_manager.invalidate_all(self.file_manager)
         self.file_manager.truncate(self.file_manager.file_header_size)
 
@@ -46,9 +35,7 @@ class BPlusTreeBase:
         self.root_page_id = root_page_id
         self.root_is_leaf = True
         self.height = 0
-        self._save_root_header()  # sin esto el header se queda en ceros
-
-    # -------- header del archivo: persistencia de la raiz ---------
+        self._save_root_header()
 
     def _load_root_header(self):
         header = self.file_manager.read_header()
@@ -57,12 +44,6 @@ class BPlusTreeBase:
     def _save_root_header(self):
         header = struct.pack(ROOT_HEADER_FORMAT, self.root_page_id, self.root_is_leaf, self.height)
         self.file_manager.write_header(header)
-
-    # ---------- I/O de paginas del arbol (hoja o nodo interno) ----------
-    # cada load/save es autocontenido (pin+unpin en el mismo metodo, sin
-    # quedarse con una pagina "prestada" del pool) para no arriesgar
-    # pin leaks cuando una operacion sostiene varias paginas a la vez
-    # (el camino descendido, hermanos durante rebalanceo, etc).
 
     def _load_leaf(self, page_id: int) -> BTreeLeafPage:
         data = self.buffer_manager.fetch_page(page_id, self.file_manager)
@@ -83,10 +64,6 @@ class BPlusTreeBase:
     def _allocate_page_id(self) -> int:
         return self.file_manager.allocate_page()
 
-    # ---------- hooks de almacenamiento ----------
-    # Implementación en subclases clusterd y unclustered, acá es donde se tiene
-    # contacto con el almacenamiento real
-
     def _store_record(self, params):
         raise NotImplementedError
 
@@ -96,11 +73,7 @@ class BPlusTreeBase:
     def _delete_record(self, key, ref) -> bool:
         raise NotImplementedError
 
-    # ---------- API publica del arbol ----------
-
     def search(self, key):
-        # baja "height" niveles por nodos internos, al llegar a
-        # depth == 0, la página siguiente es siempre una hoja
         page_id = self.root_page_id
         depth = self.height
         while depth > 0:
@@ -112,17 +85,10 @@ class BPlusTreeBase:
         return leaf.find(key)
 
     def insert(self, key, params):
-        # se persiste el dato real primero, para tener el ref listo
         ref = self._store_record(params)
         return self._insert_ref(key, ref)
 
-    # hace todo lo de insert() menos persistir el dato real -- separado
-    # para que las subclases puedan reindexar un ref que ya existe
-    # (por ejemplo, si hay que reconstruir el indice entero porque
-    # SequentialFile.reorganize() invalido los RID de todos)
     def _insert_ref(self, key, ref):
-        # mismo descenso que search(), guardando el camino recorrido
-        # para poder propagar un split hacia arriba si hace falta
         path = []
         page_id = self.root_page_id
         depth = self.height
@@ -138,8 +104,6 @@ class BPlusTreeBase:
             self._save_page(leaf)
             return ref
 
-        # la hoja esta llena: la dividimos y recien ahi insertamos,
-        # en la mitad que le corresponda segun split_key
         new_leaf_id = self._allocate_page_id()
         split_key, new_leaf = leaf.split(new_leaf_id)
 
@@ -155,12 +119,7 @@ class BPlusTreeBase:
         return ref
 
     def _propagate_split(self, path, split_key, right_page_id):
-        # empuja la clave mediana hacia el padre, dividiendo en
-        # cascada si también se llena, hasta llegar a la raíz
         if not path:
-            # la cascada llego hasta la raiz actual, creamos una raiz
-            # nueva con exactamente dos hijos (la raiz vieja y la
-            # mitad que acaba de salir de su split) 
             new_root_id = self._allocate_page_id()
             new_root = BTreeInternalPage(new_root_id)
             new_root.init_as_root(self.root_page_id, split_key, right_page_id)
@@ -172,13 +131,11 @@ class BPlusTreeBase:
             self._save_root_header()
             return
 
-        parent = path.pop()  # el padre mas cercano a la hoja primero
+        parent = path.pop()
         if parent.insert_key(split_key, right_page_id):
             self._save_page(parent)
             return
 
-        # el padre también está lleno, lo dividimos y seguimos
-        # propagando la clave que empuja hacia arriba un nivel mas
         new_parent_id = self._allocate_page_id()
         pushed_up_key, new_parent = parent.split(new_parent_id)
 
@@ -193,9 +150,6 @@ class BPlusTreeBase:
         self._propagate_split(path, pushed_up_key, new_parent_id)
 
     def delete(self, key) -> bool:
-        # mismo descenso que search(), pero guardando (padre,
-        # indice_del_hijo) en cada nivel -- hace falta para saber
-        # cuales son los hermanos adyacentes si hay que rebalancear
         path = []
         page_id = self.root_page_id
         depth = self.height
@@ -215,8 +169,6 @@ class BPlusTreeBase:
         self._delete_record(key, ref)
 
         if not path or not leaf.is_underflow():
-            # si la hoja ES la raiz no hay con quien rebalancear, y
-            # si no quedo en underflow no hace falta nada mas
             self._save_page(leaf)
             return True
 
@@ -225,8 +177,6 @@ class BPlusTreeBase:
         return True
 
     def _rebalance_leaf(self, leaf, path):
-        # redistribuye o fusiona una hoja en underflow con un hermano
-        # adyacente (mismo padre). path[-1] es (padre, indice_de_leaf)
         parent, child_index = path[-1]
 
         if child_index > 0:
@@ -249,7 +199,6 @@ class BPlusTreeBase:
                 self._save_page(parent)
                 return
 
-        # ningun hermano tiene de sobra: hay que fusionar
         if child_index > 0:
             left_sibling = self._load_leaf(parent._read_child(child_index - 1))
             left_sibling.merge_with_right(leaf)
@@ -267,12 +216,7 @@ class BPlusTreeBase:
             self._rebalance_internal(parent, path[:-1])
 
     def _rebalance_internal(self, node, path):
-        # mismo problema que _rebalance_leaf pero un nivel arriba,
-        # con la diferencia de que ademas hay que mover la clave
-        # separadora del padre (no solo el hijo) en cada operacion
         if not path:
-            # node es la raiz: si se quedo sin claves, su unico hijo
-            # pasa a ser la raiz nueva y el arbol pierde un nivel
             if node.n_keys == 0:
                 self.root_is_leaf = (self.height == 1)
                 self.root_page_id = node._read_child(0)
@@ -325,11 +269,6 @@ class BPlusTreeBase:
             self._rebalance_internal(parent, path[:-1])
 
     def range_search(self, start_key, end_key):
-        # un solo descenso hasta la hoja donde arrancaría start_key.
-        # find_leftmost_child (no find_child) porque si start_key tiene
-        # muchos duplicados repartidos en mas de una hoja, find_child
-        # aterrizaria en la ULTIMA (desempata a la derecha, pensado para
-        # insert()) y el scan hacia adelante se perderia las anteriores.
         page_id = self.root_page_id
         depth = self.height
         while depth > 0:
@@ -340,7 +279,6 @@ class BPlusTreeBase:
         leaf = self._load_leaf(page_id)
         results = []
 
-        # de ahí en más solo se sigue next_leaf_id, sin volver a subir
         while leaf is not None:
             for i in range(leaf.n_entries):
                 entry_key, ref = leaf._read_entry(i)

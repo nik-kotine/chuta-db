@@ -26,9 +26,6 @@ class Table:
     ):
         self.name = name
         self.schema = schema
-        # Nombres de las columnas, en el mismo orden que schema. Son
-        # opcionales: si no se pasan se generan col0, col1, ... para no
-        # romper a quien construya la tabla solo con tipos.
         if column_names is None:
             column_names = [f"col{i}" for i in range(len(schema))]
         if len(column_names) != len(schema):
@@ -37,8 +34,6 @@ class Table:
             )
         self.column_names = column_names
         self.buffer_manager = buffer_manager
-        # El buffer pool es global (singleton), asi que la tabla guarda
-        # aparte el FileManager de SU archivo para identificar sus paginas.
         self.file_manager = file_manager or getattr(buffer_manager, "active_file", None)
         if self.file_manager is None:
             raise ValueError(f"La tabla '{name}' necesita un FileManager para operar")
@@ -54,10 +49,8 @@ class Table:
             check_primary_key=check_primary_key
         )
 
-        # Referencia al índice primario agrupado (si existe)
         self.clustered_index = None
 
-        # Diccionario para índices secundarios: {column_index: [lista_de_indices_unclustered]}
         self.secondary_indexes: dict[int, list] = {}
 
         if self.file_type == "heap":
@@ -107,14 +100,12 @@ class Table:
 
         self.constraints_manager.validate_insert(values)
 
-        # Inserción guiada por el Árbol B+ Clustered o directa en el archivo físico
         if self.clustered_index:
             key = values[self.key_index]
             rid = self.clustered_index.insert(key, values)
         else:
             rid = self.data_file.insert(values)
 
-        # Actualización automática de índices secundarios (Unclustered)
         if rid is not None:
             for col_idx, indexes in self.secondary_indexes.items():
                 key = values[col_idx]
@@ -139,7 +130,6 @@ class Table:
 
         ok = self.data_file.delete(rid)
 
-        # Remover referencias de los índices secundarios
         if ok:
             for col_idx, indexes in self.secondary_indexes.items():
                 key = record_values[col_idx]

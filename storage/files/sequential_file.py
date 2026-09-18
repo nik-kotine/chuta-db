@@ -12,26 +12,13 @@ from storage.record_file import RecordFile
 
 SLOT_ID_BITS = 16
 
-# n_pages, first_rid, n_records, n_deleted, n_overflow_pages, n_overflow_records
 FILE_HEADER_FORMAT = ">iiiiii"
 FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT)
 
 WASTED_RATIO = 0.3
 
-# Umbral de la cadena de overflow relativo al tamaño del archivo (no una
-# cantidad fija de paginas): mismo principio que WASTED_RATIO pero para
-# inserts. Con un umbral fijo en paginas, el reorganize dispara cada K
-# inserts SIEMPRE sin importar N -> O(N^2) total (K reorganizes de costo
-# O(N) cada uno). Con un umbral en %, el archivo necesita cada vez MAS
-# inserts nuevos para volver a cruzarlo a medida que crece (como el
-# growth factor de un array dinamico) -> O(N) amortizado.
 OVERFLOW_RATIO = 0.3
 
-# con N chico, un solo insert a overflow ya cruza el % (ej. n_records=2,
-# 1 en overflow -> 50%) y reorganizaria en cada insert -- mismo problema
-# que un array dinamico sin capacidad inicial minima. No cambia la
-# complejidad asintotica (esa la da el % arriba), solo evita el
-# desperdicio en archivos chicos.
 MIN_RECORDS_FOR_OVERFLOW_CHECK = 20
 
 class SequentialFile(RecordFile):
@@ -49,7 +36,6 @@ class SequentialFile(RecordFile):
         self.page_size = page_size
         self.key_index = 0
 
-        # Determinación precisa de tipos de longitud variable
         self.variable_length = any(return_format(t)[1] == -1 for t in record_format)
 
         if self.variable_length:
@@ -64,10 +50,6 @@ class SequentialFile(RecordFile):
         self.n_records = 0
         self.n_deleted = 0
         self.reorganize_count = 0
-        # cuantas paginas fisicas componen la cadena de overflow ahora
-        # mismo (siempre >= 1: la pagina 0 es la primera) y cuantos
-        # inserts fueron a parar ahi desde el ultimo reorganize -- ver
-        # OVERFLOW_RATIO arriba.
         self.n_overflow_pages = 1
         self.n_overflow_records = 0
 
@@ -123,7 +105,6 @@ class SequentialFile(RecordFile):
         return self.page_class(page_ba, self.page_size, self.serializer)
 
     def _get_record(self, rid: RID) -> Record | None:
-        # Guarda de seguridad contra RIDs nulos o inválidos
         if rid is None or rid == (-1, -1) or getattr(rid, "page_id", -1) == -1:
             return None
 
@@ -272,14 +253,6 @@ class SequentialFile(RecordFile):
         if self.first_rid is None:
             return None, None
 
-        # _main_neighbors ya da el par mas ajustado considerando SOLO
-        # paginas principales (binary search + scan de una sola pagina,
-        # barato). Cualquier registro de overflow mas cercano a key que
-        # ese par tiene que estar, en la cadena logica (next_rid), en
-        # algun punto ENTRE main_prev_rid y main_next_rid -- caminamos
-        # solo ese tramo en vez de escanear el overflow completo, que es
-        # lo que hacia _overflow_neighbors (y por que un archivo con
-        # mucho overflow acumulado volvia cada insert mas caro).
         main_prev_rid, main_prev_key, main_next_rid, main_next_key = (
             self._main_neighbors(key, duplicates_after=duplicates_after)
         )
@@ -307,9 +280,6 @@ class SequentialFile(RecordFile):
                 prev_rid, prev_key = current_rid, current_key
                 current_rid = record.next_rid
             else:
-                # nos pasamos de la clave: todo lo que sigue en la
-                # cadena es >= esto, asi que ya no puede haber un "next"
-                # mas ajustado -- cortamos
                 next_rid, next_key = current_rid, current_key
                 break
 
@@ -327,18 +297,9 @@ class SequentialFile(RecordFile):
         return phys_page_id
 
     def _overflow_page_ids(self) -> list[int]:
-        # pagina 0 siempre es la primera de la cadena; las que siguen
-        # (si las hay) fueron asignadas justo despues de las paginas
-        # principales actuales, en orden, la primera vez que hicieron
-        # falta (ver _insert_into_overflow)
         return [0] + list(range(self.n_pages + 1, self.n_pages + self.n_overflow_pages))
 
     def _insert_into_overflow(self, record: Record) -> RID:
-        # a diferencia de la version vieja, esto SIEMPRE encuentra
-        # lugar: si la pagina actual de la cadena esta llena, se agrega
-        # una pagina nueva a la cadena en vez de forzar un reorganize.
-        # El reorganize lo decide insert() aparte, por proporcion
-        # (OVERFLOW_RATIO), no por "se lleno la pagina fisica".
         total_slot_size = self.serializer.get_size_of(record.params) + RID_SIZE + DELETED_SIZE
         current_page_id = self._overflow_page_ids()[-1]
         page = self._load_page(current_page_id)
@@ -351,8 +312,6 @@ class SequentialFile(RecordFile):
                 if page.n_records == 0:
                     raise RuntimeError("record is too big for insertion")
 
-                # la pagina actual de la cadena esta llena: se agrega
-                # una nueva y se sigue ahi
                 self.buffer_manager.unpin_page(current_page_id, self.file_manager)
                 current_page_id = self.file_manager.allocate_page()
                 self.n_overflow_pages += 1
@@ -422,12 +381,6 @@ class SequentialFile(RecordFile):
 
         self.n_records += 1
 
-        # se reorganiza por PROPORCION de overflow sobre el archivo, no
-        # porque una pagina fisica se llene -- ver OVERFLOW_RATIO arriba.
-        # El registro que acabamos de insertar tambien se reubica en ese
-        # reorganize, asi que hay que rastrear su RID nuevo (ver
-        # reorganize(track_rid=...)) en vez de devolver el viejo, ya
-        # invalido.
         if (
             self.n_records >= MIN_RECORDS_FOR_OVERFLOW_CHECK
             and self.n_overflow_records / self.n_records >= OVERFLOW_RATIO
@@ -498,12 +451,6 @@ class SequentialFile(RecordFile):
                 deleted_any = True
 
         if deleted_any:
-            # solo interesan paginas PRINCIPALES vacias (1..n_pages) --
-            # antes "phys_page_id >= 1" alcanzaba porque el overflow era
-            # nada mas la pagina 0, pero ahora puede ocupar paginas con
-            # id > n_pages tambien, y esas NO cuentan como "se vacio una
-            # pagina principal" (vaciarse ahi es normal y no amerita
-            # reorganizar)
             page_emptied = any(
                 1 <= phys_page_id <= self.n_pages and self._first_live_in_page(phys_page_id) is None
                 for phys_page_id in pages_touched
@@ -521,12 +468,6 @@ class SequentialFile(RecordFile):
         return self.n_deleted / total_slots
 
     def reorganize(self, track_rid: RID | None = None) -> RID | None:
-        # track_rid: reorganize() reasigna el RID de TODOS los registros
-        # vivos, asi que un RID que devolvio insert() justo antes de
-        # disparar este reorganize quedaria apuntando a cualquier cosa.
-        # Si el llamador necesita saber donde termino un registro
-        # puntual (identificado por su RID actual, todavia valido en
-        # este momento), lo pasa acá y se lo devolvemos ya reubicado.
         self.reorganize_count += 1
         entries = [
             (old_rid, Record(record.params))
