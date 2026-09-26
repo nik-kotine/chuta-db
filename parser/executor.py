@@ -14,6 +14,7 @@ Resuelve las tres traducciones que faltaban:
 
 import sys
 import os
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parser"))
 
@@ -27,6 +28,7 @@ from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
 from indexes.extendible_hash import HashIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
+from storage.lock_manager import LockMode
 
 EXTERNAL_SORT_BUDGET = 1000
 EXTERNAL_HASH_BUCKETS = 16
@@ -84,12 +86,18 @@ class ExecuteVisitor(Visitor):
         self.sm = storage_manager
         self.resultado = None
         self.plan = []
+        self.transaction_id = None
+        self.session_id = self.sm.allocate_session_id()
 
     def ejecutar(self, programa) -> list:
         salidas = []
         for stmt in programa.slist:
             self.plan = []
-            stmt.accept(self)
+            try:
+                stmt.accept(self)
+            except Exception:
+                self._abort_active_transaction()
+                raise
             salidas.append(self.resultado)
         return salidas
 
@@ -117,19 +125,27 @@ class ExecuteVisitor(Visitor):
         )
 
     def visit_insert_stmt(self, stm):
-        tabla = self._abrir(stm.tabla)
-        valores = [self._valor(v) for v in stm.valores]
+        with self._table_locks([stm.tabla], LockMode.EXCLUSIVE):
+            tabla = self._abrir(stm.tabla)
+            valores = [self._valor(v) for v in stm.valores]
 
-        if len(valores) != len(tabla.schema):
-            raise ExecutionError(
-                f"La tabla '{stm.tabla}' espera {len(tabla.schema)} valores, "
-                f"se dieron {len(valores)}"
-            )
+            if len(valores) != len(tabla.schema):
+                raise ExecutionError(
+                    f"La tabla '{stm.tabla}' espera {len(tabla.schema)} valores, "
+                    f"se dieron {len(valores)}"
+                )
 
-        tabla.insert(valores)
+            tabla.insert(valores)
         self.resultado = Resultado("1 fila insertada")
 
     def visit_select_stmt(self, stm):
+        nombres_bloqueados = [stm.tabla]
+        if stm.join is not None:
+            nombres_bloqueados.append(stm.join.tabla)
+        with self._table_locks(nombres_bloqueados, LockMode.SHARED):
+            self._visit_select_locked(stm)
+
+    def _visit_select_locked(self, stm):
         tabla = self._abrir(stm.tabla)
         derecha = None
         self.plan = [{"node": "SELECT", "table": stm.tabla, "operation": "project"}]
@@ -193,14 +209,15 @@ class ExecuteVisitor(Visitor):
         self.resultado = Resultado(columnas=nombres, filas=filas, plan=self.plan)
 
     def visit_delete_stmt(self, stm):
-        tabla = self._abrir(stm.tabla)
-        resolver = self._resolver_columnas([(stm.tabla, tabla)])
+        with self._table_locks([stm.tabla], LockMode.EXCLUSIVE):
+            tabla = self._abrir(stm.tabla)
+            resolver = self._resolver_columnas([(stm.tabla, tabla)])
 
-        borrados = 0
-        for rid, registro in list(tabla.scan()):
-            if self._evaluar(stm.condicion, registro, resolver):
-                if tabla.delete(rid):
-                    borrados += 1
+            borrados = 0
+            for rid, registro in list(tabla.scan()):
+                if self._evaluar(stm.condicion, registro, resolver):
+                    if tabla.delete(rid):
+                        borrados += 1
         self.resultado = Resultado(f"{borrados} fila(s) eliminada(s)")
 
     def visit_create_index_stmt(self, stm):
@@ -252,9 +269,59 @@ class ExecuteVisitor(Visitor):
         )
 
     def visit_transaction_stmt(self, stm):
-        self.resultado = Resultado(
-            "BEGIN TRANSACTION" if stm.es_begin else "END TRANSACTION"
-        )
+        if stm.es_rollback:
+            if self.transaction_id is None:
+                raise ExecutionError("ROLLBACK requiere una transaccion activa")
+            transaction_id = self.transaction_id
+            self.sm.transaction_manager.rollback(transaction_id)
+            self.sm.lock_manager.release_all(transaction_id)
+            self.transaction_id = None
+            self.resultado = Resultado("ROLLBACK")
+            return
+
+        if stm.es_begin:
+            if self.transaction_id is not None:
+                raise ExecutionError("ya existe una transaccion activa")
+            transaction = self.sm.transaction_manager.begin()
+            self.transaction_id = transaction.transaction_id
+            self.resultado = Resultado("BEGIN TRANSACTION")
+            return
+
+        if self.transaction_id is None:
+            raise ExecutionError("END TRANSACTION requiere una transaccion activa")
+        transaction_id = self.transaction_id
+        self.sm.transaction_manager.commit(transaction_id)
+        self.sm.lock_manager.release_all(transaction_id)
+        self.transaction_id = None
+        self.resultado = Resultado("END TRANSACTION")
+
+    def _abort_active_transaction(self):
+        """Aborta y libera locks si una sentencia falla dentro de una tx."""
+        if self.transaction_id is None:
+            return
+        transaction_id = self.transaction_id
+        try:
+            self.sm.transaction_manager.abort(transaction_id)
+        finally:
+            self.sm.lock_manager.release_all(transaction_id)
+            self.transaction_id = None
+
+    @contextmanager
+    def _table_locks(self, table_names, mode):
+        """Adquiere locks en orden estable y libera solo en autocommit."""
+        transaction_id = self.transaction_id or self.session_id
+        explicit = self.transaction_id is not None
+        acquired = []
+        try:
+            for table_name in sorted(set(table_names)):
+                resource = ("table", table_name)
+                self.sm.lock_manager.acquire(resource, transaction_id, mode, timeout=5)
+                acquired.append(resource)
+            yield
+        finally:
+            if not explicit:
+                for resource in reversed(acquired):
+                    self.sm.lock_manager.release(resource, transaction_id)
 
     def _abrir(self, nombre):
         try:

@@ -49,6 +49,7 @@ class Token:
         # Transacciones
         BEGIN = auto()
         END_KW = auto()
+        ROLLBACK = auto()
         TRANSACTION = auto()
 
         # Condiciones
