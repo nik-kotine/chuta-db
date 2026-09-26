@@ -59,6 +59,8 @@ class TransactionManager:
 	def _load_log_state(self) -> None:
 		"""Reconstruye estados a partir de BEGIN/COMMIT/ABORT existentes."""
 		for record in self.log_manager.iter_records():
+			if record.record_type in (LogRecordType.CHECKPOINT, LogRecordType.CLR):
+				continue
 			self._next_transaction_id = max(
 				self._next_transaction_id, record.transaction_id + 1
 			)
@@ -213,5 +215,16 @@ class TransactionManager:
 	def close(self, undo_handler: UndoHandler | None = None) -> None:
 		"""Aborta transacciones activas y cierra el WAL de forma durable."""
 		for transaction in self.active_transactions():
-			self.rollback(transaction.transaction_id, undo_handler)
+			if undo_handler is None:
+				# El cierre del motor no puede dejar una transaccion abierta en el
+				# estado logico, aunque el undo fisico lo haga RecoveryManager.
+				self.log_manager.append(
+					LogRecordType.ABORT,
+					transaction.transaction_id,
+					prev_lsn=transaction.last_lsn,
+				)
+				transaction.status = TransactionStatus.ABORTED
+			else:
+				self.rollback(transaction.transaction_id, undo_handler)
+		self.log_manager.force()
 		self.log_manager.close()

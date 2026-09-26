@@ -17,7 +17,10 @@ import os
 import json
 from contextlib import contextmanager
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parser"))
+# Los modulos del parser usan imports absolutos y tambien se ejecutan como
+# paquete (`parser.executor`). En ambos casos, la carpeta de este archivo es
+# la que contiene `ast_sql.py`, `visitor.py` y el resto del front-end.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from itertools import islice
 from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, CompareCond,

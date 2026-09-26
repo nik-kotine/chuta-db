@@ -7,12 +7,10 @@ PYTHONPATH=. python3 tests/table/test_executor_avanzado.py  (o run_all_tests.py)
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "parser"))
-
-from scanner import Scanner
+from parser.scanner import Scanner
 from parser import Parser
 from storage.storage_manager import StorageManager
-from executor import ExecuteVisitor, ExecutionError
+from parser.executor import ExecuteVisitor, ExecutionError
 
 
 ARCHIVOS = [
