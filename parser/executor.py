@@ -14,6 +14,7 @@ Resuelve las tres traducciones que faltaban:
 
 import sys
 import os
+import json
 from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parser"))
@@ -135,7 +136,7 @@ class ExecuteVisitor(Visitor):
                     f"se dieron {len(valores)}"
                 )
 
-            tabla.insert(valores)
+            tabla.insert(valores, mutation_logger=self._mutation_logger())
         self.resultado = Resultado("1 fila insertada")
 
     def visit_select_stmt(self, stm):
@@ -216,7 +217,7 @@ class ExecuteVisitor(Visitor):
             borrados = 0
             for rid, registro in list(tabla.scan()):
                 if self._evaluar(stm.condicion, registro, resolver):
-                    if tabla.delete(rid):
+                    if tabla.delete(rid, mutation_logger=self._mutation_logger()):
                         borrados += 1
         self.resultado = Resultado(f"{borrados} fila(s) eliminada(s)")
 
@@ -273,7 +274,9 @@ class ExecuteVisitor(Visitor):
             if self.transaction_id is None:
                 raise ExecutionError("ROLLBACK requiere una transaccion activa")
             transaction_id = self.transaction_id
-            self.sm.transaction_manager.rollback(transaction_id)
+            self.sm.transaction_manager.rollback(
+                transaction_id, self._undo_record
+            )
             self.sm.lock_manager.release_all(transaction_id)
             self.transaction_id = None
             self.resultado = Resultado("ROLLBACK")
@@ -301,10 +304,54 @@ class ExecuteVisitor(Visitor):
             return
         transaction_id = self.transaction_id
         try:
-            self.sm.transaction_manager.abort(transaction_id)
+            self.sm.transaction_manager.abort(transaction_id, self._undo_record)
         finally:
             self.sm.lock_manager.release_all(transaction_id)
             self.transaction_id = None
+
+    def _mutation_logger(self):
+        """Devuelve el hook WAL solo para transacciones explicitas."""
+        if self.transaction_id is None:
+            return None
+
+        def log_mutation(operation, table, values, rid):
+            payload = json.dumps(
+                {
+                    "values": values,
+                    "key": values[table.key_index],
+                    "rid": list(rid) if rid is not None else None,
+                },
+                default=str,
+            ).encode("utf-8")
+            before = payload if operation == "delete" else b""
+            after = payload if operation == "insert" else b""
+            self.sm.transaction_manager.log_update(
+                self.transaction_id,
+                operation=f"table_{operation}",
+                file_name=table.name,
+                resource_type="table_record",
+                before=before,
+                after=after,
+            )
+            # El hook corre justo antes de la mutacion fisica.
+            self.sm.log_manager.force()
+
+        return log_mutation
+
+    def _undo_record(self, record):
+        """Aplica undo logico y deja que Table actualice sus indices."""
+        payload_bytes = record.before or record.after
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        table = self._abrir(record.file_name)
+
+        if record.operation == "table_insert":
+            table.delete_by_key(payload["key"])
+        elif record.operation == "table_delete":
+            table.insert(payload["values"])
+        else:
+            raise ExecutionError(
+                f"no existe undo fisico para la operacion '{record.operation}'"
+            )
 
     @contextmanager
     def _table_locks(self, table_names, mode):

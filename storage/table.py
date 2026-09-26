@@ -88,10 +88,14 @@ class Table:
         """Asigna el índice primario agrupado (BPlusTreeClustered) para esta tabla."""
         self.clustered_index = index_obj
 
-    def insert(self, values: list) -> RID:
+    def insert(self, values: list, mutation_logger=None) -> RID:
         """
         Inserta un registro. Si hay un índice Clustered, pasa a través de él;
         de lo contrario, inserta directo en el archivo de datos y actualiza los índices secundarios.
+
+        ``mutation_logger`` se llama despues de validar constraints y antes de
+        tocar el archivo fisico. Lo usa el WAL para registrar el undo de una
+        insercion sin romper la API de los callers existentes.
         """
         if len(values) != len(self.schema):
             raise ValueError(
@@ -99,6 +103,9 @@ class Table:
             )
 
         self.constraints_manager.validate_insert(values)
+
+        if mutation_logger is not None:
+            mutation_logger("insert", self, list(values), None)
 
         if self.clustered_index:
             key = values[self.key_index]
@@ -120,13 +127,19 @@ class Table:
         """
         return self.data_file.fetch(rid)
 
-    def delete(self, rid: RID) -> bool:
+    def delete(self, rid: RID, mutation_logger=None) -> bool:
         """
         Elimina un registro y limpia sus entradas en los índices secundarios.
+
+        El logger se llama cuando la fila aun existe y antes de modificar el
+        archivo, por lo que puede guardar sus valores originales para undo.
         """
         record_values = self.get(rid)
         if record_values is None:
             return False
+
+        if mutation_logger is not None:
+            mutation_logger("delete", self, list(record_values), rid)
 
         ok = self.data_file.delete(rid)
 
