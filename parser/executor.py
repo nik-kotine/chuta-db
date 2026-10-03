@@ -27,6 +27,7 @@ from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
 from indexes.extendible_hash import HashIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
+from indexes.b_tree_leaf_page import NULL_LEAF
 
 EXTERNAL_SORT_BUDGET = 1000
 EXTERNAL_HASH_BUCKETS = 16
@@ -144,7 +145,7 @@ class ExecuteVisitor(Visitor):
             )
             filas = self._filas_join(tabla, derecha, stm, resolver, serializador)
             if not self._tiene_agregados(stm) and stm.order_by is not None:
-                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort"})
+                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if reverse else "ASC"})
                 filas = self._ordenar_externo(
                     filas, resolver, stm.order_by,
                     stm.direccion == SortDir.DESC_DIR, serializador,
@@ -154,14 +155,16 @@ class ExecuteVisitor(Visitor):
             resolver = self._resolver_columnas(tablas)
             serializador = tabla.data_file.serializer
             if not self._tiene_agregados(stm) and stm.order_by is not None:
-                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort"})
-                filas = self._select_ordenado(
-                    tabla, stm.condicion, resolver, stm.order_by,
-                    stm.direccion == SortDir.DESC_DIR,
-                )
+                reverse = stm.direccion == SortDir.DESC_DIR
+                indice_order = self._indice_para_order_by(tabla, stm.order_by)
+                if indice_order is not None and not reverse: #TODO AÑADIR SOPORTE A DESC EN EL B+
+                    filas = self._scan_ordenado_por_indice(tabla, stm.condicion, resolver, stm.order_by)
+                else:
+                    self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if reverse else "ASC"})
+                    filas = self._select_ordenado(tabla, stm.condicion, resolver, stm.order_by, reverse)
             else:
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
-
+        
         if self._tiene_agregados(stm):
             self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
             nombres, filas = self._proyeccion_agregada(
@@ -347,7 +350,7 @@ class ExecuteVisitor(Visitor):
         for registro in self._candidatos_con_indice(tabla, plan):
             if condicion is None or self._evaluar(condicion, registro, resolver):
                 yield registro
-
+    
     def _plan_indice(self, tabla, condicion, resolver):
         """Busca un predicado del WHERE que un indice B+ pueda servir.
 
@@ -679,6 +682,59 @@ class ExecuteVisitor(Visitor):
             return self._valor(cond.inferior) <= val <= self._valor(cond.superior)
 
         raise ExecutionError(f"Condicion no soportada: {cond}")
+
+    def _indice_para_order_by(self, tabla, colref):
+        """
+        Busca un índice B+ que permita recorrer la columna del ORDER BY de manera ordenada 
+        (y no índices hash, ya que estos no mantienen el orden).
+        Retorna ("clustered" / "unclustered", indice, posicion) o None.
+        """
+        try:
+            pos = tabla.column_index(colref.columna)
+        except KeyError:
+            return None
+        
+        if tabla.clustered_index is not None and pos == tabla.key_index:
+            return ("clustered", tabla.clustered_index, pos)
+        
+        secundarios = tabla.secondary_indexes.get(pos)
+        if secundarios:
+            for indice in secundarios:
+                if not isinstance(indice, HashIndex):
+                    return ("unclustered", indice, pos)
+        return None
+
+    def _scan_ordenado_por_indice(self, tabla, condicion, resolver, colref, reverse=False):
+        """
+        Recorre un indice B+ en el orden de sus claves y aplica el WHERE.
+        Actualmente solo se utiliza directamente para ASC. Para DESC se
+        puede seguir usando ExternalSort hasta disponer de enlaces hacia
+        atras en las hojas.
+        """
+        if reverse:
+            raise ExecutionError("El recorrido descendente del indice no esta implementado") #TODO
+        info = self._indice_para_order_by(tabla, colref)
+
+        if info is None:
+            raise ExecutionError(f"No existe un indice B+ sobre '{colref.columna}'")
+            
+        organizacion, indice, posicion = info
+
+        self.plan.append({"node": "INDEX SCAN", "table": tabla.name, "index": organizacion, "operation": "index_scan", 
+            "column": tabla.column_names[posicion], "direction": "DESC" if reverse else "ASC"}) #tal vez "INDEX ORDERED SCAN" o similar en node y operation
+        for _, ref in indice.iter_ordered(reverse=False):
+            registro = indice._fetch_record(ref)
+
+            if registro is None:
+                continue
+
+            registro = list(registro)
+
+            if condicion is None or self._evaluar(
+                condicion, registro, resolver
+            ):
+                yield registro
+
 
     def visit_int_value(self, v): pass
     def visit_float_value(self, v): pass
