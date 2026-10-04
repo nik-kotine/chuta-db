@@ -58,6 +58,8 @@ PALABRAS_RESERVADAS = {
     "INTO": Token.Type.INTO,
     "VALUES": Token.Type.VALUES,
     "DELETE": Token.Type.DELETE,
+    "UPDATE": Token.Type.UPDATE,
+    "SET": Token.Type.SET,
 
     # Transacciones (2.1.4)
     "BEGIN": Token.Type.BEGIN,

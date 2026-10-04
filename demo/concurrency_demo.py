@@ -1,8 +1,4 @@
 """Demo reproducible de transacciones y concurrencia.
-
-Ejecutar desde la raiz del repositorio:
-
-    python3 demo/concurrency_demo.py
 """
 
 import os

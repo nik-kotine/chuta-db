@@ -34,6 +34,7 @@ from indexes.extendible_hash import HashIndex
 from indexes.bitmap_index import BitmapIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from storage.lock_manager import LockMode
+from storage.rid import RID
 
 EXTERNAL_SORT_BUDGET = 1000
 EXTERNAL_HASH_BUCKETS = 16
@@ -117,6 +118,17 @@ class ExecuteVisitor(Visitor):
             )
 
         file_type = "heap" if stm.org == FileOrg.HEAP_ORG else "sequential"
+
+        self._log_ddl(
+            "create_table",
+            stm.tabla,
+            {
+                "schema": schema,
+                "file_type": file_type,
+                "key_index": key_index,
+                "column_names": column_names,
+            },
+        )
 
         self.sm.create_table(
             name=stm.tabla,
@@ -226,6 +238,34 @@ class ExecuteVisitor(Visitor):
                         borrados += 1
         self.resultado = Resultado(f"{borrados} fila(s) eliminada(s)")
 
+    def visit_update_stmt(self, stm):
+        with self._table_locks([stm.tabla], LockMode.UREAD):
+            tabla = self._abrir(stm.tabla)
+            resolver = self._resolver_columnas([(stm.tabla, tabla)])
+            posiciones = {}
+            for columna, valor in stm.asignaciones:
+                if columna in posiciones:
+                    raise ExecutionError(f"la columna '{columna}' aparece mas de una vez en SET")
+                posiciones[columna] = tabla.column_index(columna)
+
+            pendientes = []
+            for rid, registro in list(tabla.scan()):
+                if not self._evaluar(stm.condicion, registro, resolver):
+                    continue
+                nuevos = list(registro)
+                for columna, valor in stm.asignaciones:
+                    nuevos[posiciones[columna]] = self._valor(valor)
+                pendientes.append((rid, nuevos))
+
+            if pendientes:
+                self._promote_table_locks([stm.tabla])
+
+            actualizadas = 0
+            for rid, nuevos in pendientes:
+                if tabla.update(rid, nuevos, mutation_logger=self._mutation_logger()):
+                    actualizadas += 1
+        self.resultado = Resultado(f"{actualizadas} fila(s) actualizada(s)")
+
     def visit_create_index_stmt(self, stm):
         tabla = self._abrir(stm.tabla)
         pos = tabla.column_index(stm.columna)
@@ -264,6 +304,21 @@ class ExecuteVisitor(Visitor):
             # asi que un bitmap sobre la misma columna necesita el suyo: es
             # justamente el caso en que los tres conviven.
             nombre = f"{nombre}_bitmap"
+
+        # El sufijo va antes del log: el rollback de ddl_create_index hace
+        # drop_index(payload["index_name"]), asi que el log tiene que llevar
+        # el nombre final del indice.
+        self._log_ddl(
+            "create_index",
+            stm.tabla,
+            {
+                "index_name": nombre,
+                "column_name": stm.columna,
+                "column_index": pos,
+                "index_kind": stm.tipo.name,
+                "clustered": stm.clustered,
+            },
+        )
         if stm.tipo == IndexKind.HASH_IDX:
             self.sm.index_manager.create_hash_index(
                 nombre, tabla, pos, stm.columna
@@ -297,11 +352,13 @@ class ExecuteVisitor(Visitor):
             if self.transaction_id is None:
                 raise ExecutionError("ROLLBACK requiere una transaccion activa")
             transaction_id = self.transaction_id
+            self.sm.current_transaction_id = None
             self.sm.transaction_manager.rollback(
                 transaction_id, self._undo_record
             )
             self.sm.lock_manager.release_all(transaction_id)
             self.transaction_id = None
+            self.sm.current_transaction_id = None
             self.resultado = Resultado("ROLLBACK")
             return
 
@@ -310,6 +367,7 @@ class ExecuteVisitor(Visitor):
                 raise ExecutionError("ya existe una transaccion activa")
             transaction = self.sm.transaction_manager.begin()
             self.transaction_id = transaction.transaction_id
+            self.sm.current_transaction_id = self.transaction_id
             self.resultado = Resultado("BEGIN TRANSACTION")
             return
 
@@ -319,6 +377,7 @@ class ExecuteVisitor(Visitor):
         self.sm.transaction_manager.commit(transaction_id)
         self.sm.lock_manager.release_all(transaction_id)
         self.transaction_id = None
+        self.sm.current_transaction_id = None
         self.resultado = Resultado("END TRANSACTION")
 
     def _abort_active_transaction(self):
@@ -326,18 +385,20 @@ class ExecuteVisitor(Visitor):
         if self.transaction_id is None:
             return
         transaction_id = self.transaction_id
+        self.sm.current_transaction_id = None
         try:
             self.sm.transaction_manager.abort(transaction_id, self._undo_record)
         finally:
             self.sm.lock_manager.release_all(transaction_id)
             self.transaction_id = None
+            self.sm.current_transaction_id = None
 
     def _mutation_logger(self):
         """Devuelve el hook WAL solo para transacciones explicitas."""
         if self.transaction_id is None:
             return None
 
-        def log_mutation(operation, table, values, rid):
+        def log_mutation(operation, table, values, rid, new_values=None):
             payload = json.dumps(
                 {
                     "values": values,
@@ -346,8 +407,19 @@ class ExecuteVisitor(Visitor):
                 },
                 default=str,
             ).encode("utf-8")
-            before = payload if operation == "delete" else b""
-            after = payload if operation == "insert" else b""
+            if operation == "update":
+                before = payload
+                after = json.dumps(
+                    {
+                        "values": new_values,
+                        "key": new_values[table.key_index],
+                        "rid": list(rid) if rid is not None else None,
+                    },
+                    default=str,
+                ).encode("utf-8")
+            else:
+                before = payload if operation == "delete" else b""
+                after = payload if operation == "insert" else b""
             self.sm.transaction_manager.log_update(
                 self.transaction_id,
                 operation=f"table_{operation}",
@@ -361,8 +433,30 @@ class ExecuteVisitor(Visitor):
 
         return log_mutation
 
+    def _log_ddl(self, operation, table_name, payload):
+        if self.transaction_id is None:
+            return
+        self.sm.transaction_manager.log_update(
+            self.transaction_id,
+            operation=f"ddl_{operation}",
+            file_name=table_name,
+            resource_type="ddl",
+            after=json.dumps(payload).encode("utf-8"),
+        )
+        self.sm.log_manager.force()
+
     def _undo_record(self, record):
         """Aplica undo logico y deja que Table actualice sus indices."""
+        if record.resource_type in ("page", "header", "allocation", "truncate"):
+            self.sm._undo_physical_record(record)
+            return
+        if record.resource_type == "ddl":
+            payload = json.loads(record.after.decode("utf-8"))
+            if record.operation == "ddl_create_table":
+                self.sm.drop_table(record.file_name)
+            elif record.operation == "ddl_create_index":
+                self.sm.index_manager.drop_index(payload["index_name"])
+            return
         payload_bytes = record.before or record.after
         payload = json.loads(payload_bytes.decode("utf-8"))
         table = self._abrir(record.file_name)
@@ -371,6 +465,14 @@ class ExecuteVisitor(Visitor):
             table.delete_by_key(payload["key"])
         elif record.operation == "table_delete":
             table.insert(payload["values"])
+        elif record.operation == "table_update":
+            old_payload = json.loads(record.before.decode("utf-8"))
+            new_payload = json.loads(record.after.decode("utf-8"))
+            rid = RID(*new_payload["rid"]) if new_payload.get("rid") else None
+            restored = table.update(rid, old_payload["values"]) if rid else None
+            if restored is None:
+                table.delete_by_key(new_payload["key"])
+                table.insert(old_payload["values"])
         else:
             raise ExecutionError(
                 f"no existe undo fisico para la operacion '{record.operation}'"
@@ -392,6 +494,15 @@ class ExecuteVisitor(Visitor):
             if not explicit:
                 for resource in reversed(acquired):
                     self.sm.lock_manager.release(resource, transaction_id)
+
+    def _promote_table_locks(self, table_names):
+        """Promueve locks UREAD ya adquiridos a EXCLUSIVE en orden estable."""
+        transaction_id = self.transaction_id or self.session_id
+        for table_name in sorted(set(table_names)):
+            resource = ("table", table_name)
+            self.sm.lock_manager.acquire(
+                resource, transaction_id, LockMode.EXCLUSIVE, timeout=5
+            )
 
     def _abrir(self, nombre):
         try:

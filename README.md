@@ -19,7 +19,10 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
   - `INSERT INTO tabla VALUES (...)`.
   - `DELETE FROM tabla WHERE ...` — el `WHERE` es **obligatorio**, para no borrar la tabla completa por accidente.
 - **Transacciones**
-  - `BEGIN TRANSACTION` / `END TRANSACTION`, aceptadas por el parser (todavía sin rollback/recovery).
+  - `BEGIN TRANSACTION`, `END TRANSACTION` y `ROLLBACK`.
+  - Undo y redo lógico idempotente de `INSERT`, `DELETE` y `UPDATE` mediante WAL.
+  - Undo y redo transaccional de `CREATE TABLE` y `CREATE INDEX`.
+  - Locks `SHARED`, `UREAD` y `EXCLUSIVE` por tabla, con timeout y limpieza al finalizar.
 - **Detalles del lenguaje**
   - Palabras reservadas insensibles a mayúsculas (`select` = `SELECT`).
   - Comentarios de línea con `--`.
@@ -59,10 +62,10 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
 
 ### Lo que *no* está implementado (aún)
 
-- `UPDATE`, `DROP TABLE` / `DROP INDEX` desde SQL (existen internamente en el motor).
-- `ROLLBACK`/recovery de transacciones: `BEGIN`/`END TRANSACTION` solo se parsean.
+- `DROP TABLE` / `DROP INDEX` desde SQL (existen internamente en el motor).
+- Recovery físico completo: redo de páginas confirmadas, page LSN y restauración byte a byte de headers y asignaciones.
+- Detección formal de deadlocks y aislamiento serializable.
 - Joins de más de dos tablas, `HAVING`, subconsultas, `DISTINCT`.
-- Ningún grado de concurrencia ni bloqueos (el motor es de un solo proceso).
 
 ---
 
@@ -230,7 +233,59 @@ Borrado y "transacciones":
 DELETE FROM ventas WHERE id = 3;
 BEGIN TRANSACTION;
 END TRANSACTION;
+UPDATE ventas SET cliente = 'Ana María' WHERE id = 1;
+ROLLBACK;
 ```
+
+### Transacciones, concurrencia y alcance del recovery
+
+Una transacción explícita sigue el ciclo `BEGIN TRANSACTION` -> operaciones ->
+`END TRANSACTION` o `ROLLBACK`. El `TransactionManager` escribe `BEGIN`, las
+mutaciones y el resultado final en el WAL. El commit fuerza el log antes de
+marcar la transacción como confirmada y liberar sus locks.
+
+Las lecturas adquieren locks `SHARED` y las escrituras adquieren locks
+`EXCLUSIVE`. Los locks se conservan durante una transacción explícita y se
+liberan automáticamente en autocommit. Si una espera supera el timeout, la
+sentencia falla, la transacción se aborta y sus recursos se liberan.
+
+El rollback actual es lógico. El WAL conserva los valores necesarios para
+deshacer cada operación y el executor utiliza las APIs de `Table`, por lo que
+los índices secundarios se actualizan normalmente:
+
+- `INSERT`: se elimina la fila por su clave primaria.
+- `DELETE`: se reinserta la fila con sus valores originales.
+- `UPDATE`: se restaura la imagen anterior; cuando el tamaño cabe en el slot,
+  se conserva el RID original.
+- Las operaciones se deshacen en orden inverso y generan registros `CLR`.
+
+Si el motor se reabre, `RecoveryManager` reaplica primero el redo lógico de las
+transacciones confirmadas y luego aplica undo lógico a las transacciones sin
+`COMMIT`. El redo lógico es idempotente: no duplica inserts ni falla si un
+delete ya fue aplicado. También puede reaplicar un registro físico explícito
+de página (`resource_type = "page"`) usando sus imágenes `before`/`after`.
+
+La recuperación física ya se integra con `mark_dirty` del buffer pool cuando
+existe una transacción activa: el frame conserva su imagen original y el WAL
+recibe el `before`/`after` de la página antes de que pueda escribirse. Si una
+página tiene varios cambios consecutivos, recovery reproduce la cadena en
+orden y no pisa una modificación posterior que no pertenece al registro.
+Todavía quedan fuera operaciones DDL no expuestas por el parser, como `DROP
+TABLE` y `DROP INDEX`, además de algunos cambios de metadata internos que se
+realizan fuera de estas rutas de logging.
+
+El límite es importante: si una actualización cambia el tamaño de un registro,
+puede ser necesario borrar y volver a insertar la fila, por lo que su RID puede
+cambiar. Tampoco se restauran byte a byte los headers de archivos, la free-list
+de las páginas, la creación de páginas ni las operaciones internas de splits de
+los índices. El catálogo y las operaciones DDL tampoco forman parte del undo
+transaccional SQL.
+
+Para completar el recovery físico habría que persistir `page_lsn`, aplicar el
+protocolo WAL a la metadata restante, registrar undo/redo de operaciones DDL,
+registrar o reconstruir de forma segura los índices y probar crashes en cada
+punto de escritura. Ese trabajo es una fase posterior y no debe confundirse
+con el redo físico de registros de página explícitos implementado aquí.
 
 ---
 
