@@ -79,10 +79,36 @@ def test_rollback_keeps_secondary_index_consistent():
             close_table(old, sm)
 
 
+def test_update_rollback_restores_values_and_index():
+    with tempfile.TemporaryDirectory() as directory:
+        old, sm, visitor = setup_table(directory, indexed=True)
+        try:
+            execute(visitor, "INSERT INTO ventas VALUES (5, 'Ana');")
+            execute(visitor, "BEGIN TRANSACTION; UPDATE ventas SET nombre = 'Beto' WHERE id = 5; ROLLBACK;")
+            assert execute(visitor, "SELECT * FROM ventas WHERE nombre = 'Ana';")[0].filas == [[5, "Ana"]]
+            assert execute(visitor, "SELECT * FROM ventas WHERE nombre = 'Beto';")[0].filas == []
+        finally:
+            close_table(old, sm)
+
+
+def test_ddl_rollback_removes_table_and_index():
+    with tempfile.TemporaryDirectory() as directory:
+        old, sm, visitor = setup_table(directory)
+        try:
+            execute(visitor, "BEGIN TRANSACTION; CREATE TABLE temporal (id INT PRIMARY KEY) USING HEAP; ROLLBACK;")
+            assert sm.catalog.get_table_info("temporal") is None
+            execute(visitor, "BEGIN TRANSACTION; CREATE INDEX ON ventas (nombre) USING BTREE; ROLLBACK;")
+            assert "idx_ventas_nombre" not in sm.index_manager.open_indexes
+        finally:
+            close_table(old, sm)
+
+
 if __name__ == "__main__":
     test_insert_rollback_removes_row()
     test_delete_rollback_restores_row()
     test_multiple_mutations_rollback_in_reverse_order()
     test_insert_commit_preserves_row()
     test_rollback_keeps_secondary_index_consistent()
+    test_update_rollback_restores_values_and_index()
+    test_ddl_rollback_removes_table_and_index()
     print("test_phase5_atomicity: OK")

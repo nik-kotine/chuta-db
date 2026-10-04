@@ -213,6 +213,31 @@ class HeapFile(RecordFile):
             self.buffer_manager.unpin_page(page_id, self.file_manager)
         return ok
 
+    def update(self, rid: RID, values) -> bool:
+        """Reemplaza un registro conservando el RID si cabe en su slot."""
+        page_id, slot_id = rid
+        if not self._is_data_page(page_id):
+            return False
+        page = self._load(page_id)
+        try:
+            slot_offset = page._slot_offset(slot_id)
+            record_offset, stored_size = struct.unpack_from(
+                ">ii", page.page_ba, slot_offset
+            )
+            record_size = self.serializer.get_size_of(values) + RID_SIZE + DELETED_SIZE
+            if record_size != stored_size:
+                return False
+            old_record = page.get_record(slot_id)
+            if old_record is None:
+                return False
+            old_record.params = list(values)
+            page.set_record(slot_id, old_record)
+            self._sync_page(page)
+            return True
+        except (RuntimeError, IndexError):
+            self.buffer_manager.unpin_page(page_id, self.file_manager)
+            return False
+
     def compact(self, page_id: int):
         if not self._is_data_page(page_id):
             return

@@ -1,10 +1,3 @@
-"""Coordinador del ciclo de vida de las transacciones.
-
-La integracion con Table y los locks pertenece a fases posteriores. En esta
-fase el manager coordina estados y eventos del WAL, y expone un callback para
-que la futura capa de almacenamiento aplique undo sobre cambios fisicos.
-"""
-
 from dataclasses import dataclass
 from enum import Enum, auto
 import threading
@@ -210,6 +203,15 @@ class TransactionManager:
 				transaction
 				for transaction in self._transactions.values()
 				if transaction.status == TransactionStatus.ACTIVE
+			]
+
+	def committed_transactions(self) -> list[Transaction]:
+		"""Devuelve una instantanea de las transacciones confirmadas."""
+		with self._lock:
+			return [
+				transaction
+				for transaction in self._transactions.values()
+				if transaction.status == TransactionStatus.COMMITTED
 			]
 
 	def close(self, undo_handler: UndoHandler | None = None) -> None:

@@ -45,6 +45,8 @@ class Token:
         INTO = auto()
         VALUES = auto()
         DELETE = auto()
+        UPDATE = auto()
+        SET = auto()
 
         # Transacciones
         BEGIN = auto()

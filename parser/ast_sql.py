@@ -290,6 +290,17 @@ class DeleteStmt(Stmt):
         return visitor.visit_delete_stmt(self)
 
 
+# UPDATE tabla SET columna = valor [, ...] WHERE condicion
+class UpdateStmt(Stmt):
+    def __init__(self):
+        self.tabla = ""
+        self.asignaciones = []
+        self.condicion = None
+
+    def accept(self, visitor):
+        return visitor.visit_update_stmt(self)
+
+
 # BEGIN TRANSACTION | END TRANSACTION | ROLLBACK
 class TransactionStmt(Stmt):
     def __init__(self, es_begin=None, es_rollback=False):

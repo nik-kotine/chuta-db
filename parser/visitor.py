@@ -56,6 +56,9 @@ class Visitor:
     def visit_delete_stmt(self, stm):
         raise NotImplementedError
 
+    def visit_update_stmt(self, stm):
+        raise NotImplementedError
+
     def visit_transaction_stmt(self, stm):
         raise NotImplementedError
 
@@ -236,6 +239,16 @@ class PrintVisitor(Visitor):
 
     def visit_delete_stmt(self, stm):
         print("DELETE FROM " + stm.tabla + " WHERE ", end="")
+        stm.condicion.accept(self)
+
+    def visit_update_stmt(self, stm):
+        print("UPDATE " + stm.tabla + " SET ", end="")
+        for index, (column, value) in enumerate(stm.asignaciones):
+            if index:
+                print(", ", end="")
+            print(column + " = ", end="")
+            value.accept(self)
+        print(" WHERE ", end="")
         stm.condicion.accept(self)
 
     def visit_transaction_stmt(self, stm):

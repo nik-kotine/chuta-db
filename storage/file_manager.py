@@ -7,9 +7,18 @@ con rid = -1 siendo NULL
 """
 
 import os
+import struct
 
 
 class FileManager:
+
+    _wal_logger = None
+    _transaction_id_provider = None
+
+    @classmethod
+    def configure_wal(cls, wal_logger, transaction_id_provider):
+        cls._wal_logger = wal_logger
+        cls._transaction_id_provider = transaction_id_provider
 
     def __init__(self, filename: str, page_size: int, file_header_size: int):
         self.filename: str              = filename
@@ -53,6 +62,8 @@ class FileManager:
         if len(header) != self.file_header_size:
             raise ValueError("El tamaño del header no coincide.")
 
+        before = self.read_header()
+        self._log_physical("header", -1, 0, before, bytes(header))
         self.file_ptr.seek(0)
         self.file_ptr.write(header)
 
@@ -68,8 +79,27 @@ class FileManager:
             file_size = self.file_header_size
         data_size = file_size - self.file_header_size
         page_id = data_size // self.page_size
-        self.file_ptr.write(b"\x00" * self.page_size)
+        page = b"\x00" * self.page_size
+        self._log_physical("allocation", page_id, 0, b"", page)
+        self.file_ptr.write(page)
         return page_id
+
+    def _log_physical(self, resource_type, page_id, offset, before, after):
+        transaction_id = (
+            type(self)._transaction_id_provider()
+            if type(self)._transaction_id_provider is not None
+            else None
+        )
+        if type(self)._wal_logger is not None and transaction_id is not None:
+            type(self)._wal_logger(
+                transaction_id,
+                self,
+                resource_type,
+                page_id,
+                offset,
+                before,
+                after,
+            )
 
     def flush(self):
         """
@@ -93,6 +123,15 @@ class FileManager:
         Trunca el archivo a tamaño exactamente size. Todo lo que esta despues es
         eliminado.
         """
+        self.file_ptr.seek(0, 2)
+        before = self.file_ptr.tell()
+        self._log_physical(
+            "truncate",
+            -1,
+            0,
+            struct.pack(">Q", before),
+            struct.pack(">Q", size),
+        )
         self.file_ptr.truncate(size)
 
     def close(self):
