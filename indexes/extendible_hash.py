@@ -658,9 +658,10 @@ class HashIndex:
         hashed_key = hash_key(key, self.key_format, self.seed)
         bucket_to_insert = hashed_key % self.max_capacity
         output = []
-        bucket_page = self._locate_bucket(bucket_to_insert)
-        if bucket_page is None:
-            raise IndexError("Bucket redirection from locator dictionary is wrong or capacity is too big")
+        # _iter_kvs_in_bucket ya resuelve el bucket (y valida que no sea
+        # None) por su cuenta; llamar _locate_bucket aca antes era una
+        # segunda resolucion redundante (metadata + directorio de nuevo),
+        # duplicando de 3 a 5 paginas leidas por busqueda sin necesidad.
         for kv in self._iter_kvs_in_bucket(bucket_to_insert):
             if kv is not None and kv.key == key and (not kv.deleted):
                 output.append(kv)
