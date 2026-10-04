@@ -84,9 +84,9 @@ class Rectangle:
 
 
 def mindist(point, rectangle, metric="euclidean"):
-    # Distancia entre point y el punto mas cercano posible dentro de rectangle
-    # (slides 49-51). Se proyecta point sobre cada eje, clampeado al rango
-    # del rectangulo, y se mide la distancia al punto resultante.
+    # Distancia entre point y el punto mas cercano posible dentro de
+    # rectangle: se proyecta point sobre cada eje, clampeado al rango del
+    # rectangulo, y se mide la distancia al punto resultante.
     #
     # Para metric="haversine" esto es una aproximacion (la proyeccion por eje
     # asume geometria plana), no un lower bound estricto en la esfera -- pero
