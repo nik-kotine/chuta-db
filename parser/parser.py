@@ -204,8 +204,10 @@ class Parser:
             ci.tipo = IndexKind.BTREE_IDX
         elif self.match(Token.Type.HASH):
             ci.tipo = IndexKind.HASH_IDX
+        elif self.match(Token.Type.BITMAP):
+            ci.tipo = IndexKind.BITMAP_IDX
         else:
-            self.error("se esperaba BTREE o HASH")
+            self.error("se esperaba BTREE, HASH o BITMAP")
 
         if self.match(Token.Type.CLUSTERED):
             ci.clustered = True
@@ -214,6 +216,10 @@ class Parser:
         # orden, asi que no puede definir el orden fisico de los registros
         if ci.clustered and ci.tipo == IndexKind.HASH_IDX:
             self.error_semantico("un indice HASH no puede ser CLUSTERED")
+        # El bitmap guarda mascaras de bits, no registros ordenados: agrupar
+        # por el obligaria a copiar cada fila al heap, que ya es donde vive
+        if ci.clustered and ci.tipo == IndexKind.BITMAP_IDX:
+            self.error_semantico("un indice BITMAP no puede ser CLUSTERED")
         return ci
 
     # Select ::= SELECT SelList FROM id [Join] [Where] [GroupBy] [OrderBy] [Limit]

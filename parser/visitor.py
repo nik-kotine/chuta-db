@@ -1,5 +1,12 @@
 from ast_sql import (AggFun, Cond, DataType, FileOrg, IndexKind, SortDir)
 
+# Nombre SQL de cada tipo de indice
+NOMBRE_INDICE = {
+    IndexKind.BTREE_IDX: "BTREE",
+    IndexKind.HASH_IDX: "HASH",
+    IndexKind.BITMAP_IDX: "BITMAP",
+}
+
 
 class Visitor:
     # En C++ estas eran sobrecargas de visit(); Python no resuelve por
@@ -191,7 +198,7 @@ class PrintVisitor(Visitor):
     def visit_create_index_stmt(self, stm):
         print("CREATE INDEX ON " + stm.tabla + " (" + stm.columna + ")", end="")
         print(" USING ", end="")
-        print("BTREE" if stm.tipo == IndexKind.BTREE_IDX else "HASH", end="")
+        print(NOMBRE_INDICE[stm.tipo], end="")
         if stm.clustered:
             print(" CLUSTERED", end="")
 

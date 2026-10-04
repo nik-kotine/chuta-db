@@ -12,7 +12,7 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
 
 - **DDL**
   - `CREATE TABLE ... USING HEAP` o `USING SEQUENTIAL`, con columna `PRIMARY KEY` obligatoria.
-  - `CREATE INDEX ON tabla (columna) USING BTREE|HASH [CLUSTERED]`.
+  - `CREATE INDEX ON tabla (columna) USING BTREE|HASH|BITMAP [CLUSTERED]` (el `CLUSTERED` solo aplica a `BTREE`).
 - **DML**
   - `SELECT` con proyección (`*` o columnas con/sin calificación `tabla.col`), `JOIN ... ON`, `WHERE` (con paréntesis, `AND`, `OR`, `BETWEEN` y los operadores `=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), `GROUP BY`, `ORDER BY ... ASC|DESC` y `LIMIT n`.
   - Funciones de agregación: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` (y `COUNT(*)`).
@@ -44,12 +44,14 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
 - **B+ árbol agrupado** (`CLUSTERED`): solo sobre tablas `USING SEQUENTIAL` y sobre la columna `PRIMARY KEY`; el orden del índice coincide con el orden físico de los datos.
 - **B+ árbol no agrupado**: sobre tablas `USING HEAP`; guarda referencias (RID) a las filas del heap.
 - **Hash extensible** no agrupado: sobre tablas `USING HEAP`; resuelve búsquedas por igualdad.
+- **Bitmap (bitmap index) no agrupado**: sobre tablas `USING HEAP`; una máscara de bits por valor sobre el espacio de RIDs del heap. Resuelve igualdades, `BETWEEN`, rangos en columnas numéricas, y combina varios valores con `AND` (intersección) y `OR` (unión).
 - Los índices **se registran en el catálogo** y **se recalgan automáticamente** al reabrir la base; el CRUD (`INSERT`/`DELETE`) los mantiene al día.
-- El parser/ejecutor **rechaza combinaciones inválidas** (p. ej. `HASH CLUSTERED`, índice B+ no agrupado sobre tabla sequential).
+- El parser/ejecutor **rechaza combinaciones inválidas** (p. ej. `HASH CLUSTERED`, `BITMAP CLUSTERED`, índice B+ no agrupado sobre tabla sequential).
 
 ### Procesamiento de consultas
 
 - **Planificador con uso estratégico de índices**: si el `WHERE` tiene un predicado en contexto conjuntivo (`AND`) que un índice puede responder exactamente, se recorre el índice (búsqueda por punto o por rango) en lugar de barrer la tabla completa; el resultado se afina luego con el resto de la condición.
+- **Planificador de bitmaps**: los `AND` se combinan por intersección y los `OR` por unión de las máscaras (siempre que **todas** las ramas tengan bitmap; si no, se cae al plan normal). Cada máscara se resuelve en RAM y del heap solo se leen las páginas que la máscara señala, lo que ahorra muchísima E/S cuando el filtro es selectivo sobre columnas con pocos valores distintos.
 - **Grace Hash Join** para `JOIN` (particiona ambas tablas por la clave del `ON` y une las particiones de a pares, sin cargar nunca todo en memoria).
 - **Ordenamiento externo (k-way merge)** para `ORDER BY`, que usa disco cuando el resultado no entra en memoria.
 - **Agregación con hash externo** para `GROUP BY` y agregados globales.
@@ -88,6 +90,7 @@ El código está dividido en tres grandes capas, imitando la separación clásic
 │                    indexes/   (índices + ext.)              │
 │  B+ tree (BPlusTreeBase + subclases)                       │
 │  extendible_hash  (HashIndex)                              │
+│  bitmap_index  (BitmapIndex + algebra de mascaras)         │
 │  external_sort / external_hash  (ORDER BY, JOIN, GROUP BY) │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -102,8 +105,8 @@ El flujo de una consulta es siempre el mismo:
 
 Conceptos clave que conviene tener en mente:
 
-- **Página**: unidad de almacenamiento de tamaño fijo (4 KiB en tablas, 4 KiB en los B+, 8 KiB en el hash). Todo en disco vive dentro de páginas.
-- **RID** (`page_id`, `slot_id`): la "dirección" de un registro dentro de un archivo. Los índices guardan RIDs para localizar las filas.
+- **Página**: unidad de almacenamiento de tamaño fijo (4 KiB en tablas, 4 KiB en los B+ y en el bitmap, 8 KiB en el hash). Todo en disco vive dentro de páginas.
+- **RID** (`page_id`, `slot_id`): la "dirección" de un registro dentro de un archivo. Los índices guardan RIDs para localizar las filas; el bitmap los usa directamente como posiciones de bit (el RID `p * 512 + s` es el bit `p * 512 + s` de la máscara).
 - **Buffer pool global**: un único arreglo de *frames* compartido por todo el motor. Una página se identifica por el par **(archivo, número de página)**, porque dos archivos distintos pueden tener su propia "página 0".
 - **Catálogo**: tres tablas del sistema que describen las tablas del usuario (nombres, tipos, orden de columnas), la organización del archivo y los índices existentes.
 
@@ -123,7 +126,7 @@ programa ::= sentencia { ";" sentencia }* [ ";" ]
 CREATE TABLE id "(" ColDec { "," ColDec }* ")" USING (HEAP | SEQUENTIAL)
 ColDec ::= id (INT | FLOAT | BOOL | DATE | VARCHAR "(" num ")") [PRIMARY KEY]
 
-CREATE INDEX ON id "(" id ")" USING (BTREE | HASH) [CLUSTERED]
+CREATE INDEX ON id "(" id ")" USING (BTREE | HASH | BITMAP) [CLUSTERED]
 
 SELECT ("*" | SelectItem { "," SelectItem }*) FROM id
         [JOIN id ON ColRef = ColRef]
@@ -153,6 +156,7 @@ Notas importantes sobre la sintaxis:
 - **`DELETE` exige `WHERE`.** `DELETE FROM t;` sin condición es un error.
 - **`CREATE TABLE` exige una `PRIMARY KEY`.** Si no se declara ninguna, el ejecutor la rechaza. La PK puede estar en cualquier columna, no solo la primera.
 - **`CREATE INDEX` con `USING HASH CLUSTERED` es inválido** (un hash no preserva orden, no puede definir el orden físico). El parser lo rechaza con un error semántico.
+- **`CREATE INDEX` con `USING BITMAP CLUSTERED` es inválido** por la misma razón (una máscara no tiene orden), y `USING BITMAP` solo se acepta sobre tablas `USING HEAP`.
 - Las **agregaciones** (`SUM`, `AVG`, `MIN`, `MAX`) rechazan `*` como argumento; solo `COUNT` admite `COUNT(*)`. Una columna sin agregar en un `SELECT` agregado debe aparecer en el `GROUP BY`.
 - Las condiciones pueden agruparse con paréntesis y se respeta la precedencia clásica `AND` > `OR`.
 - Las columnas en `WHERE`, `ORDER BY`, etc. pueden ser calificadas (`ventas.id`) para desambiguar en joins; una columna sin calificar que exista en ambas tablas del join se rechaza como **ambigua**.
@@ -213,6 +217,9 @@ SELECT ventas.cliente FROM ventas JOIN dept ON ventas.id = dept.id ORDER BY vent
 CREATE INDEX ON ventas (monto) USING BTREE;
 -- Hash extensible sobre un Heap (sirve solo con igualdad)
 CREATE INDEX ON ventas (cliente) USING HASH;
+-- Bitmap sobre un Heap: un valor = una mascara de bits sobre los RIDs.
+-- Resuelve igualdades y combina varios valores con AND/OR.
+CREATE INDEX ON ventas (cliente) USING BITMAP;
 -- B+ agrupado: exige una tabla USING SEQUENTIAL e indexa la PRIMARY KEY
 CREATE INDEX ON diario (id) USING BTREE CLUSTERED;
 ```
@@ -238,7 +245,7 @@ Esta sección describe el rol de cada módulo y de cada función/método importa
 #### `token_sql.py`
 Define la unidad mínima del lenguaje.
 
-- **`Token.Type`** (enum): todos los tipos de token del lenguaje: palabras reservadas (`CREATE`, `TABLE`, `INDEX`, `SELECT`, `INSERT`, `DELETE`, `BEGIN`, `END`, `JOIN`, `WHERE`, `GROUP`, `ORDER`, `AND`, `OR`, `BETWEEN`, funciones de agregación, tipos de dato, organizaciones `HEAP`/`SEQUENTIAL`, tipos de índice `BTREE`/`HASH`...), operadores (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), puntuación (`(`, `)`, `,`, `;`, `*`, `.`), y los tokens especiales `NUM`, `STR`, `ID`, `ERR`, `END`.
+- **`Token.Type`** (enum): todos los tipos de token del lenguaje: palabras reservadas (`CREATE`, `TABLE`, `INDEX`, `SELECT`, `INSERT`, `DELETE`, `BEGIN`, `END`, `JOIN`, `WHERE`, `GROUP`, `ORDER`, `AND`, `OR`, `BETWEEN`, funciones de agregación, tipos de dato, organizaciones `HEAP`/`SEQUENTIAL`, tipos de índice `BTREE`/`HASH`/`BITMAP`...), operadores (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), puntuación (`(`, `)`, `,`, `;`, `*`, `.`), y los tokens especiales `NUM`, `STR`, `ID`, `ERR`, `END`.
 - **`Token.__init__`**: guarda el tipo, el texto del lexema y la posición (línea/columna) que luego estampa el Scanner.
 - **`Token.__str__`/`__repr__`**: representación legible `TOKEN(TIPO, "texto")`, útil para depurar con la salida del Scanner.
 
@@ -258,7 +265,7 @@ Análisis léxico: texto SQL → flujo de tokens.
 #### `ast_sql.py`
 Define los **nodos del AST** (el árbol que produce el parser). Cada nodo sabe "aceptar" un visitor.
 
-- **Enums**: `FileOrg` (`HEAP_ORG`, `SEQUENTIAL_ORG`), `IndexKind` (`BTREE_IDX`, `HASH_IDX`), `DataType` (`INT`, `FLOAT`, `BOOL`, `DATE`, `VARCHAR`), `RelOp` (los 6 operadores relacionales), `AggFun` (`NONE_AGG` + COUNT/SUM/AVG/MIN/MAX), `SortDir` (`ASC_DIR`, `DESC_DIR`).
+- **Enums**: `FileOrg` (`HEAP_ORG`, `SEQUENTIAL_ORG`), `IndexKind` (`BTREE_IDX`, `HASH_IDX`, `BITMAP_IDX`), `DataType` (`INT`, `FLOAT`, `BOOL`, `DATE`, `VARCHAR`), `RelOp` (los 6 operadores relacionales), `AggFun` (`NONE_AGG` + COUNT/SUM/AVG/MIN/MAX), `SortDir` (`ASC_DIR`, `DESC_DIR`).
 - **Valores literales**: jerarquía `Value` (abstracto) con `IntValue`, `FloatValue`, `StrValue`, `BoolValue`.
 - **`ColRef`**: referencia a columna, opcionalmente calificada (`tabla.col` o solo `col`).
 - **Condiciones `WHERE`**: jerarquía `Cond` con `OrCond` (lista de condiciones unidas por `OR`), `AndCond` (unidas por `AND`), `CompareCond` (`col op valor`) y `BetweenCond` (`col BETWEEN inf AND sup`). La jerarquía `OrCond → AndCond → predicado` codifica la precedencia.
@@ -280,7 +287,7 @@ Análisis sintáctico y semántico: tokens → AST.
   - `parse_create`: distingue `CREATE TABLE` de `CREATE INDEX`.
   - `parse_create_table`: valida la forma `CREATE TABLE id (ColDec...) USING HEAP|SEQUENTIAL`.
   - `parse_column_dec`: parsea el tipo y el opcional `PRIMARY KEY`; para `VARCHAR` exige la longitud entre paréntesis.
-  - `parse_create_index`: `CREATE INDEX ON t (col) USING BTREE|HASH [CLUSTERED]`, y **rechaza** `HASH CLUSTERED` (el hash no preserva orden).
+  - `parse_create_index`: `CREATE INDEX ON t (col) USING BTREE|HASH|BITMAP [CLUSTERED]`, y **rechaza** `HASH CLUSTERED` y `BITMAP CLUSTERED` (ninguno de los dos preserva orden).
   - `parse_select`: arma la proyección, `FROM` (con JOIN opcional), `WHERE`, `GROUP BY`, `ORDER BY ASC/DESC`, `LIMIT`.
   - `parse_select_item`: columna simple o función de agregación; solo `COUNT` admite `*`.
   - `parse_join`: `JOIN t ON ColRef = ColRef`.
@@ -316,9 +323,9 @@ El **puente** entre el parser y el motor (ver §2).
   - `visit_insert_stmt`: valida la cantidad de valores y delega en `Table.insert`.
   - `visit_select_stmt`: orquesta la consulta completa (ver abajo).
   - `visit_delete_stmt`: recorre las filas, evalúa la condición y borra las que coincidan.
-  - `visit_create_index_stmt`: valida las reglas de uso del índice (HASH→HEAP, CLUSTERED→SEQUENTIAL + columna PK, B+ no agrupado→HEAP) y crea el índice correspondiente.
+  - `visit_create_index_stmt`: valida las reglas de uso del índice (HASH→HEAP, BITMAP→HEAP, CLUSTERED→SEQUENTIAL + columna PK, B+ no agrupado→HEAP) y crea el índice correspondiente. El bitmap se registra en un archivo propio (`idx_tabla_columna_bitmap.idx`) para poder convivir con un B+ o un hash sobre la misma columna.
   - `visit_transaction_stmt`: responde `BEGIN/END TRANSACTION` (sin semántica de transacción).
-  - **Ayudantes de consultas**: `_abrir` (abre una tabla), `_resolver_columnas` (traduce `ColRef` → posición dentro del registro combinado, rechazando columnas ambiguas), `_tiene_agregados`, `_nombre_item` (nombre de columna de salida, p. ej. `count(*)`), `_scan_filtrado` (barre la tabla o usa un plan de índice), `_plan_indice` (busca un predicado que un B+ pueda servir: punto `EQ` o `RANGO`, solo en contexto conjuntivo), `_candidatos_con_indice` (trae las filas que postula el índice), `_select_ordenado` y `_ordenar_externo` (ORDER BY con External Sorter), `_filas_join` (Grace Hash Join), `_proyeccion_agregada` (GROUP BY + agregados con hash externo), `_ordenar_resultado` (ORDER BY sobre resultado agregado ya materializado), `_valor` (extrae el valor Python de un literal), `_evaluar` (evalúa recursivamente una condición sobre un registro).
+  - **Ayudantes de consultas**: `_abrir` (abre una tabla), `_resolver_columnas` (traduce `ColRef` → posición dentro del registro combinado, rechazando columnas ambiguas), `_tiene_agregados`, `_nombre_item` (nombre de columna de salida, p. ej. `count(*)`), `_scan_filtrado` (elige primero un plan de bitmap; si no hay, barre la tabla o usa un plan de índice clásico), los ayudantes de bitmap `_plan_bitmap` (recurre el `WHERE` y devuelve `(mascara, predicados_que_faltan_evaluar)` o `None` si algún predicado no lo cubre), `_combinar_bitmaps` (intersección para `AND`, unión para `OR`, búsqueda por punto y por rango en las hojas), `_scan_con_bitmap` (recorre los RIDs de la máscara trayendo solo esas páginas del heap y re-evaluando la condición original), `_indice_bitmap` (localiza el `BitmapIndex` de una columna), `_plan_indice` (busca un predicado que un B+ pueda servir: punto `EQ` o `RANGO`, solo en contexto conjuntivo), `_candidatos_con_indice` (trae las filas que postula el índice), `_indice_para`/`_indice_para_order_by` (eligen el índice clásico de una columna **ignorando** el bitmap, para que conviva con el plan de máscaras), `_select_ordenado` y `_ordenar_externo` (ORDER BY con External Sorter), `_filas_join` (Grace Hash Join), `_proyeccion_agregada` (GROUP BY + agregados con hash externo), `_ordenar_resultado` (ORDER BY sobre resultado agregado ya materializado), `_valor` (extrae el valor Python de un literal), `_evaluar` (evalúa recursivamente una condición sobre un registro).
   - El resto de `visit_*` son no-operaciones, porque esos nodos son *piezas* (columnas, condiciones, valores) y no sentencias.
 
 ---
@@ -448,9 +455,11 @@ Maneja el ciclo de vida de los índices.
 - **`create_unclustered_index`**: construye un `BPlusTreeUnclustered` sobre el heap de la tabla, lo puebla con los datos existentes y lo registra en el catálogo.
 - **`create_clustered_index`**: exige tabla `sequential`; construye un `BPlusTreeClustered` y lo sincroniza con los datos (`_reindex`), siempre sobre la `PRIMARY KEY`.
 - **`create_hash_index`**: registra el índice en el catálogo y delega en `_build_hash_index`.
+- **`create_bitmap_index`**: exige tabla `heap`, registra el índice con `index_type="bitmap"` y delega en `_build_bitmap_index`.
 - **`_hash_key_config`**: traduce el tipo de la columna a la configuración del serializador del hash (`struct format`, variable o fijo).
 - **`_build_hash_index`**: como el hash **no persiste páginas**, descarta la caché antigua, trunca el archivo `.idx`, construye el `HashIndex` desde cero y lo puebla con la tabla.
-- **`load_indexes_for_table`**: al abrir una tabla, recarga del catálogo sus índices: B+ no agrupado, B+ agrupado y hash (que se reconstruye).
+- **`_build_bitmap_index`**: trunca el `.idx`, construye el `BitmapIndex` y lo puebla con un `insert_ref` por fila del heap (el bitmap sí persiste sus páginas, así que no se reconstruye al reabrir).
+- **`load_indexes_for_table`**: al abrir una tabla, recarga del catálogo sus índices: B+ no agrupado, B+ agrupado, hash (que se reconstruye) y bitmap (que se reabre tal cual, con su directorio de claves en RAM).
 - **`drop_index`**: cierra el índice, lo quita del catálogo y borra su archivo `.idx`. **`close`**: cierra todos los índices abiertos.
 
 #### `constraints_manager.py`
@@ -530,6 +539,22 @@ B+ **agrupado**: las hojas guardan RIDs hacia un `SequentialFile`, que mantiene 
   - Crecimiento: `_split_bucket` (re-hashea un bucket lleno en dos, creciendo su `local_depth`), `_add_overflow_bucket` (encadena un bucket de overflow cuando ya se llegó a `MAX_DEPTH`), `_double_in_size` (duplica el tamaño del directorio).
   - **`insert(key, rid)`**: localiza el bucket, compacta/splittea/dobla según haga falta y guarda el par. **`search(key)`**: recorre la cadena de buckets de la partición y devuelve los `KV` con esa clave no borrados. **`delete(key)`** / **`delete_ref(key, rid)`**: borran todas las coincidencias o una fila puntual.
   - **`_insert_ref`**: alias de mantenimiento desde `Table.insert`. **`close`**: cierra el archivo del índice.
+
+#### `bitmap_index.py`
+Índice **bitmap** (bitmap index) no agrupado: un valor → una máscara de bits sobre el espacio de RIDs del heap. Detallado en `indexes/BITMAP_INDEX_README.md`.
+
+- **Constantes y formatos**: `PAGE_SIZE=4096`, `SLOTS_PER_PAGE=512` (los slots por página del heap), `CHUNK_BYTES=64` (un chunk cubre las 512 filas de una página del heap), `MAX_ON_PAGE`, `NO_PAGE=-1`, `SPILL_CAP`. `FILE_HEADER_FORMAT` (cabecera del archivo), `PAGE_HEADER_FORMAT` (cabecera de página), `ENTRY_DIR_FORMAT` (`key_offset`, `key_len`, `spill_head`), `CHUNK_FORMAT` y `SPILL_HEADER_FORMAT`. Los punteros a página van **con signo** porque `-1` es el centinela de "no hay página siguiente".
+- **`popcount(data)`**: cuenta los bits en 1 de un chunk, que es la cuenta que el índice hace al resolver o comparar máscaras.
+- **`Bitmap`**: la máscara en RAM, guardada como una lista de chunks de 64 bytes en lugar de un `bytearray` plano, para que intersect/union solo toquen los chunks que las dos máscaras comparten. `add`/`add_at` y `discard`/`discard_at` (ponen y limpian bits, ignorando RIDs fuera de rango), `copy`, `intersect`/`union`/`difference` (devuelven una máscara nueva), `__bool__`/`__len__`/`__contains__`/`__eq__`, `count`, `pages`/`page_count` (cuántas páginas del heap toca la máscara), `rids` (rinde los RIDs activos), `encode`/`decode`.
+- **`BitmapPage`**: una página del índice (distinta de las del heap). Header (`offset`, `n_entries`, `next_page`) + directorio de entradas `ENTRY_DIR_FORMAT` + los payloads de las claves al final de la página. Métodos: `save_header`/`load_header`, `_dir_offset`, `free_space`, `fits`, `read_slot`, `read_head`, `read_spill`, `_write_slot`, `rewrite(payloads, spills)`.
+- **`BitmapIndex`**:
+  - **Directorio en RAM**: `self._directory` es un `dict` `clave -> (page_id, slot_id)`; se reconstruye al abrir el archivo (`_load_directory`) y se renumera en cada reescritura de página (`_refresh_directory`). Las claves se serializan con `encode_key` de `external_sort`, así que el orden de los bytes coincide con el orden de los valores y el rango se resuelve comparando bytes.
+  - **`__init__`**: crea el archivo si no existe; si está vacío lo inicializa (`_init_empty_index`); si ya existe, carga el directorio.
+  - **Páginas y spilling**: `_alloc_page` (reutiliza la lista de páginas libres antes de hacer crecer el archivo), `_free_page`, `_link` (escribe el `siguiente` de una página de spill), `_load_page`/`_save_page`/`_unpin`, `_walk_spill` (lee la cadena como generador, sin copiarla), `_write_spill`, `_write_spill_chain` (escribe la cadena sin reusar páginas que van a liberarse).
+  - **Payloads**: `_encode_payload` (longitud de la clave + la clave + un chunk por cada página del heap que la máscara toque), `_key_of_payload`/`_decode_payload`, `_read_payload`, `_read_entries`, `_entries_with` (devuelve las claves de una página excluyendo una, con sus cadenas de spill alineadas) y `_refresh_directory`.
+  - **Escritura**: `_put`/`insert`/`_insert_ref` (alias de mantenimiento desde `Table.insert`) agregan el RID a la máscara de la clave; `_append` (agrega la clave a la última página; si no entra, crea otra y encadena la anterior), `_rewrite_page` (reescribe una página completa liberando antes las cadenas viejas, para no aliarlas), `delete_ref` (limpia el RID; si la máscara queda vacía, `_drop` borra la clave) y `delete`.
+  - **Lectura**: `search(valor)` (máscara exacta o vacía), `search_range(low, high, max_keys)` (unión de las claves del rango, extremos abiertos con `None`; devuelve `None` si hay demasiados valores distintos), `keys`, `key_count`, `exists`, `stats` (`keys`, `data_pages`, `pages_read`, `bytes`) y `close`.
+  - `search_range` es **inclusivo en los dos extremos**, así que un `<` se resuelve con un rango que además trae el valor igual: la máscara es una sobre-aproximación y el ejecutor vuelve a evaluar el `WHERE` sobre la fila traída, que es lo que garantiza la corrección.
 
 #### `external_sort.py`
 **Ordenamiento externo** (k-way merge) para el `ORDER BY`.

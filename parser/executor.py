@@ -26,6 +26,7 @@ from storage.storage_manager import StorageManager
 from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
 from indexes.extendible_hash import HashIndex
+from indexes.bitmap_index import Bitmap, BitmapIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from indexes.b_tree_leaf_page import NULL_LEAF
 
@@ -216,6 +217,13 @@ class ExecuteVisitor(Visitor):
                 raise ExecutionError(
                     "un indice HASH exige una tabla USING HEAP"
                 )
+        elif stm.tipo == IndexKind.BITMAP_IDX:
+            # El parser ya rechaza BITMAP CLUSTERED; el bitmap apunta a filas
+            # del heap, asi que solo tiene sentido alli.
+            if tabla.file_type != "heap":
+                raise ExecutionError(
+                    "un indice BITMAP exige una tabla USING HEAP"
+                )
         elif stm.clustered:
             if tabla.file_type != "sequential":
                 raise ExecutionError(
@@ -231,11 +239,22 @@ class ExecuteVisitor(Visitor):
             )
 
         nombre = f"idx_{stm.tabla}_{stm.columna}"
+        if stm.tipo == IndexKind.BITMAP_IDX:
+            # El nombre base (idx_tabla_columna) es el del B+ y el del hash,
+            # asi que un bitmap sobre la misma columna necesita el suyo: es
+            # justamente el caso en que los tres conviven.
+            nombre = f"{nombre}_bitmap"
         if stm.tipo == IndexKind.HASH_IDX:
             self.sm.index_manager.create_hash_index(
                 nombre, tabla, pos, stm.columna
             )
             tipo_nombre = "HASH"
+            org = "no agrupado"
+        elif stm.tipo == IndexKind.BITMAP_IDX:
+            self.sm.index_manager.create_bitmap_index(
+                nombre, tabla, pos, stm.columna
+            )
+            tipo_nombre = "BITMAP"
             org = "no agrupado"
         elif stm.clustered:
             self.sm.index_manager.create_clustered_index(
@@ -327,7 +346,21 @@ class ExecuteVisitor(Visitor):
         la condicion. Si la condicion tiene un predicado que un indice
         B+ pueda responder exactamente y existe ese indice (agrupado o
         no), recorre el indice (punto o rango) en vez de barrer la
-        tabla: es el uso estrategico de indices del planificador."""
+        tabla: es el uso estrategico de indices del planificador.
+
+        El indice de bitmap tiene prioridad: combina los varios
+        predicados del WHERE en una sola mascara y solo despues visita
+        las paginas del heap que esa mascara senala. Si no hay bitmap
+        util, se sigue con el plan del B+/hash y, si tampoco, el
+        barrido secuencial."""
+        plan_bitmap = self._plan_bitmap(tabla, condicion, resolver)
+        if plan_bitmap is not None:
+            mascara, partes = plan_bitmap
+            yield from self._scan_con_bitmap(
+                tabla, mascara, partes, condicion, resolver
+            )
+            return
+
         plan = self._plan_indice(tabla, condicion, resolver)
 
         if plan is None:
@@ -349,7 +382,154 @@ class ExecuteVisitor(Visitor):
         for registro in self._candidatos_con_indice(tabla, plan):
             if condicion is None or self._evaluar(condicion, registro, resolver):
                 yield registro
-    
+
+    # ---------------- indice de bitmap ----------------
+
+    def _plan_bitmap(self, tabla, condicion, resolver):
+        """Resuelve el WHERE con los indices de bitmap disponibles.
+
+        A diferencia de `_plan_indice`, aqui no alcanza con un unico
+        predicado: lo interesante del bitmap es que las mascaras de
+        todos los predicados se combinan entre si antes de tocar el
+        heap, asi que se devuelve la combinacion completa o None (si
+        ningun bitmap sirve, el planificador usa el B+/hash de siempre).
+
+        Devuelve una lista de tuplas `(indice, posicion, acceso, valores)`.
+        """
+        if condicion is None:
+            return None
+
+        combinado = self._combinar_bitmaps(tabla, condicion, resolver)
+        if combinado is None:
+            return None
+        mascara, partes = combinado
+        return mascara, partes
+
+    @staticmethod
+    def _predicados_de(partes):
+        """Aplana los `(indice, posicion, acceso, valores)` de un arbol de
+        condiciones, que pueden venir anidados (un AND dentro de un OR)."""
+        return [item for _mascara, usados in partes for item in usados]
+
+    def _combinar_bitmaps(self, tabla, condicion, resolver):
+        """Resuelve el WHERE entero con mascaras de bitmap.
+
+        Devuelve `(mascara, predicados)`, donde `predicados` son los
+        `(indice, posicion, acceso, valores)` que se usaron, o None si
+        alguna parte del WHERE no se puede resolver con bitmap (ahi mandan
+        el B+/hash o el barrido).
+
+        Cuidado de no confundir dos cosas: una mascara VACIA es una
+        respuesta valida (no hay filas que traer, y se contesta sin tocar
+        el heap), mientras que None significa que el bitmap no sabe
+        acortar ese predicado y por lo tanto no sirve para el WHERE entero.
+        """
+        if isinstance(condicion, (AndCond, OrCond)):
+            es_and = isinstance(condicion, AndCond)
+            partes = []
+            for hijo in condicion.condiciones:
+                combinado = self._combinar_bitmaps(tabla, hijo, resolver)
+                if combinado is None:
+                    return None
+                partes.append(combinado)
+
+            mascaras = [mascara for mascara, _usados in partes]
+            total = mascaras[0]
+            for bit in mascaras[1:]:
+                # AND: quedan las filas que estan en todas; OR: en alguna.
+                total = total.intersect(bit) if es_and else total.union(bit)
+            return (total, self._predicados_de(partes))
+
+        try:
+            pos = resolver(condicion.columna)
+        except (ExecutionError, KeyError):
+            return None
+        indice = self._indice_bitmap(tabla, pos)
+        if indice is None:
+            return None
+
+        if isinstance(condicion, BetweenCond):
+            valores = (
+                self._valor(condicion.inferior),
+                self._valor(condicion.superior),
+            )
+            acceso = "RANGO"
+        elif isinstance(condicion, CompareCond):
+            valor = self._valor(condicion.valor)
+            if condicion.op == RelOp.EQ_OP:
+                valores = (valor,)
+                acceso = "EQ"
+            elif (
+                self._es_numerico(tabla, pos)
+                and condicion.op in (RelOp.LT_OP, RelOp.LE_OP)
+            ):
+                valores = (None, valor)
+                acceso = "RANGO"
+            elif (
+                self._es_numerico(tabla, pos)
+                and condicion.op in (RelOp.GT_OP, RelOp.GE_OP)
+            ):
+                valores = (valor, None)
+                acceso = "RANGO"
+            else:
+                # != y las comparaciones sin indice no se pueden resolver
+                # con una mascara de un solo valor.
+                return None
+        else:
+            return None
+
+        mascara = (
+            indice.search(valores[0])
+            if acceso == "EQ"
+            else indice.search_range(*valores)
+        )
+        if mascara is None:
+            # Rango con demasiados valores distintos: armarlo en memoria
+            # saldria mas caro que barrer, asi que se descarta.
+            return None
+
+        return (mascara, [(indice, pos, acceso, valores)])
+
+    def _indice_bitmap(self, tabla, pos):
+        """Primer indice de bitmap sobre la columna `pos`, o None.
+
+        Conviven con los demas indices de la columna: el bitmap elige su
+        propia clave y no estorba al B+ ni al hash."""
+        for idx in tabla.secondary_indexes.get(pos, []):
+            if isinstance(idx, BitmapIndex):
+                return idx
+        return None
+
+    def _scan_con_bitmap(self, tabla, mascara, partes, condicion, resolver):
+        """Rinde las filas que la mascara del plan senala.
+
+        Los RIDs salen ordenados por pagina y de ahi por slot, asi que el
+        heap se recorre de forma secuencial y cada pagina se visita una sola
+        vez. El WHERE se vuelve a evaluar sobre cada fila traida, asi que el
+        resultado no depende de que la mascara sea exacta: los filtros que
+        el bitmap no acoto (un NOT, un predicado sin indice) se resuelven
+        ahi."""
+        self.plan.append({
+            "node": "BITMAP INDEX SCAN",
+            "table": tabla.name,
+            "operation": "bitmap_index_scan",
+            "columns": [tabla.column_names[pos] for _i, pos, _a, _v in partes],
+            "access": "+".join(dict.fromkeys(a for _i, _p, a, _v in partes)),
+            "matches": mascara.count(),
+            "heap_pages": mascara.page_count(),
+        })
+
+        # Una mascara vacia ya dice que no hay filas que traer: ni se toca
+        # el heap. El nodo del plan queda igual, para que se vea que la
+        # consulta se resolvio con el indice y no barriendo la tabla.
+        for rid in mascara.rids():
+            registro = tabla.data_file.fetch(rid)
+            if registro is None:
+                continue
+            registro = list(registro)
+            if condicion is None or self._evaluar(condicion, registro, resolver):
+                yield registro
+
     def _plan_indice(self, tabla, condicion, resolver):
         """Busca un predicado del WHERE que un indice B+ pueda servir.
 
@@ -421,15 +601,18 @@ class ExecuteVisitor(Visitor):
 
         Si la columna tiene varios indices secundarios se prefiere el B+
         (responde busquedas por punto Y por rango); el hash se usa como
-        alternativa cuando es el unico indice postulante.
+        alternativa cuando es el unico indice postulante. Los de bitmap se
+        dejan fuera: los maneja `_plan_bitmap`, que sabe combinar sus
+        mascaras entre si.
         """
         if tabla.clustered_index is not None and pos == tabla.key_index:
             return ("clustered", tabla.clustered_index)
-        secundarios = tabla.secondary_indexes.get(pos)
+        secundarios = [idx for idx in tabla.secondary_indexes.get(pos, [])
+                       if not isinstance(idx, BitmapIndex)]
+        for idx in secundarios:
+            if not isinstance(idx, HashIndex):
+                return ("unclustered", idx)
         if secundarios:
-            for idx in secundarios:
-                if not isinstance(idx, HashIndex):
-                    return ("unclustered", idx)
             return ("hash", secundarios[0])
         return None
 
@@ -685,7 +868,8 @@ class ExecuteVisitor(Visitor):
     def _indice_para_order_by(self, tabla, colref):
         """
         Busca un índice B+ que permita recorrer la columna del ORDER BY de manera ordenada 
-        (y no índices hash, ya que estos no mantienen el orden).
+        (y no índices hash, ya que estos no mantienen el orden, ni de bitmap,
+        que no tienen orden de clave).
         Retorna ("clustered" / "unclustered", indice, posicion) o None.
         """
         try:
@@ -696,11 +880,9 @@ class ExecuteVisitor(Visitor):
         if tabla.clustered_index is not None and pos == tabla.key_index:
             return ("clustered", tabla.clustered_index, pos)
         
-        secundarios = tabla.secondary_indexes.get(pos)
-        if secundarios:
-            for indice in secundarios:
-                if not isinstance(indice, HashIndex):
-                    return ("unclustered", indice, pos)
+        for indice in tabla.secondary_indexes.get(pos, []):
+            if not isinstance(indice, (HashIndex, BitmapIndex)):
+                return ("unclustered", indice, pos)
         return None
 
     def _scan_ordenado_por_indice(self, tabla, condicion, resolver, colref, reverse=False):
