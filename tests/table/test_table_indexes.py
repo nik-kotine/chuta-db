@@ -15,7 +15,7 @@ BUFFER_FRAMES = 50
 def limpiar():
     archivos = [
         "empleados_heap.dat", "empleados_seq.dat",
-        "idx_emp_edad.idx", "idx_emp_pk.idx"
+        "idx_emp_edad_unclustered.idx", "idx_emp_pk_clustered.idx"
     ]
     for f in archivos:
         if os.path.exists(f):
@@ -35,7 +35,7 @@ def test_table_with_unclustered_index():
     with Table("empleados_heap", schema, bm, file_type="heap") as tabla:
         
         # Creamos un índice secundario (unclustered) para la columna 2 ("edad", que es entero)
-        idx_edad = BPlusTreeUnclustered("idx_emp_edad.idx", tabla.data_file, schema)
+        idx_edad = BPlusTreeUnclustered("idx_emp_edad_unclustered.idx", tabla.data_file, schema)
         tabla.attach_index(column_index=2, index_obj=idx_edad)
 
         # 1. Insertar registros (debe actualizar la tabla y el índice de edades automáticamente)
@@ -82,7 +82,7 @@ def test_table_with_clustered_index():
     with Table("empleados_seq", schema, bm, file_type="sequential", key_index=0) as tabla:
         
         # Envolvemos el archivo secuencial en un Árbol B+ Clustered (clave numérica en col 0)
-        idx_clustered = BPlusTreeClustered("idx_emp_pk.idx", tabla.data_file)
+        idx_clustered = BPlusTreeClustered("idx_emp_pk_clustered.idx", tabla.data_file)
         tabla.set_clustered_index(idx_clustered)
 
         # 1. Insertar a través del índice Clustered

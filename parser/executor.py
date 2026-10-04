@@ -386,11 +386,19 @@ class ExecuteVisitor(Visitor):
             )
 
         nombre = f"idx_{stm.tabla}_{stm.columna}"
-        if stm.tipo == IndexKind.BITMAP_IDX:
-            # El nombre base (idx_tabla_columna) es el del B+ y el del hash,
-            # asi que un bitmap sobre la misma columna necesita el suyo: es
-            # justamente el caso en que los tres conviven.
+        #if stm.tipo == IndexKind.BITMAP_IDX:
+        #    # El nombre base (idx_tabla_columna) es el del B+ y el del hash,
+        #    # asi que un bitmap sobre la misma columna necesita el suyo: es
+        #    # justamente el caso en que los tres conviven.
+        #    nombre = f"{nombre}_bitmap"
+        if stm.tipo == IndexKind.HASH_IDX:
+            nombre = f"{nombre}_hash"
+        elif stm.tipo == IndexKind.BITMAP_IDX:
             nombre = f"{nombre}_bitmap"
+        elif stm.clustered:
+            nombre = f"{nombre}_clustered"
+        else:
+            nombre = f"{nombre}_unclustered"
 
         # El sufijo va antes del log: el rollback de ddl_create_index hace
         # drop_index(payload["index_name"]), asi que el log tiene que llevar
