@@ -284,7 +284,15 @@ class ExecuteVisitor(Visitor):
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
 
         if self._tiene_agregados(stm):
-            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            #self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            columnas_agregacion = []
+            for item in stm.proyeccion:
+                if item.agg != AggFun.NONE_AGG:
+                    if item.agg == AggFun.COUNT_AGG:
+                        columnas_agregacion.append(tabla.column_names[tabla.key_index])
+                    else:
+                        columnas_agregacion.append(item.columna.columna)
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate", "column": columnas_agregacion})
             nombres, filas = self._proyeccion_agregada(
                 stm, filas, resolver, serializador
             )
@@ -571,7 +579,16 @@ class ExecuteVisitor(Visitor):
             })
 
         if self._tiene_agregados(interna):
-            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            #self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            columnas_agregacion = []
+            for item in interna.proyeccion:
+                if item.agg != AggFun.NONE_AGG:
+                    if item.agg == AggFun.COUNT_AGG:
+                        columnas_agregacion.append(tabla.column_names[tabla.key_index])
+                    else:
+                        columnas_agregacion.append(item.columna.columna)
+
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate", "column": columnas_agregacion})
 
     def _texto_filtro(self, interna) -> str:
         """Reconstruye el WHERE tal como lo muestra el plan de PostgreSQL."""
