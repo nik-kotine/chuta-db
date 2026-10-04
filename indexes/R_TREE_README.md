@@ -272,9 +272,6 @@ entrega separada:
 - Extensión del parser SQL (`WHERE distancia(...) < X`,
   `ORDER BY distancia(...) LIMIT k`) y el tipo de columna punto/geometría en
   el catálogo de tablas.
-- Comparación formal contra PostGIS/GiST — el benchmark de
-  `benchmark/spatial/` compara el R-Tree solo contra búsqueda secuencial en
-  Python, sin levantar un motor externo.
 - Variantes R+/R* — no implementadas, solo el R-Tree clásico.
 - `CondenseTree` aplana subárboles completos a nivel hoja en vez de
   reinsertar preservando altura (ver nota en la sección de borrado) —
@@ -290,5 +287,5 @@ python run_all_tests.py geometry r_tree
 python run_all_tests.py
 ```
 
-Benchmark de rendimiento (R-Tree vs búsqueda secuencial): ver
-`benchmark/spatial/README.md`.
+Benchmark de rendimiento (R-Tree vs búsqueda secuencial vs PostGIS/GiST):
+ver `benchmark/spatial/README.md`.
