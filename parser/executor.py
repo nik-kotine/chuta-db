@@ -145,7 +145,7 @@ class ExecuteVisitor(Visitor):
             )
             filas = self._filas_join(tabla, derecha, stm, resolver, serializador)
             if not self._tiene_agregados(stm) and stm.order_by is not None:
-                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if reverse else "ASC"})
+                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if stm.direccion == SortDir.DESC_DIR else "ASC"})
                 filas = self._ordenar_externo(
                     filas, resolver, stm.order_by,
                     stm.direccion == SortDir.DESC_DIR, serializador,
@@ -156,9 +156,8 @@ class ExecuteVisitor(Visitor):
             serializador = tabla.data_file.serializer
             if not self._tiene_agregados(stm) and stm.order_by is not None:
                 reverse = stm.direccion == SortDir.DESC_DIR
-                indice_order = self._indice_para_order_by(tabla, stm.order_by)
-                if indice_order is not None and not reverse: #TODO AÑADIR SOPORTE A DESC EN EL B+
-                    filas = self._scan_ordenado_por_indice(tabla, stm.condicion, resolver, stm.order_by)
+                if self._indice_para_order_by(tabla, stm.order_by) is not None:
+                    filas = self._scan_ordenado_por_indice(tabla, stm.condicion, resolver, stm.order_by, reverse)
                 else:
                     self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if reverse else "ASC"})
                     filas = self._select_ordenado(tabla, stm.condicion, resolver, stm.order_by, reverse)
@@ -707,12 +706,11 @@ class ExecuteVisitor(Visitor):
     def _scan_ordenado_por_indice(self, tabla, condicion, resolver, colref, reverse=False):
         """
         Recorre un indice B+ en el orden de sus claves y aplica el WHERE.
-        Actualmente solo se utiliza directamente para ASC. Para DESC se
-        puede seguir usando ExternalSort hasta disponer de enlaces hacia
+        El recorrido descendente es tan legitimo como el ascendente: se
+        desciende por los hijos de derecha a izquierda y dentro de cada hoja
+        se leen las entradas al reves, así que no hacen falta enlaces hacia
         atras en las hojas.
         """
-        if reverse:
-            raise ExecutionError("El recorrido descendente del indice no esta implementado") #TODO
         info = self._indice_para_order_by(tabla, colref)
 
         if info is None:
@@ -722,7 +720,7 @@ class ExecuteVisitor(Visitor):
 
         self.plan.append({"node": "INDEX SCAN", "table": tabla.name, "index": organizacion, "operation": "index_scan", 
             "column": tabla.column_names[posicion], "direction": "DESC" if reverse else "ASC"}) #tal vez "INDEX ORDERED SCAN" o similar en node y operation
-        for _, ref in indice.iter_ordered(reverse=False):
+        for _, ref in indice.iter_ordered(reverse=reverse):
             registro = indice._fetch_record(ref)
 
             if registro is None:
