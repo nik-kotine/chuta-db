@@ -10,6 +10,7 @@ from parser import Parser
 from scanner import Scanner
 from storage.storage_manager import StorageManager
 from storage.file_manager import FileManager
+from storage.files.sequential_file import FILE_HEADER_SIZE
 from storage.log_manager import LogManager, LogRecordType
 
 
@@ -122,7 +123,7 @@ def test_recovery_redoes_committed_physical_page_change():
         try:
             wal_path = os.path.join(directory, "wal.log")
             filename = "physical.dat"
-            file_manager = FileManager(filename, 4096, 24)
+            file_manager = FileManager(filename, 4096, FILE_HEADER_SIZE)
             page = bytearray(4096)
             page[:3] = b"old"
             file_manager.allocate_page()
@@ -153,7 +154,7 @@ def test_recovery_redoes_committed_physical_page_change():
             log_manager.close()
 
             reopened = StorageManager(wal_path=wal_path)
-            physical = FileManager(filename, 4096, 24)
+            physical = FileManager(filename, 4096, FILE_HEADER_SIZE)
             assert physical.read_page(0)[:3] == b"new"
             physical.close()
             reopened.close()

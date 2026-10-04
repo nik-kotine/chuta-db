@@ -17,6 +17,7 @@ _UINT64_SIGN = 0x8000000000000000
 _UINT64_MASK = 0xFFFFFFFFFFFFFFFF
 
 _ENTRY_HEADER = ">II"
+_VALUE_HEADER = ">II"
 
 def _encode_int(value: int) -> bytes:
     payload = bytearray(struct.pack(_INT_FORMAT, value))
@@ -108,26 +109,25 @@ class ExternalSorter:
         return path
 
     @staticmethod
-    def _write_entry(archivo, key_bytes: bytes, value_bytes: bytes):
-        entry_len = 8 + len(key_bytes) + len(value_bytes)
+    def _write_entry(archivo, seq: int, key_bytes: bytes, value_bytes: bytes):
+        entry_len = 12 + len(key_bytes) + len(value_bytes)
         archivo.write(struct.pack(_ENTRY_HEADER, entry_len, len(key_bytes)))
         archivo.write(key_bytes)
-        archivo.write(struct.pack(">I", len(value_bytes)))
+        archivo.write(struct.pack(_VALUE_HEADER, len(value_bytes), seq))
         archivo.write(value_bytes)
 
     def _write_run(self, buffer) -> str:
-        buffer.sort(key=lambda item: item[0], reverse=self.reverse)
+        buffer.sort(key=lambda item: item[1], reverse=self.reverse)
         path = self._nuevo_run()
         self._run_paths.append(path)
         with open(path, "wb") as archivo:
-            for clave, value_bytes in buffer:
-                self._write_entry(archivo, encode_key(clave), value_bytes)
+            for seq, clave, value_bytes in buffer:
+                self._write_entry(archivo, seq, encode_key(clave), value_bytes)
         self.run_count += 1
         return path
 
     def _iter_run(self, path):
         with open(path, "rb") as archivo:
-            seq = 0
             while True:
                 cabecera = archivo.read(4)
                 if not cabecera:
@@ -138,11 +138,10 @@ class ExternalSorter:
                 key_len = struct.unpack_from(">I", entry, 0)[0]
                 key_bytes = entry[4:4 + key_len]
 
-                value_len = struct.unpack_from(">I", entry, 4 + key_len)[0]
-                value_bytes = entry[8 + key_len:8 + key_len + value_len]
+                value_len, seq = struct.unpack_from(_VALUE_HEADER, entry, 4 + key_len)
+                value_bytes = entry[12 + key_len:12 + key_len + value_len]
 
                 yield key_bytes, seq, value_bytes
-                seq += 1
 
     def _heap_key(self, key_bytes):
         return _ReverseKey(key_bytes) if self.reverse else key_bytes
@@ -188,28 +187,41 @@ class ExternalSorter:
             )
 
 
-    def sort(self, items):
+    def spill(self, items):
+        """Consume `items` por completo y devuelve un iterador perezoso ya ordenado.
+
+        A diferencia de `sort()`, aqui la lectura de la fuente termina antes de
+        que empiece el recorrido del resultado, asi que el consumidor puede
+        escribir sobre la misma estructura que esta leyendo sin corromperla.
+
+        Devuelve (clave, valor) en orden ascendente (o descendente si el
+        ExternalSorter fue creado con reverse=True). Los registros con claves
+        iguales conservan el orden en que llegaron, tanto en el camino de RAM
+        como cuando hay que mezclar runs.
+        """
         run_paths = []
         buffer = []
-        try:
-            for item in items:
-                buffer.append(item)
-                if len(buffer) >= self.budget:
-                    run_paths.append(self._write_run(buffer))
-                    buffer = []
-
-            if not run_paths:
-                if not buffer:
-                    return
-                buffer.sort(key=lambda item: item[0], reverse=self.reverse)
-                for item in buffer:
-                    yield item
-                return
-
-            if buffer:
+        for seq, (clave, value_bytes) in enumerate(items):
+            buffer.append((seq, clave, value_bytes))
+            if len(buffer) >= self.budget:
                 run_paths.append(self._write_run(buffer))
+                buffer = []
 
-            yield from self._merge(run_paths)
+        if not run_paths:
+            if not buffer:
+                return iter(())
+            buffer.sort(key=lambda item: item[1], reverse=self.reverse)
+            return iter([(clave, value_bytes) for _, clave, value_bytes in buffer])
+
+        if buffer:
+            run_paths.append(self._write_run(buffer))
+
+        return self._merge(run_paths)
+
+    def sort(self, items):
+        """Ordena `items` por pares (clave, valor) usando el camino de RAM o runs."""
+        try:
+            yield from self.spill(items)
         finally:
             self._drop_runs()
 

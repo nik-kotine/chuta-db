@@ -84,6 +84,37 @@ class FileManager:
         self.file_ptr.write(page)
         return page_id
 
+    def grow_to_page(self, page_id: int) -> int:
+        """
+        Extiende el archivo con paginas vacias (llenas de bytes nulos) hasta que
+        exista la pagina de indice fisico page_id y retorna cuantos indices fisicos
+        tiene el archivo en total.
+
+        A diferencia de `allocate_page()`, que siempre agrega al final, este metodo
+        completa el hueco que queda cuando las paginas reservadas no son contiguas.
+        Es idempotente: si la pagina ya existe no hace nada.
+        """
+        self.file_ptr.seek(0, 2)
+        file_size = self.file_ptr.tell()
+        if file_size < self.file_header_size:
+            self.file_ptr.write(b"\x00" * (self.file_header_size - file_size))
+            file_size = self.file_header_size
+        data_size = file_size - self.file_header_size
+
+        resto = data_size % self.page_size
+        pages = data_size // self.page_size
+        if resto:
+            # una pagina parcial desalinearia todos los offsets siguientes
+            self.file_ptr.write(b"\x00" * (self.page_size - resto))
+            pages += 1
+
+        page = b"\x00" * self.page_size
+        while pages <= page_id:
+            self._log_physical("allocation", pages, 0, b"", page)
+            self.file_ptr.write(page)
+            pages += 1
+        return pages
+
     def _log_physical(self, resource_type, page_id, offset, before, after):
         transaction_id = (
             type(self)._transaction_id_provider()
