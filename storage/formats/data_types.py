@@ -30,10 +30,28 @@ FIXED_DATA_TYPES = {
     "money": [">q", 8],
     "uuid": ["16s", 16],
     "name": ["64s", 64],
+    # Tipo espacial: par (x, y) de doble precision
+    "point": [">dd", 16],
 }
 
 STRING_DATA_TYPE_STARTS = ["bit", "char", "varchar"]
 STRING_DATA_TYPES = ["text", "bytea", "varbit", "json", "jsonb", "xml", "string", "str"]
+
+
+def field_value_count(fmt: str) -> int:
+    """
+    Cantidad de valores que ocupa un formato de campo.
+
+    Casi todos los tipos son un solo valor ("integer" -> 1, "varchar(20)"
+    -> 1), pero algunos empaquetan varios: "point" son dos dobles y
+    "interval" son tres enteros. Los serializadores necesitan este dato
+    para aplanar al escribir y reagrupar al leer.
+    """
+    clean = fmt.lstrip("><=@!")
+    if clean.endswith("s"):
+        return 1
+    fmt_str = ">" + clean
+    return len(struct.unpack(fmt_str, b"\x00" * struct.calcsize(fmt_str)))
 
 
 def return_format(primitive_type: str) -> list:

@@ -21,6 +21,7 @@ class DataType(Enum):
     BOOL_TYPE = auto()
     DATE_TYPE = auto()
     VARCHAR_TYPE = auto()
+    POINT_TYPE = auto()
 
 
 # Operadores relacionales soportados
@@ -95,6 +96,27 @@ class BoolValue(Value):
         return visitor.visit_bool_value(self)
 
 
+# Literal espacial POINT(x, y), con el orden de PostGIS:
+#   x = longitud  (eje horizontal, -180..180)
+#   y = latitud   (eje vertical,   -90..90)
+#
+# Es decir, Lima se escribe POINT(-77.0428, -12.0464) y NO al reves.
+# Es la misma convencion de PostGIS / GeoJSON / WKT: primero la
+# coordenada X. Se guarda como la tupla (x, y), que es exactamente lo
+# que el tipo "point" del motor espera y devuelve.
+class PointValue(Value):
+    def __init__(self, x, y):
+        self.x = float(x)    # longitud
+        self.y = float(y)    # latitud
+
+    @property
+    def value(self):
+        return (self.x, self.y)
+
+    def accept(self, visitor):
+        return visitor.visit_point_value(self)
+
+
 # -----------------------------
 # Referencia a columna: col o tabla.col
 # -----------------------------
@@ -106,6 +128,45 @@ class ColRef:
 
     def accept(self, visitor):
         return visitor.visit_col_ref(self)
+
+
+# Metricas de distancia soportadas
+class Metrica(Enum):
+    EUCLIDIANA = auto()   # plano; devuelve grados (como ST_Distance)
+    GEODESICA = auto()    # Haversine; devuelve metros (como ST_DistanceSphere)
+
+
+# -----------------------------
+# Expresion espacial: distancia(a, b)
+#
+# Cada operando es un ColRef (una columna de tipo point) o un PointValue
+# literal. Se puede usar como lado izquierdo de un predicado
+#   WHERE distancia(ubicacion, POINT(-12.04, -77.04)) < 5000
+# o como criterio de orden
+#   ORDER BY distancia(ubicacion, mi_ubicacion)
+# -----------------------------
+
+class DistanceExpr:
+    def __init__(self, izquierda, derecha, metrica=Metrica.EUCLIDIANA):
+        self.izquierda = izquierda
+        self.derecha = derecha
+        self.metrica = metrica
+
+    def nombre_funcion(self) -> str:
+        return ("distancia_geodesica"
+                if self.metrica == Metrica.GEODESICA else "distancia")
+
+    def etiqueta(self) -> str:
+        """Texto para mostrar en el plan de ejecucion y en las cabeceras."""
+        def lado(o):
+            if isinstance(o, PointValue):
+                return f"POINT({o.x}, {o.y})"
+            return o.columna if o.tabla == "" else f"{o.tabla}.{o.columna}"
+        return (f"{self.nombre_funcion()}"
+                f"({lado(self.izquierda)}, {lado(self.derecha)})")
+
+    def accept(self, visitor):
+        return visitor.visit_distance_expr(self)
 
 
 # -----------------------------
@@ -310,6 +371,29 @@ class TransactionStmt(Stmt):
 
     def accept(self, visitor):
         return visitor.visit_transaction_stmt(self)
+
+
+# DROP TABLE t [IF EXISTS]
+class DropTableStmt(Stmt):
+    def __init__(self, tabla="", if_exists=False):
+        self.tabla = tabla
+        self.if_exists = if_exists
+
+    def accept(self, visitor):
+        return visitor.visit_drop_table_stmt(self)
+
+
+# EXPLAIN [ANALYZE] <sentencia>
+#
+# analyze=False: solo muestra el plan, sin ejecutar.
+# analyze=True : ejecuta y agrega tiempos y filas reales, como en pgAdmin.
+class ExplainStmt(Stmt):
+    def __init__(self, sentencia, analyze=False):
+        self.sentencia = sentencia
+        self.analyze = analyze
+
+    def accept(self, visitor):
+        return visitor.visit_explain_stmt(self)
 
 
 # -----------------------------

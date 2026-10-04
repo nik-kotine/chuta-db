@@ -19,6 +19,7 @@ def a_mayusculas(s):
 PALABRAS_RESERVADAS = {
     # DDL
     "CREATE": Token.Type.CREATE,
+    "DROP": Token.Type.DROP,
     "TABLE": Token.Type.TABLE,
     "INDEX": Token.Type.INDEX,
     "ON": Token.Type.ON,
@@ -75,6 +76,16 @@ PALABRAS_RESERVADAS = {
     "FALSE": Token.Type.FALSE_KW,
 
     # Funciones de agregacion
+    # Consultas espaciales
+    "POINT": Token.Type.POINT,
+    "DISTANCIA": Token.Type.DISTANCIA,
+    "DISTANCIA_EUCLIDIANA": Token.Type.DISTANCIA_EUCLIDIANA,
+    "DISTANCIA_GEODESICA": Token.Type.DISTANCIA_GEODESICA,
+
+    # Plan de ejecucion
+    "EXPLAIN": Token.Type.EXPLAIN,
+    "ANALYZE": Token.Type.ANALYZE,
+
     "COUNT": Token.Type.COUNT,
     "SUM": Token.Type.SUM,
     "AVG": Token.Type.AVG,
@@ -190,7 +201,7 @@ class Scanner:
                 token = Token(Token.Type.STR, texto)
 
         # Operadores y signos de puntuacion
-        elif c in ",;().*=<>!":
+        elif c in ",;().*=<>!-":
             if c == ',':
                 token = Token(Token.Type.COMA, c)
             elif c == ';':
@@ -203,6 +214,8 @@ class Scanner:
                 token = Token(Token.Type.PUNTO, c)
             elif c == '*':
                 token = Token(Token.Type.STAR, c)
+            elif c == '-':
+                token = Token(Token.Type.MINUS, c)
             elif c == '=':
                 token = Token(Token.Type.EQ, c)
             elif c == '<':

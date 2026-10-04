@@ -1,6 +1,6 @@
 import struct
 from storage.rid import DELETED_SIZE, RID_SIZE
-from storage.formats.data_types import return_format
+from storage.formats.data_types import field_value_count, return_format
 from storage.formats.serializers.record_serializer import RecordSerializer
 
 class VariableLengthRecordSerializer(RecordSerializer):
@@ -26,8 +26,13 @@ class VariableLengthRecordSerializer(RecordSerializer):
                 output += struct.pack(fmt_str, val_bytes)
             else:
                 fmt_str = ">" + clean_fmt
-                output += struct.pack(fmt_str, params[index])
-                
+                value = params[index]
+                if field_value_count(fmt) > 1:
+                    # campo multi-valor ("point"): se aplana en sus componentes
+                    output += struct.pack(fmt_str, *value)
+                else:
+                    output += struct.pack(fmt_str, value)
+
         return bytes(output)
 
     def deserialize(self, data: bytes):
@@ -52,11 +57,14 @@ class VariableLengthRecordSerializer(RecordSerializer):
             else:
                 record_size = size
                 fmt_str = ">" + clean_fmt
-                record_value = struct.unpack(
+                valores = struct.unpack(
                     fmt_str,
                     data[unpacking_index:unpacking_index + record_size],
-                )[0]
-                output.append(record_value)
+                )
+                if field_value_count(fmt) > 1:
+                    output.append(tuple(valores))   # campo multi-valor
+                else:
+                    output.append(valores[0])
                 unpacking_index += record_size
 
         return output

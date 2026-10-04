@@ -7,6 +7,7 @@ class Token:
     class Type(Enum):
         # Palabras reservadas: DDL
         CREATE = auto()
+        DROP = auto()
         TABLE = auto()
         INDEX = auto()
         ON = auto()
@@ -63,6 +64,16 @@ class Token:
         FALSE_KW = auto()
 
         # Funciones de agregacion
+        # Consultas espaciales
+        POINT = auto()
+        DISTANCIA = auto()
+        DISTANCIA_EUCLIDIANA = auto()
+        DISTANCIA_GEODESICA = auto()
+
+        # Plan de ejecucion
+        EXPLAIN = auto()
+        ANALYZE = auto()
+
         COUNT = auto()
         SUM = auto()
         AVG = auto()
@@ -78,6 +89,7 @@ class Token:
         GE = auto()       # >=
 
         # Signos de puntuacion
+        MINUS = auto()    # - (signo de un literal numerico)
         LPAREN = auto()   # (
         RPAREN = auto()   # )
         COMA = auto()     # ,

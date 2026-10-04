@@ -1,11 +1,12 @@
 from token_sql import Token
 from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, ColRef,
                      ColumnDec, CompareCond, CreateIndexStmt,
-                     CreateTableStmt, DataType, DeleteStmt, FileOrg,
+                     CreateTableStmt, DataType, DeleteStmt, DistanceExpr,
+                     DropTableStmt, ExplainStmt, FileOrg,
                      FloatValue, IndexKind, InsertStmt, IntValue,
-                     JoinClause, OrCond, Programa, RelOp, SelectItem,
-                     SelectStmt, SortDir, StrValue, TransactionStmt,
-                     UpdateStmt)
+                     JoinClause, Metrica, OrCond, PointValue, Programa, RelOp,
+                     SelectItem, SelectStmt, SortDir, StrValue,
+                     TransactionStmt, UpdateStmt)
 
 
 # En C++ esto era un runtime_error con la posicion pegada al mensaje.
@@ -95,10 +96,15 @@ class Parser:
             p.slist.append(self.parse_stmt())
         return p
 
-    # Stmt ::= CreateTable | CreateIndex | Select | Insert | Delete | Update | Transaction
+    # Stmt ::= CreateTable | CreateIndex | DropTable | Select | Insert
+    #        | Delete | Update | Transaction | Explain
     def parse_stmt(self):
         if self.check(Token.Type.CREATE):
             return self.parse_create()
+        elif self.check(Token.Type.DROP):
+            return self.parse_drop()
+        elif self.check(Token.Type.EXPLAIN):
+            return self.parse_explain()
         elif self.check(Token.Type.SELECT):
             return self.parse_select()
         elif self.check(Token.Type.INSERT):
@@ -168,6 +174,8 @@ class Parser:
             cd.tipo = DataType.BOOL_TYPE
         elif self.match(Token.Type.DATE):
             cd.tipo = DataType.DATE_TYPE
+        elif self.match(Token.Type.POINT):
+            cd.tipo = DataType.POINT_TYPE
         elif self.match(Token.Type.VARCHAR):
             cd.tipo = DataType.VARCHAR_TYPE
             if not self.match(Token.Type.LPAREN):
@@ -229,6 +237,28 @@ class Parser:
             self.error_semantico("un indice BITMAP no puede ser CLUSTERED")
         return ci
 
+    # DropTable ::= DROP TABLE id
+    def parse_drop(self):
+        self.match(Token.Type.DROP)
+        if not self.match(Token.Type.TABLE):
+            self.error("se esperaba TABLE despues de DROP")
+
+        d = DropTableStmt()
+        if not self.match(Token.Type.ID):
+            self.error("se esperaba el nombre de la tabla")
+        d.tabla = self.previous.text
+        return d
+
+    # Explain ::= EXPLAIN [ANALYZE] Stmt
+    def parse_explain(self):
+        self.match(Token.Type.EXPLAIN)
+        analyze = self.match(Token.Type.ANALYZE)
+
+        if self.check(Token.Type.EXPLAIN):
+            self.error("EXPLAIN no se puede anidar")
+        sentencia = self.parse_stmt()
+        return ExplainStmt(sentencia, analyze)
+
     # Select ::= SELECT SelList FROM id [Join] [Where] [GroupBy] [OrderBy] [Limit]
     def parse_select(self):
         self.match(Token.Type.SELECT)
@@ -262,7 +292,7 @@ class Parser:
         if self.match(Token.Type.ORDER):
             if not self.match(Token.Type.BY):
                 self.error("se esperaba BY")
-            s.order_by = self.parse_col_ref()
+            s.order_by = self.parse_order_expr()
             if self.match(Token.Type.ASC):
                 s.direccion = SortDir.ASC_DIR
             elif self.match(Token.Type.DESC):
@@ -429,13 +459,20 @@ class Parser:
             a.condiciones.append(self.parse_pred())
         return a
 
-    # Pred ::= ColRef RelOp Value | ColRef BETWEEN Value AND Value | ( Cond )
+    # Pred ::= Operando RelOp Value | ColRef BETWEEN Value AND Value | ( Cond )
+    # Operando ::= ColRef | Distancia
     def parse_pred(self):
         if self.match(Token.Type.LPAREN):
             c = self.parse_cond()
             if not self.match(Token.Type.RPAREN):
                 self.error("se esperaba )")
             return c
+
+        # Predicado espacial: distancia(a, b) <op> valor
+        if self._es_distancia():
+            expr = self.parse_distancia()
+            op = self.parse_rel_op()
+            return CompareCond(expr, op, self.parse_value())
 
         col = self.parse_col_ref()
 
@@ -446,22 +483,92 @@ class Parser:
             sup = self.parse_value()
             return BetweenCond(col, inf, sup)
 
-        if self.match(Token.Type.EQ):
-            op = RelOp.EQ_OP
-        elif self.match(Token.Type.NEQ):
-            op = RelOp.NEQ_OP
-        elif self.match(Token.Type.LT):
-            op = RelOp.LT_OP
-        elif self.match(Token.Type.LE):
-            op = RelOp.LE_OP
-        elif self.match(Token.Type.GT):
-            op = RelOp.GT_OP
-        elif self.match(Token.Type.GE):
-            op = RelOp.GE_OP
-        else:
-            self.error("se esperaba un operador relacional o BETWEEN")
+        op = self.parse_rel_op()
         v = self.parse_value()
         return CompareCond(col, op, v)
+
+    # RelOp ::= = | != | < | <= | > | >=
+    def parse_rel_op(self):
+        if self.match(Token.Type.EQ):
+            return RelOp.EQ_OP
+        if self.match(Token.Type.NEQ):
+            return RelOp.NEQ_OP
+        if self.match(Token.Type.LT):
+            return RelOp.LT_OP
+        if self.match(Token.Type.LE):
+            return RelOp.LE_OP
+        if self.match(Token.Type.GT):
+            return RelOp.GT_OP
+        if self.match(Token.Type.GE):
+            return RelOp.GE_OP
+        self.error("se esperaba un operador relacional o BETWEEN")
+
+    def _es_distancia(self) -> bool:
+        return (self.check(Token.Type.DISTANCIA)
+                or self.check(Token.Type.DISTANCIA_EUCLIDIANA)
+                or self.check(Token.Type.DISTANCIA_GEODESICA))
+
+    # Distancia ::= (DISTANCIA | DISTANCIA_EUCLIDIANA | DISTANCIA_GEODESICA)
+    #               ( Operando , Operando )
+    # Operando  ::= Point | ColRef
+    #
+    # distancia / distancia_euclidiana -> distancia plana, en grados
+    # distancia_geodesica              -> Haversine, en metros
+    def parse_distancia(self):
+        if self.match(Token.Type.DISTANCIA_GEODESICA):
+            metrica = Metrica.GEODESICA
+        elif (self.match(Token.Type.DISTANCIA)
+              or self.match(Token.Type.DISTANCIA_EUCLIDIANA)):
+            metrica = Metrica.EUCLIDIANA
+        else:
+            self.error("se esperaba una funcion de distancia")
+
+        nombre = self.previous.text
+        if not self.match(Token.Type.LPAREN):
+            self.error(f"se esperaba ( despues de {nombre}")
+        izquierda = self.parse_operando_espacial()
+        if not self.match(Token.Type.COMA):
+            self.error(f"{nombre} espera dos argumentos separados por ,")
+        derecha = self.parse_operando_espacial()
+        if not self.match(Token.Type.RPAREN):
+            self.error(f"se esperaba ) al cerrar {nombre}")
+        return DistanceExpr(izquierda, derecha, metrica)
+
+    def parse_operando_espacial(self):
+        if self.check(Token.Type.POINT):
+            return self.parse_point()
+        return self.parse_col_ref()
+
+    # Point ::= POINT ( longitud , latitud )
+    #
+    # Orden de PostGIS: primero X (longitud), despues Y (latitud).
+    # Lima -> POINT(-77.0428, -12.0464)
+    def parse_point(self):
+        self.match(Token.Type.POINT)
+        if not self.match(Token.Type.LPAREN):
+            self.error("se esperaba ( despues de POINT")
+        x = self.parse_numero()          # longitud
+        if not self.match(Token.Type.COMA):
+            self.error("POINT espera dos coordenadas separadas por , "
+                       "(longitud, latitud)")
+        y = self.parse_numero()          # latitud
+        if not self.match(Token.Type.RPAREN):
+            self.error("se esperaba ) al cerrar POINT")
+        return PointValue(x, y)
+
+    # Numero ::= [-] num
+    def parse_numero(self) -> float:
+        negativo = self.match(Token.Type.MINUS)
+        if not self.match(Token.Type.NUM):
+            self.error("se esperaba un numero")
+        valor = float(self.previous.text)
+        return -valor if negativo else valor
+
+    # OrderExpr ::= Distancia | ColRef
+    def parse_order_expr(self):
+        if self._es_distancia():
+            return self.parse_distancia()
+        return self.parse_col_ref()
 
     # ColRef ::= id | id . id
     def parse_col_ref(self):
@@ -479,8 +586,20 @@ class Parser:
             c.columna = primero
         return c
 
-    # Value ::= num | str | TRUE | FALSE
+    # Value ::= [-] num | str | TRUE | FALSE | Point
     def parse_value(self):
+        if self.check(Token.Type.POINT):
+            return self.parse_point()
+
+        if self.check(Token.Type.MINUS):
+            self.match(Token.Type.MINUS)
+            if not self.match(Token.Type.NUM):
+                self.error("se esperaba un numero despues del signo -")
+            texto = self.previous.text
+            if texto.find('.') != -1:
+                return FloatValue(-float(texto))
+            return IntValue(-int(texto))
+
         if self.match(Token.Type.NUM):
             texto = self.previous.text
             if texto.find('.') != -1:

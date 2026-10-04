@@ -15,6 +15,8 @@ Resuelve las tres traducciones que faltaban:
 import sys
 import os
 import json
+import math
+import time
 from contextlib import contextmanager
 
 # Los modulos del parser usan imports absolutos y tambien se ejecutan como
@@ -23,10 +25,24 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from itertools import islice
-from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, CompareCond,
-                     DataType, FileOrg, FloatValue, IndexKind, IntValue,
-                     OrCond, RelOp, SortDir, StrValue)
+from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, ColRef, Cond,
+                     CompareCond, DataType, DistanceExpr, FileOrg,
+                     FloatValue, IndexKind, IntValue, Metrica, OrCond,
+                     PointValue,
+                     RelOp, SortDir, StrValue)
+from ast_sql import SelectStmt
 from visitor import Visitor
+import explain as explain_fmt
+
+# Nodo que muestra EXPLAIN para las sentencias que no son SELECT
+_NODO_DML = {
+    "InsertStmt": "Insert",
+    "UpdateStmt": "Update",
+    "DeleteStmt": "Delete",
+    "CreateTableStmt": "Create Table",
+    "CreateIndexStmt": "Create Index",
+    "DropTableStmt": "Drop Table",
+}
 from storage.storage_manager import StorageManager
 from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
@@ -48,6 +64,7 @@ TIPOS = {
     DataType.FLOAT_TYPE: "float",
     DataType.BOOL_TYPE: "boolean",
     DataType.DATE_TYPE: "date",
+    DataType.POINT_TYPE: "point",
 }
 
 def tipo_a_str(columna) -> str:
@@ -85,11 +102,68 @@ class Resultado:
         return "\n".join(lineas)
 
 
+PAGE_SIZE_ESTIMADO = 4096
+
+# Radio medio de la Tierra en metros. Es el mismo valor que usa
+# ST_DistanceSphere de PostGIS.
+RADIO_TIERRA_M = 6371008.8
+
+
+def _haversine(lon1, lat1, lon2, lat2) -> float:
+    """
+    Distancia geodesica en metros entre dos puntos (longitud, latitud)
+    en grados, sobre una esfera.
+
+    Se usa Haversine y no la ley de cosenos esferica porque esta ultima
+    pierde precision en distancias cortas, que es justo el caso de una
+    consulta "tiendas a menos de 5 km".
+    """
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
+    return 2 * RADIO_TIERRA_M * math.asin(math.sqrt(a))
+
+
+def _ancho_estimado(tipo: str) -> int:
+    """Ancho aproximado de una columna, para el 'width' del plan."""
+    try:
+        from storage.formats.data_types import return_format
+        _fmt, size = return_format(tipo)
+        return size if size > 0 else 24
+    except Exception:
+        return 24
+
+
+class _MedicionNodo:
+    """Contadores de un nodo del plan durante EXPLAIN ANALYZE."""
+
+    def __init__(self, entrada):
+        self.entrada = entrada
+        self.filas = 0
+        self.descartadas = 0
+        self.t_primera = None
+
+    def emitida(self):
+        if self.t_primera is None:
+            self.t_primera = time.perf_counter()
+        self.filas += 1
+
+    def descartada(self):
+        self.descartadas += 1
+
+
 class ExecuteVisitor(Visitor):
     """Ejecuta un AST del parser contra el StorageManager."""
 
     def __init__(self, storage_manager: StorageManager):
         self.sm = storage_manager
+        self._t0 = time.perf_counter()
+        self._planning_ms = 0.0
+        self._promovidos = []
         self.resultado = None
         self.plan = []
         self.transaction_id = None
@@ -99,6 +173,8 @@ class ExecuteVisitor(Visitor):
         salidas = []
         for stmt in programa.slist:
             self.plan = []
+            self._planning_ms = 0.0
+            self._t0 = time.perf_counter()
             try:
                 stmt.accept(self)
             except Exception:
@@ -152,6 +228,17 @@ class ExecuteVisitor(Visitor):
                     f"se dieron {len(valores)}"
                 )
 
+            # Un POINT tiene que llegar como par (x, y). Sin este chequeo
+            # el error sale desde el serializador como un struct.error.
+            for pos, (tipo, valor) in enumerate(zip(tabla.schema, valores)):
+                if tipo == "point" and (
+                    not isinstance(valor, (tuple, list)) or len(valor) != 2
+                ):
+                    raise ExecutionError(
+                        f"La columna '{tabla.column_names[pos]}' es POINT y "
+                        f"espera POINT(x, y); se recibio {valor!r}"
+                    )
+
             tabla.insert(valores, mutation_logger=self._mutation_logger())
         self.resultado = Resultado("1 fila insertada")
 
@@ -177,7 +264,7 @@ class ExecuteVisitor(Visitor):
             )
             filas = self._filas_join(tabla, derecha, stm, resolver, serializador)
             if not self._tiene_agregados(stm) and stm.order_by is not None:
-                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if stm.direccion == SortDir.DESC_DIR else "ASC"})
+                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": self._etiqueta_orden(stm.order_by), "direction": "DESC" if stm.direccion == SortDir.DESC_DIR else "ASC"})
                 filas = self._ordenar_externo(
                     filas, resolver, stm.order_by,
                     stm.direccion == SortDir.DESC_DIR, serializador,
@@ -191,7 +278,7 @@ class ExecuteVisitor(Visitor):
                 if self._indice_para_order_by(tabla, stm.order_by) is not None:
                     filas = self._scan_ordenado_por_indice(tabla, stm.condicion, resolver, stm.order_by, reverse)
                 else:
-                    self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if reverse else "ASC"})
+                    self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": self._etiqueta_orden(stm.order_by), "direction": "DESC" if reverse else "ASC"})
                     filas = self._select_ordenado(tabla, stm.condicion, resolver, stm.order_by, reverse)
             else:
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
@@ -203,7 +290,7 @@ class ExecuteVisitor(Visitor):
             )
             if stm.order_by is not None:
                 filas = self._ordenar_resultado(
-                    filas, nombres, stm.order_by.columna,
+                    filas, nombres, self._etiqueta_orden(stm.order_by),
                     stm.direccion == SortDir.DESC_DIR,
                 )
             if stm.haylimite:
@@ -347,6 +434,184 @@ class ExecuteVisitor(Visitor):
             f"Indice {tipo_nombre} {org} '{nombre}' creado sobre {stm.tabla}({stm.columna})"
         )
 
+    def visit_explain_stmt(self, stm):
+        """
+        EXPLAIN [ANALYZE] <sentencia>, con la misma salida que pgAdmin.
+
+        Sin ANALYZE solo se planifica: se calcula el plan (que indice se
+        usaria, si hace falta ordenar) sin tocar las filas. Con ANALYZE
+        se ejecuta de verdad y se agregan las filas y los tiempos reales,
+        igual que en PostgreSQL.
+        """
+        interna = stm.sentencia
+
+        t_plan = time.perf_counter()
+        self.plan = []
+        self._t0 = time.perf_counter()
+
+        es_select = isinstance(interna, SelectStmt)
+        filtro = self._texto_filtro(interna) if es_select else ""
+        limite = (
+            interna.limite
+            if es_select and getattr(interna, "haylimite", False)
+            else None
+        )
+        nombre_tabla = getattr(interna, "tabla", None) if es_select else None
+
+        if stm.analyze:
+            interna.accept(self)
+            resultado_interno = self.resultado
+            if not es_select:
+                # Las sentencias DML no registran nodo de acceso: se
+                # agrega aca para que el plan muestre la operacion.
+                self.plan.append({
+                    "node": _NODO_DML.get(type(interna).__name__, "Result"),
+                    "table": getattr(interna, "tabla", "?"),
+                    "operation": "dml",
+                })
+            ejecucion_ms = (time.perf_counter() - self._t0) * 1000.0
+            planificacion_ms = 0.0
+        else:
+            # Solo planificar: se arma el plan sin consumir el generador.
+            resultado_interno = None
+            ejecucion_ms = 0.0
+            self._planificar_sin_ejecutar(interna)
+            planificacion_ms = (time.perf_counter() - t_plan) * 1000.0
+
+        if stm.analyze:
+            # La planificacion ocurre dentro de la ejecucion (al elegir
+            # indice); se cronometra ahi y se descuenta del total, igual
+            # que PostgreSQL separa Planning Time de Execution Time.
+            planificacion_ms = self._planning_ms
+            ejecucion_ms = max(0.0, ejecucion_ms - planificacion_ms)
+
+        stats = self._estadisticas_tabla(nombre_tabla) if nombre_tabla else (0, 0, 0)
+        raiz = explain_fmt.construir(
+            self.plan, stats, filtro=filtro, limite=limite, total_ms=ejecucion_ms
+        )
+        lineas = explain_fmt.formatear(
+            raiz, stm.analyze, planificacion_ms, ejecucion_ms
+        )
+
+        self.resultado = Resultado(
+            columnas=["QUERY PLAN"],
+            filas=[[linea] for linea in lineas],
+            plan=self.plan,
+        )
+        self.resultado.explain = "\n".join(lineas)
+        self.resultado.filas_reales = (
+            len(resultado_interno.filas) if resultado_interno is not None else None
+        )
+
+    def _planificar_sin_ejecutar(self, interna):
+        """
+        Decide el plan de una SELECT sin leer filas: abre la tabla,
+        consulta que indices hay y deja la entrada correspondiente en
+        self.plan. Es lo que hace EXPLAIN sin ANALYZE.
+        """
+        # EXPLAIN tambien acepta INSERT/UPDATE/DELETE/DDL; ahi no hay
+        # plan de acceso que elegir, solo el nodo de la operacion.
+        if not isinstance(interna, SelectStmt):
+            self.plan.append({
+                "node": _NODO_DML.get(type(interna).__name__, "Result"),
+                "table": getattr(interna, "tabla", "?"),
+                "operation": "dml",
+            })
+            return
+
+        nombre = getattr(interna, "tabla", None)
+        if nombre is None:
+            return
+        tabla = self._abrir(nombre)
+        resolver = self._resolver_columnas([(nombre, tabla)])
+        condicion = getattr(interna, "condicion", None)
+
+        self.plan.append({"node": "SELECT", "table": nombre, "operation": "project"})
+
+        _t_plan = time.perf_counter()
+        plan_bitmap = self._plan_bitmap(tabla, condicion, resolver)
+        self._planning_ms += (time.perf_counter() - _t_plan) * 1000.0
+        if plan_bitmap is not None:
+            mascara, partes = plan_bitmap
+            self.plan.append({
+                "node": "BITMAP INDEX SCAN", "table": nombre,
+                "operation": "bitmap_index_scan",
+                "columns": [tabla.column_names[pos] for _i, pos, _a, _v in partes],
+                "matches": mascara.count(),
+            })
+        else:
+            plan_indice = self._plan_indice(tabla, condicion, resolver)
+            if plan_indice is None:
+                self.plan.append({
+                    "node": "SEQUENTIAL SCAN", "table": nombre, "operation": "scan",
+                })
+            else:
+                tipo, (organizacion, _indice), posicion, valores = plan_indice
+                self.plan.append({
+                    "node": "INDEX SCAN", "table": nombre, "index": organizacion,
+                    "access": tipo.lower(), "operation": "index_scan",
+                    "column": tabla.column_names[posicion],
+                    "bounded": tipo == "RANGO" and all(v is not None for v in valores),
+                })
+
+        order_by = getattr(interna, "order_by", None)
+        if order_by is not None and self._indice_para_order_by(tabla, order_by) is None:
+            self.plan.append({
+                "node": "EXTERNAL SORT", "operation": "sort",
+                "column": self._etiqueta_orden(order_by),
+                "direction": "DESC" if interna.direccion == SortDir.DESC_DIR else "ASC",
+            })
+
+        if self._tiene_agregados(interna):
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+
+    def _texto_filtro(self, interna) -> str:
+        """Reconstruye el WHERE tal como lo muestra el plan de PostgreSQL."""
+        condicion = getattr(interna, "condicion", None)
+        if condicion is None:
+            return ""
+        return self._texto_condicion(condicion)
+
+    def _texto_condicion(self, cond) -> str:
+        if isinstance(cond, OrCond):
+            return " OR ".join(self._texto_condicion(c) for c in cond.condiciones)
+        if isinstance(cond, AndCond):
+            return " AND ".join(self._texto_condicion(c) for c in cond.condiciones)
+        if isinstance(cond, BetweenCond):
+            return (f"{self._texto_operando(cond.columna)} BETWEEN "
+                    f"{self._texto_valor(cond.inferior)} AND "
+                    f"{self._texto_valor(cond.superior)}")
+        if isinstance(cond, CompareCond):
+            return (f"{self._texto_operando(cond.columna)} "
+                    f"{Cond.relop_to_char(cond.op)} "
+                    f"{self._texto_valor(cond.valor)}")
+        return str(cond)
+
+    def _texto_operando(self, nodo) -> str:
+        if isinstance(nodo, DistanceExpr):
+            return nodo.etiqueta()
+        return nodo.columna if not nodo.tabla else f"{nodo.tabla}.{nodo.columna}"
+
+    def _texto_valor(self, nodo) -> str:
+        if isinstance(nodo, PointValue):
+            return f"POINT({nodo.x}, {nodo.y})"
+        if isinstance(nodo, StrValue):
+            return f"'{nodo.value}'"
+        if isinstance(nodo, BoolValue):
+            return "TRUE" if nodo.value else "FALSE"
+        return str(getattr(nodo, "value", nodo))
+
+    def visit_drop_table_stmt(self, stm):
+        """DROP TABLE: borra la metadata del catalogo y el archivo de datos."""
+        try:
+            self.sm.drop_table(stm.tabla)
+        except KeyError:
+            raise ExecutionError(f"La tabla '{stm.tabla}' no existe")
+        self.plan.append({
+            "node": "DROP TABLE", "table": stm.tabla, "operation": "drop",
+        })
+        self.resultado = Resultado(f"Tabla '{stm.tabla}' eliminada", plan=self.plan)
+
     def visit_transaction_stmt(self, stm):
         if stm.es_rollback:
             if self.transaction_id is None:
@@ -484,6 +749,12 @@ class ExecuteVisitor(Visitor):
         transaction_id = self.transaction_id or self.session_id
         explicit = self.transaction_id is not None
         acquired = []
+        # _promote_table_locks adquiere un segundo lock sobre el mismo
+        # recurso (UREAD -> EXCLUSIVE). Hay que soltar los dos: si solo
+        # se libera el primero, el EXCLUSIVE queda tomado y la siguiente
+        # sentencia que escriba esa tabla se cuelga hasta el timeout.
+        promovidos_previos = self._promovidos
+        self._promovidos = []
         try:
             for table_name in sorted(set(table_names)):
                 resource = ("table", table_name)
@@ -491,7 +762,11 @@ class ExecuteVisitor(Visitor):
                 acquired.append(resource)
             yield
         finally:
+            promovidos = self._promovidos
+            self._promovidos = promovidos_previos
             if not explicit:
+                for resource in reversed(promovidos):
+                    self.sm.lock_manager.release(resource, transaction_id)
                 for resource in reversed(acquired):
                     self.sm.lock_manager.release(resource, transaction_id)
 
@@ -503,6 +778,7 @@ class ExecuteVisitor(Visitor):
             self.sm.lock_manager.acquire(
                 resource, transaction_id, LockMode.EXCLUSIVE, timeout=5
             )
+            self._promovidos.append(resource)
 
     def _abrir(self, nombre):
         try:
@@ -580,7 +856,9 @@ class ExecuteVisitor(Visitor):
         las paginas del heap que esa mascara senala. Si no hay bitmap
         util, se sigue con el plan del B+/hash y, si tampoco, el
         barrido secuencial."""
+        _t_plan = time.perf_counter()
         plan_bitmap = self._plan_bitmap(tabla, condicion, resolver)
+        self._planning_ms += (time.perf_counter() - _t_plan) * 1000.0
         if plan_bitmap is not None:
             mascara, partes = plan_bitmap
             yield from self._scan_con_bitmap(
@@ -588,16 +866,23 @@ class ExecuteVisitor(Visitor):
             )
             return
 
+        _t_plan = time.perf_counter()
         plan = self._plan_indice(tabla, condicion, resolver)
+        self._planning_ms += (time.perf_counter() - _t_plan) * 1000.0
 
         if plan is None:
-            self.plan.append({"node": "SEQUENTIAL SCAN", "table": tabla.name, "operation": "scan"})
-            for _, registro in tabla.scan():
-                if condicion is None or self._evaluar(condicion, registro, resolver):
-                    yield registro
+            entrada = {"node": "SEQUENTIAL SCAN", "table": tabla.name, "operation": "scan"}
+            self.plan.append(entrada)
+            with self._medir(entrada) as medida:
+                for _, registro in tabla.scan():
+                    if condicion is None or self._evaluar(condicion, registro, resolver):
+                        medida.emitida()
+                        yield registro
+                    else:
+                        medida.descartada()
             return
 
-        tipo, (organizacion, indice), posicion, _ = plan
+        tipo, (organizacion, indice), posicion, valores = plan
         self.plan.append({
             "node": "INDEX SCAN",
             "table": tabla.name,
@@ -605,10 +890,16 @@ class ExecuteVisitor(Visitor):
             "access": tipo.lower(),
             "operation": "index_scan",
             "column": tabla.column_names[posicion],
+            # un rango cerrado (BETWEEN) filtra mucho mas que uno abierto
+            "bounded": tipo == "RANGO" and all(v is not None for v in valores),
         })
-        for registro in self._candidatos_con_indice(tabla, plan):
-            if condicion is None or self._evaluar(condicion, registro, resolver):
-                yield registro
+        with self._medir(self.plan[-1]) as medida:
+            for registro in self._candidatos_con_indice(tabla, plan):
+                if condicion is None or self._evaluar(condicion, registro, resolver):
+                    medida.emitida()
+                    yield registro
+                else:
+                    medida.descartada()
 
     # ---------------- indice de bitmap ----------------
 
@@ -667,6 +958,8 @@ class ExecuteVisitor(Visitor):
                 total = total.intersect(bit) if es_and else total.union(bit)
             return (total, self._predicados_de(partes))
 
+        if not isinstance(getattr(condicion, "columna", None), ColRef):
+            return None   # p.ej. distancia(...) < v: no lo sirve un bitmap
         try:
             pos = resolver(condicion.columna)
         except (ExecutionError, KeyError):
@@ -781,6 +1074,20 @@ class ExecuteVisitor(Visitor):
             if isinstance(cond, OrCond):
                 return None
 
+            # ---- PUNTO DE ENGANCHE DEL INDICE ESPACIAL (R-Tree) ----
+            # Hoy un predicado espacial cae a barrido secuencial: la
+            # distancia se calcula fila por fila. Cuando exista el R-Tree,
+            # aca va la rama que lo use, devolviendo un plan del estilo
+            #     ("ESPACIAL", (org, indice), pos, (punto, radio))
+            # y _candidatos_con_indice debe saber recorrerlo. Lo mismo
+            # para el KNN: hoy ORDER BY distancia(...) ordena todo
+            # (ver _clave_orden); con el arbol seria una busqueda por
+            # cercania sin leer toda la tabla.
+            if isinstance(getattr(cond, "columna", None), DistanceExpr):
+                return None
+
+            if not isinstance(getattr(cond, "columna", None), ColRef):
+                return None   # cualquier otra expresion tampoco la sirve un B+
             try:
                 pos = resolver(cond.columna)
             except (ExecutionError, KeyError):
@@ -887,11 +1194,11 @@ class ExecuteVisitor(Visitor):
         filas en memoria (un run se vuelca apenas supera el budget).
         """
         serializador = tabla.data_file.serializer
-        pos = resolver(colref)
+        clave = self._clave_orden(colref, resolver)
 
         def items():
             for registro in self._scan_filtrado(tabla, condicion, resolver):
-                yield registro[pos], serializador.encode(registro)
+                yield clave(registro), serializador.encode(registro)
 
         sorter = ExternalSorter(reverse=reverse, budget=EXTERNAL_SORT_BUDGET)
         try:
@@ -900,14 +1207,85 @@ class ExecuteVisitor(Visitor):
         finally:
             sorter.cleanup()
 
+    # ---------------- instrumentacion para EXPLAIN ANALYZE ----------------
+
+    @contextmanager
+    def _medir(self, entrada):
+        """
+        Acumula en la entrada del plan las filas emitidas, las descartadas
+        por el filtro y la ventana de tiempo del nodo.
+
+        Como los nodos son generadores perezosos, el cronometro arranca
+        cuando se pide la primera fila y se detiene cuando se agota el
+        generador, igual que el "actual time=inicio..fin" de PostgreSQL.
+        """
+        medida = _MedicionNodo(entrada)
+        entrada["actual_start_ms"] = (time.perf_counter() - self._t0) * 1000.0
+        try:
+            yield medida
+        finally:
+            entrada["actual_rows"] = medida.filas
+            entrada["rows_removed"] = medida.descartadas
+            entrada["actual_first_ms"] = (
+                (medida.t_primera - self._t0) * 1000.0
+                if medida.t_primera is not None
+                else entrada["actual_start_ms"]
+            )
+            entrada["actual_end_ms"] = (time.perf_counter() - self._t0) * 1000.0
+            entrada["loops"] = 1
+
+    def _estadisticas_tabla(self, nombre):
+        """
+        (paginas, filas estimadas, ancho de fila) de una tabla.
+
+        Son las estadisticas que alimentan el costo estimado del plan,
+        igual que pg_class.relpages / reltuples en PostgreSQL. Se deducen
+        del tamano del archivo para no tener que recorrerlo.
+        """
+        try:
+            tabla = self.sm.open_table(nombre)
+        except Exception:
+            return (0, 0, 0)
+
+        serializador = tabla.data_file.serializer
+        ancho = getattr(serializador, "record_size", None)
+        if not ancho:
+            ancho = max(1, sum(_ancho_estimado(tipo) for tipo in tabla.schema))
+
+        try:
+            tamano = os.path.getsize(tabla.filename)
+        except OSError:
+            tamano = 0
+        paginas = max(1, tamano // PAGE_SIZE_ESTIMADO)
+        por_pagina = max(1, PAGE_SIZE_ESTIMADO // max(1, ancho + 17))
+        return (paginas, paginas * por_pagina, ancho)
+
+    def _clave_orden(self, order_by, resolver):
+        """
+        Devuelve la funcion que extrae el valor de orden de un registro.
+
+        Para un ColRef es simplemente su posicion; para distancia(a, b)
+        hay que calcularla fila por fila.
+        """
+        if isinstance(order_by, DistanceExpr):
+            return lambda registro: self._distancia(order_by, registro, resolver)
+        pos = resolver(order_by)
+        return lambda registro: registro[pos]
+
+    def _etiqueta_orden(self, order_by) -> str:
+        """Nombre del criterio de orden, para mostrarlo en el plan."""
+        if isinstance(order_by, DistanceExpr):
+            return order_by.etiqueta()
+        return order_by.columna
+
     def _ordenar_externo(self, filas, resolver, colref, reverse, serializador):
         """Ordena un stream de registros combinados (p.ej. de un JOIN)
         con el sorter externo, usando `serializador` para persistirlos."""
-        pos = resolver(colref)
+        clave = self._clave_orden(colref, resolver)
 
         def items():
             for registro in filas:
-                yield registro[pos], serializador.encode(registro)
+                yield clave(registro), serializador.encode(registro)
 
         sorter = ExternalSorter(reverse=reverse, budget=EXTERNAL_SORT_BUDGET)
         try:
@@ -1054,12 +1432,59 @@ class ExecuteVisitor(Visitor):
         return sorted(filas, key=lambda fila: fila[pos], reverse=reverse)
 
     def _valor(self, nodo):
-        """
-        Extrae el valor Python de un nodo Value del parser.
-        """
+        """Extrae el valor Python de un nodo Value del parser."""
+        if isinstance(nodo, PointValue):
+            return nodo.value
         if isinstance(nodo, (IntValue, FloatValue, StrValue, BoolValue)):
             return nodo.value
         raise ExecutionError(f"Valor no soportado: {nodo}")
+
+    def _punto(self, operando, registro, resolver):
+        """
+        Obtiene el par (x, y) de un operando espacial: un POINT literal
+        o una columna de tipo point del registro.
+
+        El orden es el de PostGIS: x = longitud, y = latitud.
+        """
+        if isinstance(operando, PointValue):
+            return operando.value
+
+        valor = registro[resolver(operando)]
+        if not isinstance(valor, (tuple, list)) or len(valor) != 2:
+            raise ExecutionError(
+                f"La columna '{operando.columna}' no es de tipo POINT "
+                f"(contiene {valor!r})"
+            )
+        return valor
+
+    def _distancia(self, expr, registro, resolver) -> float:
+        """
+        Distancia entre los dos operandos, con la metrica que pidio la
+        consulta. Las coordenadas van en orden PostGIS (longitud, latitud).
+
+        distancia / distancia_euclidiana
+            Distancia plana entre las coordenadas, en GRADOS. Es lo que
+            hace ST_Distance de PostGIS sobre una geometria sin SRID
+            geografico: rapida, pero un grado de longitud no mide lo
+            mismo cerca del ecuador que cerca de los polos.
+
+        distancia_geodesica
+            Haversine sobre una esfera, en METROS. Equivale a
+            ST_DistanceSphere de PostGIS. Mas cara de calcular, pero es
+            la que sirve para un radio expresado en metros.
+        """
+        x1, y1 = self._punto(expr.izquierda, registro, resolver)
+        x2, y2 = self._punto(expr.derecha, registro, resolver)
+
+        if expr.metrica == Metrica.GEODESICA:
+            return _haversine(x1, y1, x2, y2)
+        return math.hypot(x1 - x2, y1 - y2)
+
+    def _operando(self, nodo, registro, resolver):
+        """Valor de un lado del predicado: distancia(...) o una columna."""
+        if isinstance(nodo, DistanceExpr):
+            return self._distancia(nodo, registro, resolver)
+        return registro[resolver(nodo)]
 
     def _evaluar(self, cond, registro, resolver) -> bool:
         """
@@ -1071,7 +1496,7 @@ class ExecuteVisitor(Visitor):
             return all(self._evaluar(c, registro, resolver) for c in cond.condiciones)
 
         if isinstance(cond, CompareCond):
-            izq = registro[resolver(cond.columna)]
+            izq = self._operando(cond.columna, registro, resolver)
             der = self._valor(cond.valor)
             if cond.op == RelOp.EQ_OP:
                 return izq == der
@@ -1099,6 +1524,8 @@ class ExecuteVisitor(Visitor):
         que no tienen orden de clave).
         Retorna ("clustered" / "unclustered", indice, posicion) o None.
         """
+        if not isinstance(colref, ColRef):
+            return None   # distancia(...) se calcula, ningun indice la ordena
         try:
             pos = tabla.column_index(colref.columna)
         except KeyError:

@@ -1,6 +1,6 @@
 import struct
 from storage.rid import DELETED_FORMAT, RID_FORMAT
-from storage.formats.data_types import return_format
+from storage.formats.data_types import field_value_count, return_format
 from storage.formats.serializers.record_serializer import RecordSerializer
 
 class FixedLengthRecordSerializer(RecordSerializer):
@@ -8,6 +8,10 @@ class FixedLengthRecordSerializer(RecordSerializer):
     def __init__(self, record_format: list[str]):
         super().__init__(record_format)
         self.field_formats = [return_format(t) for t in record_format]
+        # Cuantos valores ocupa cada campo: 1 para la mayoria, 2 para
+        # "point", 3 para "interval". Permite aplanar al empaquetar y
+        # reagrupar al desempaquetar.
+        self.field_counts = [field_value_count(fmt) for fmt, _ in self.field_formats]
         type_codes = []
         self.record_size = 0
         
@@ -38,9 +42,27 @@ class FixedLengthRecordSerializer(RecordSerializer):
         return value
 
     def _prepare(self, params) -> list:
+        """
+        Aplana los campos a la lista de valores que espera struct.pack.
+        Un campo multi-valor ("point") aporta sus componentes por separado.
+        """
         result = []
         for index, (fmt, _) in enumerate(self.field_formats):
-            result.append(self._prepare_field(fmt, params[index]))
+            value = params[index]
+            if self.field_counts[index] > 1:
+                if not isinstance(value, (tuple, list)):
+                    raise TypeError(
+                        f"el campo {index} ({self.record_format[index]}) espera "
+                        f"{self.field_counts[index]} valores, se recibio {value!r}"
+                    )
+                if len(value) != self.field_counts[index]:
+                    raise ValueError(
+                        f"el campo {index} ({self.record_format[index]}) espera "
+                        f"{self.field_counts[index]} valores, se recibieron {len(value)}"
+                    )
+                result.extend(value)
+            else:
+                result.append(self._prepare_field(fmt, value))
         return result
 
     def get_size_of(self, params) -> int:
@@ -65,7 +87,16 @@ class FixedLengthRecordSerializer(RecordSerializer):
         unpacked = struct.unpack(self.record_format_str, record_bytes)
 
         result = []
-        for (fmt, _), value in zip(self.field_formats, unpacked):
+        pos = 0
+        for (fmt, _), count in zip(self.field_formats, self.field_counts):
+            if count > 1:
+                # campo multi-valor: se devuelve como tupla
+                result.append(tuple(unpacked[pos:pos + count]))
+                pos += count
+                continue
+
+            value = unpacked[pos]
+            pos += 1
             if fmt[-1] == "s":
                 if isinstance(value, bytes):
                     result.append(value.decode("utf-8").rstrip("\x00"))

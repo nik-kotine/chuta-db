@@ -24,6 +24,12 @@ class Visitor:
     def visit_bool_value(self, v):
         raise NotImplementedError
 
+    def visit_point_value(self, v):
+        raise NotImplementedError
+
+    def visit_distance_expr(self, e):
+        raise NotImplementedError
+
     def visit_col_ref(self, c):
         raise NotImplementedError
 
@@ -69,6 +75,12 @@ class Visitor:
     def visit_transaction_stmt(self, stm):
         raise NotImplementedError
 
+    def visit_drop_table_stmt(self, stm):
+        raise NotImplementedError
+
+    def visit_explain_stmt(self, stm):
+        raise NotImplementedError
+
     def visit_programa(self, program):
         raise NotImplementedError
 
@@ -91,6 +103,16 @@ class PrintVisitor(Visitor):
 
     def visit_bool_value(self, v):
         print("TRUE" if v.value else "FALSE", end="")
+
+    def visit_point_value(self, v):
+        print(f"POINT({v.x}, {v.y})", end="")
+
+    def visit_distance_expr(self, e):
+        print("distancia(", end="")
+        e.izquierda.accept(self)
+        print(", ", end="")
+        e.derecha.accept(self)
+        print(")", end="")
 
     def visit_col_ref(self, c):
         if c.tabla != "":
@@ -263,6 +285,13 @@ class PrintVisitor(Visitor):
             print("ROLLBACK", end="")
         else:
             print("BEGIN TRANSACTION" if stm.es_begin else "END TRANSACTION", end="")
+
+    def visit_drop_table_stmt(self, stm):
+        print("DROP TABLE " + stm.tabla, end="")
+
+    def visit_explain_stmt(self, stm):
+        print("EXPLAIN " + ("ANALYZE " if stm.analyze else ""), end="")
+        stm.sentencia.accept(self)
 
     # -----------------------------
     # Programa
