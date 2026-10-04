@@ -78,6 +78,16 @@ class FileManager:
         """
         self.file_ptr.flush()
 
+    def force(self):
+        """Hace persistente el contenido del archivo en el dispositivo.
+
+        ``flush()`` solo entrega los bytes al sistema operativo. Esta
+        operación agrega ``fsync()`` y sera necesaria para respetar WAL antes
+        de confirmar una transaccion.
+        """
+        self.file_ptr.flush()
+        os.fsync(self.file_ptr.fileno())
+
     def truncate(self, size: int):
         """
         Trunca el archivo a tamaño exactamente size. Todo lo que esta despues es

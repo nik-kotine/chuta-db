@@ -246,7 +246,10 @@ class PrintVisitor(Visitor):
         stm.condicion.accept(self)
 
     def visit_transaction_stmt(self, stm):
-        print("BEGIN TRANSACTION" if stm.es_begin else "END TRANSACTION", end="")
+        if stm.es_rollback:
+            print("ROLLBACK", end="")
+        else:
+            print("BEGIN TRANSACTION" if stm.es_begin else "END TRANSACTION", end="")
 
     # -----------------------------
     # Programa

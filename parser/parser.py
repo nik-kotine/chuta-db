@@ -104,7 +104,11 @@ class Parser:
             return self.parse_insert()
         elif self.check(Token.Type.DELETE):
             return self.parse_delete()
-        elif self.check(Token.Type.BEGIN) or self.check(Token.Type.END_KW):
+        elif (
+            self.check(Token.Type.BEGIN)
+            or self.check(Token.Type.END_KW)
+            or self.check(Token.Type.ROLLBACK)
+        ):
             return self.parse_transaction()
         else:
             self.error("se esperaba una sentencia")
@@ -356,8 +360,10 @@ class Parser:
         d.condicion = self.parse_cond()
         return d
 
-    # Transaction ::= BEGIN TRANSACTION | END TRANSACTION
+    # Transaction ::= BEGIN TRANSACTION | END TRANSACTION | ROLLBACK
     def parse_transaction(self):
+        if self.match(Token.Type.ROLLBACK):
+            return TransactionStmt(es_rollback=True)
         if self.match(Token.Type.BEGIN):
             es_begin = True
         elif self.match(Token.Type.END_KW):

@@ -14,8 +14,13 @@ Resuelve las tres traducciones que faltaban:
 
 import sys
 import os
+import json
+from contextlib import contextmanager
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parser"))
+# Los modulos del parser usan imports absolutos y tambien se ejecutan como
+# paquete (`parser.executor`). En ambos casos, la carpeta de este archivo es
+# la que contiene `ast_sql.py`, `visitor.py` y el resto del front-end.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from itertools import islice
 from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, CompareCond,
@@ -26,9 +31,9 @@ from storage.storage_manager import StorageManager
 from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
 from indexes.extendible_hash import HashIndex
-from indexes.bitmap_index import Bitmap, BitmapIndex
+from indexes.bitmap_index import BitmapIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
-from indexes.b_tree_leaf_page import NULL_LEAF
+from storage.lock_manager import LockMode
 
 EXTERNAL_SORT_BUDGET = 1000
 EXTERNAL_HASH_BUCKETS = 16
@@ -86,12 +91,18 @@ class ExecuteVisitor(Visitor):
         self.sm = storage_manager
         self.resultado = None
         self.plan = []
+        self.transaction_id = None
+        self.session_id = self.sm.allocate_session_id()
 
     def ejecutar(self, programa) -> list:
         salidas = []
         for stmt in programa.slist:
             self.plan = []
-            stmt.accept(self)
+            try:
+                stmt.accept(self)
+            except Exception:
+                self._abort_active_transaction()
+                raise
             salidas.append(self.resultado)
         return salidas
 
@@ -119,19 +130,27 @@ class ExecuteVisitor(Visitor):
         )
 
     def visit_insert_stmt(self, stm):
-        tabla = self._abrir(stm.tabla)
-        valores = [self._valor(v) for v in stm.valores]
+        with self._table_locks([stm.tabla], LockMode.EXCLUSIVE):
+            tabla = self._abrir(stm.tabla)
+            valores = [self._valor(v) for v in stm.valores]
 
-        if len(valores) != len(tabla.schema):
-            raise ExecutionError(
-                f"La tabla '{stm.tabla}' espera {len(tabla.schema)} valores, "
-                f"se dieron {len(valores)}"
-            )
+            if len(valores) != len(tabla.schema):
+                raise ExecutionError(
+                    f"La tabla '{stm.tabla}' espera {len(tabla.schema)} valores, "
+                    f"se dieron {len(valores)}"
+                )
 
-        tabla.insert(valores)
+            tabla.insert(valores, mutation_logger=self._mutation_logger())
         self.resultado = Resultado("1 fila insertada")
 
     def visit_select_stmt(self, stm):
+        nombres_bloqueados = [stm.tabla]
+        if stm.join is not None:
+            nombres_bloqueados.append(stm.join.tabla)
+        with self._table_locks(nombres_bloqueados, LockMode.SHARED):
+            self._visit_select_locked(stm)
+
+    def _visit_select_locked(self, stm):
         tabla = self._abrir(stm.tabla)
         derecha = None
         self.plan = [{"node": "SELECT", "table": stm.tabla, "operation": "project"}]
@@ -164,7 +183,7 @@ class ExecuteVisitor(Visitor):
                     filas = self._select_ordenado(tabla, stm.condicion, resolver, stm.order_by, reverse)
             else:
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
-        
+
         if self._tiene_agregados(stm):
             self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
             nombres, filas = self._proyeccion_agregada(
@@ -196,14 +215,15 @@ class ExecuteVisitor(Visitor):
         self.resultado = Resultado(columnas=nombres, filas=filas, plan=self.plan)
 
     def visit_delete_stmt(self, stm):
-        tabla = self._abrir(stm.tabla)
-        resolver = self._resolver_columnas([(stm.tabla, tabla)])
+        with self._table_locks([stm.tabla], LockMode.EXCLUSIVE):
+            tabla = self._abrir(stm.tabla)
+            resolver = self._resolver_columnas([(stm.tabla, tabla)])
 
-        borrados = 0
-        for rid, registro in list(tabla.scan()):
-            if self._evaluar(stm.condicion, registro, resolver):
-                if tabla.delete(rid):
-                    borrados += 1
+            borrados = 0
+            for rid, registro in list(tabla.scan()):
+                if self._evaluar(stm.condicion, registro, resolver):
+                    if tabla.delete(rid, mutation_logger=self._mutation_logger()):
+                        borrados += 1
         self.resultado = Resultado(f"{borrados} fila(s) eliminada(s)")
 
     def visit_create_index_stmt(self, stm):
@@ -273,9 +293,105 @@ class ExecuteVisitor(Visitor):
         )
 
     def visit_transaction_stmt(self, stm):
-        self.resultado = Resultado(
-            "BEGIN TRANSACTION" if stm.es_begin else "END TRANSACTION"
-        )
+        if stm.es_rollback:
+            if self.transaction_id is None:
+                raise ExecutionError("ROLLBACK requiere una transaccion activa")
+            transaction_id = self.transaction_id
+            self.sm.transaction_manager.rollback(
+                transaction_id, self._undo_record
+            )
+            self.sm.lock_manager.release_all(transaction_id)
+            self.transaction_id = None
+            self.resultado = Resultado("ROLLBACK")
+            return
+
+        if stm.es_begin:
+            if self.transaction_id is not None:
+                raise ExecutionError("ya existe una transaccion activa")
+            transaction = self.sm.transaction_manager.begin()
+            self.transaction_id = transaction.transaction_id
+            self.resultado = Resultado("BEGIN TRANSACTION")
+            return
+
+        if self.transaction_id is None:
+            raise ExecutionError("END TRANSACTION requiere una transaccion activa")
+        transaction_id = self.transaction_id
+        self.sm.transaction_manager.commit(transaction_id)
+        self.sm.lock_manager.release_all(transaction_id)
+        self.transaction_id = None
+        self.resultado = Resultado("END TRANSACTION")
+
+    def _abort_active_transaction(self):
+        """Aborta y libera locks si una sentencia falla dentro de una tx."""
+        if self.transaction_id is None:
+            return
+        transaction_id = self.transaction_id
+        try:
+            self.sm.transaction_manager.abort(transaction_id, self._undo_record)
+        finally:
+            self.sm.lock_manager.release_all(transaction_id)
+            self.transaction_id = None
+
+    def _mutation_logger(self):
+        """Devuelve el hook WAL solo para transacciones explicitas."""
+        if self.transaction_id is None:
+            return None
+
+        def log_mutation(operation, table, values, rid):
+            payload = json.dumps(
+                {
+                    "values": values,
+                    "key": values[table.key_index],
+                    "rid": list(rid) if rid is not None else None,
+                },
+                default=str,
+            ).encode("utf-8")
+            before = payload if operation == "delete" else b""
+            after = payload if operation == "insert" else b""
+            self.sm.transaction_manager.log_update(
+                self.transaction_id,
+                operation=f"table_{operation}",
+                file_name=table.name,
+                resource_type="table_record",
+                before=before,
+                after=after,
+            )
+            # El hook corre justo antes de la mutacion fisica.
+            self.sm.log_manager.force()
+
+        return log_mutation
+
+    def _undo_record(self, record):
+        """Aplica undo logico y deja que Table actualice sus indices."""
+        payload_bytes = record.before or record.after
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        table = self._abrir(record.file_name)
+
+        if record.operation == "table_insert":
+            table.delete_by_key(payload["key"])
+        elif record.operation == "table_delete":
+            table.insert(payload["values"])
+        else:
+            raise ExecutionError(
+                f"no existe undo fisico para la operacion '{record.operation}'"
+            )
+
+    @contextmanager
+    def _table_locks(self, table_names, mode):
+        """Adquiere locks en orden estable y libera solo en autocommit."""
+        transaction_id = self.transaction_id or self.session_id
+        explicit = self.transaction_id is not None
+        acquired = []
+        try:
+            for table_name in sorted(set(table_names)):
+                resource = ("table", table_name)
+                self.sm.lock_manager.acquire(resource, transaction_id, mode, timeout=5)
+                acquired.append(resource)
+            yield
+        finally:
+            if not explicit:
+                for resource in reversed(acquired):
+                    self.sm.lock_manager.release(resource, transaction_id)
 
     def _abrir(self, nombre):
         try:
@@ -867,7 +983,7 @@ class ExecuteVisitor(Visitor):
 
     def _indice_para_order_by(self, tabla, colref):
         """
-        Busca un índice B+ que permita recorrer la columna del ORDER BY de manera ordenada 
+        Busca un índice B+ que permita recorrer la columna del ORDER BY de manera ordenada
         (y no índices hash, ya que estos no mantienen el orden, ni de bitmap,
         que no tienen orden de clave).
         Retorna ("clustered" / "unclustered", indice, posicion) o None.
@@ -876,10 +992,10 @@ class ExecuteVisitor(Visitor):
             pos = tabla.column_index(colref.columna)
         except KeyError:
             return None
-        
+
         if tabla.clustered_index is not None and pos == tabla.key_index:
             return ("clustered", tabla.clustered_index, pos)
-        
+
         for indice in tabla.secondary_indexes.get(pos, []):
             if not isinstance(indice, (HashIndex, BitmapIndex)):
                 return ("unclustered", indice, pos)
@@ -897,10 +1013,10 @@ class ExecuteVisitor(Visitor):
 
         if info is None:
             raise ExecutionError(f"No existe un indice B+ sobre '{colref.columna}'")
-            
+
         organizacion, indice, posicion = info
 
-        self.plan.append({"node": "INDEX SCAN", "table": tabla.name, "index": organizacion, "operation": "index_scan", 
+        self.plan.append({"node": "INDEX SCAN", "table": tabla.name, "index": organizacion, "operation": "index_scan",
             "column": tabla.column_names[posicion], "direction": "DESC" if reverse else "ASC"}) #tal vez "INDEX ORDERED SCAN" o similar en node y operation
         for _, ref in indice.iter_ordered(reverse=reverse):
             registro = indice._fetch_record(ref)
@@ -914,7 +1030,6 @@ class ExecuteVisitor(Visitor):
                 condicion, registro, resolver
             ):
                 yield registro
-
 
     def visit_int_value(self, v): pass
     def visit_float_value(self, v): pass
