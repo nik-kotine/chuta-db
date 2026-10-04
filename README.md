@@ -19,7 +19,9 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
   - `INSERT INTO tabla VALUES (...)`.
   - `DELETE FROM tabla WHERE ...` — el `WHERE` es **obligatorio**, para no borrar la tabla completa por accidente.
 - **Transacciones**
-  - `BEGIN TRANSACTION` / `END TRANSACTION`, aceptadas por el parser (todavía sin rollback/recovery).
+  - `BEGIN TRANSACTION`, `END TRANSACTION` y `ROLLBACK`.
+  - Undo lógico y recovery de `INSERT`, `DELETE` y `UPDATE` mediante WAL.
+  - Locks compartidos y exclusivos por tabla, con timeout y limpieza al finalizar.
 - **Detalles del lenguaje**
   - Palabras reservadas insensibles a mayúsculas (`select` = `SELECT`).
   - Comentarios de línea con `--`.
@@ -57,10 +59,10 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
 
 ### Lo que *no* está implementado (aún)
 
-- `UPDATE`, `DROP TABLE` / `DROP INDEX` desde SQL (existen internamente en el motor).
-- `ROLLBACK`/recovery de transacciones: `BEGIN`/`END TRANSACTION` solo se parsean.
+- `DROP TABLE` / `DROP INDEX` desde SQL (existen internamente en el motor).
+- Recovery físico completo: redo de páginas confirmadas, page LSN y restauración byte a byte de headers y asignaciones.
+- Detección formal de deadlocks y aislamiento serializable.
 - Joins de más de dos tablas, `HAVING`, subconsultas, `DISTINCT`.
-- Ningún grado de concurrencia ni bloqueos (el motor es de un solo proceso).
 
 ---
 
@@ -223,7 +225,48 @@ Borrado y "transacciones":
 DELETE FROM ventas WHERE id = 3;
 BEGIN TRANSACTION;
 END TRANSACTION;
+UPDATE ventas SET cliente = 'Ana María' WHERE id = 1;
+ROLLBACK;
 ```
+
+### Transacciones, concurrencia y alcance del recovery
+
+Una transacción explícita sigue el ciclo `BEGIN TRANSACTION` -> operaciones ->
+`END TRANSACTION` o `ROLLBACK`. El `TransactionManager` escribe `BEGIN`, las
+mutaciones y el resultado final en el WAL. El commit fuerza el log antes de
+marcar la transacción como confirmada y liberar sus locks.
+
+Las lecturas adquieren locks `SHARED` y las escrituras adquieren locks
+`EXCLUSIVE`. Los locks se conservan durante una transacción explícita y se
+liberan automáticamente en autocommit. Si una espera supera el timeout, la
+sentencia falla, la transacción se aborta y sus recursos se liberan.
+
+El rollback actual es lógico. El WAL conserva los valores necesarios para
+deshacer cada operación y el executor utiliza las APIs de `Table`, por lo que
+los índices secundarios se actualizan normalmente:
+
+- `INSERT`: se elimina la fila por su clave primaria.
+- `DELETE`: se reinserta la fila con sus valores originales.
+- `UPDATE`: se restaura la imagen anterior; cuando el tamaño cabe en el slot,
+  se conserva el RID original.
+- Las operaciones se deshacen en orden inverso y generan registros `CLR`.
+
+Si el motor se reabre con transacciones sin `COMMIT`, `RecoveryManager` aplica
+el mismo undo lógico. Esto garantiza consistencia observable de las filas y de
+los índices mantenidos por `Table`, pero no es todavía recovery físico ARIES.
+
+El límite es importante: si una actualización cambia el tamaño de un registro,
+puede ser necesario borrar y volver a insertar la fila, por lo que su RID puede
+cambiar. Tampoco se restauran byte a byte los headers de archivos, la free-list
+de las páginas, la creación de páginas ni las operaciones internas de splits de
+los índices. El catálogo y las operaciones DDL tampoco forman parte del undo
+transaccional SQL.
+
+Para completar el recovery físico habría que añadir logging de páginas con
+imágenes `before`/`after`, `page_lsn`, protocolo WAL también para el buffer pool,
+undo/redo de asignación de páginas y headers, logging o reconstrucción segura de
+los índices y pruebas de crash en cada punto de escritura. Ese trabajo es una
+fase posterior y no debe confundirse con el undo lógico implementado aquí.
 
 ---
 

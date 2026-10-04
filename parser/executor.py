@@ -33,6 +33,7 @@ from indexes.external_hash import ExternalHasher
 from indexes.extendible_hash import HashIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from storage.lock_manager import LockMode
+from storage.rid import RID
 
 EXTERNAL_SORT_BUDGET = 1000
 EXTERNAL_HASH_BUCKETS = 16
@@ -225,6 +226,27 @@ class ExecuteVisitor(Visitor):
                         borrados += 1
         self.resultado = Resultado(f"{borrados} fila(s) eliminada(s)")
 
+    def visit_update_stmt(self, stm):
+        with self._table_locks([stm.tabla], LockMode.EXCLUSIVE):
+            tabla = self._abrir(stm.tabla)
+            resolver = self._resolver_columnas([(stm.tabla, tabla)])
+            posiciones = {}
+            for columna, valor in stm.asignaciones:
+                if columna in posiciones:
+                    raise ExecutionError(f"la columna '{columna}' aparece mas de una vez en SET")
+                posiciones[columna] = tabla.column_index(columna)
+
+            actualizadas = 0
+            for rid, registro in list(tabla.scan()):
+                if not self._evaluar(stm.condicion, registro, resolver):
+                    continue
+                nuevos = list(registro)
+                for columna, valor in stm.asignaciones:
+                    nuevos[posiciones[columna]] = self._valor(valor)
+                if tabla.update(rid, nuevos, mutation_logger=self._mutation_logger()):
+                    actualizadas += 1
+        self.resultado = Resultado(f"{actualizadas} fila(s) actualizada(s)")
+
     def visit_create_index_stmt(self, stm):
         tabla = self._abrir(stm.tabla)
         pos = tabla.column_index(stm.columna)
@@ -318,7 +340,7 @@ class ExecuteVisitor(Visitor):
         if self.transaction_id is None:
             return None
 
-        def log_mutation(operation, table, values, rid):
+        def log_mutation(operation, table, values, rid, new_values=None):
             payload = json.dumps(
                 {
                     "values": values,
@@ -327,8 +349,19 @@ class ExecuteVisitor(Visitor):
                 },
                 default=str,
             ).encode("utf-8")
-            before = payload if operation == "delete" else b""
-            after = payload if operation == "insert" else b""
+            if operation == "update":
+                before = payload
+                after = json.dumps(
+                    {
+                        "values": new_values,
+                        "key": new_values[table.key_index],
+                        "rid": list(rid) if rid is not None else None,
+                    },
+                    default=str,
+                ).encode("utf-8")
+            else:
+                before = payload if operation == "delete" else b""
+                after = payload if operation == "insert" else b""
             self.sm.transaction_manager.log_update(
                 self.transaction_id,
                 operation=f"table_{operation}",
@@ -352,6 +385,14 @@ class ExecuteVisitor(Visitor):
             table.delete_by_key(payload["key"])
         elif record.operation == "table_delete":
             table.insert(payload["values"])
+        elif record.operation == "table_update":
+            old_payload = json.loads(record.before.decode("utf-8"))
+            new_payload = json.loads(record.after.decode("utf-8"))
+            rid = RID(*new_payload["rid"]) if new_payload.get("rid") else None
+            restored = table.update(rid, old_payload["values"]) if rid else None
+            if restored is None:
+                table.delete_by_key(new_payload["key"])
+                table.insert(old_payload["values"])
         else:
             raise ExecutionError(
                 f"no existe undo fisico para la operacion '{record.operation}'"

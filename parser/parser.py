@@ -4,7 +4,8 @@ from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, ColRef,
                      CreateTableStmt, DataType, DeleteStmt, FileOrg,
                      FloatValue, IndexKind, InsertStmt, IntValue,
                      JoinClause, OrCond, Programa, RelOp, SelectItem,
-                     SelectStmt, SortDir, StrValue, TransactionStmt)
+                     SelectStmt, SortDir, StrValue, TransactionStmt,
+                     UpdateStmt)
 
 
 # En C++ esto era un runtime_error con la posicion pegada al mensaje.
@@ -94,7 +95,7 @@ class Parser:
             p.slist.append(self.parse_stmt())
         return p
 
-    # Stmt ::= CreateTable | CreateIndex | Select | Insert | Delete | Transaction
+    # Stmt ::= CreateTable | CreateIndex | Select | Insert | Delete | Update | Transaction
     def parse_stmt(self):
         if self.check(Token.Type.CREATE):
             return self.parse_create()
@@ -104,6 +105,8 @@ class Parser:
             return self.parse_insert()
         elif self.check(Token.Type.DELETE):
             return self.parse_delete()
+        elif self.check(Token.Type.UPDATE):
+            return self.parse_update()
         elif (
             self.check(Token.Type.BEGIN)
             or self.check(Token.Type.END_KW)
@@ -353,6 +356,34 @@ class Parser:
             self.error("DELETE requiere WHERE")
         d.condicion = self.parse_cond()
         return d
+
+    # Update ::= UPDATE id SET id = Value {, id = Value} WHERE Cond
+    def parse_update(self):
+        self.match(Token.Type.UPDATE)
+        u = UpdateStmt()
+
+        if not self.match(Token.Type.ID):
+            self.error("se esperaba el nombre de la tabla")
+        u.tabla = self.previous.text
+
+        if not self.match(Token.Type.SET):
+            self.error("se esperaba SET")
+        u.asignaciones.append(self.parse_update_assignment())
+        while self.match(Token.Type.COMA):
+            u.asignaciones.append(self.parse_update_assignment())
+
+        if not self.match(Token.Type.WHERE):
+            self.error("UPDATE requiere WHERE")
+        u.condicion = self.parse_cond()
+        return u
+
+    def parse_update_assignment(self):
+        if not self.match(Token.Type.ID):
+            self.error("se esperaba el nombre de la columna")
+        columna = self.previous.text
+        if not self.match(Token.Type.EQ):
+            self.error("se esperaba = en la asignacion")
+        return columna, self.parse_value()
 
     # Transaction ::= BEGIN TRANSACTION | END TRANSACTION | ROLLBACK
     def parse_transaction(self):

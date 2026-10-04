@@ -63,7 +63,34 @@ def test_recovery_preserves_committed_insert():
             os.chdir(old_directory)
 
 
+def test_recovery_rolls_back_uncommitted_update_after_reopen():
+    with tempfile.TemporaryDirectory() as directory:
+        old_directory = os.getcwd()
+        os.chdir(directory)
+        try:
+            wal_path = os.path.join(directory, "wal.log")
+            sm = StorageManager(wal_path=wal_path)
+            visitor = ExecuteVisitor(sm)
+            execute(visitor, "CREATE TABLE ventas (id INT PRIMARY KEY, nombre VARCHAR(20)) USING HEAP;")
+            execute(visitor, "INSERT INTO ventas VALUES (3, 'Ana');")
+            execute(visitor, "BEGIN TRANSACTION; UPDATE ventas SET nombre = 'Beto' WHERE id = 3;")
+            sm.log_manager.force()
+            for table in sm.tables.values():
+                table.close()
+            sm.catalog.close()
+            sm.index_manager.close()
+            sm.log_manager.close()
+
+            reopened = StorageManager(wal_path=wal_path)
+            reader = ExecuteVisitor(reopened)
+            assert execute(reader, "SELECT * FROM ventas;")[0].filas == [[3, "Ana"]]
+            reopened.close()
+        finally:
+            os.chdir(old_directory)
+
+
 if __name__ == "__main__":
     test_recovery_rolls_back_uncommitted_insert_after_reopen()
     test_recovery_preserves_committed_insert()
+    test_recovery_rolls_back_uncommitted_update_after_reopen()
     print("test_recovery_manager: OK")

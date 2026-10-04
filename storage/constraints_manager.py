@@ -59,3 +59,40 @@ class ConstraintsManager:
                 )
 
         return True
+
+    def validate_update(self, values: list, rid):
+        """Valida una fila modificada sin compararla consigo misma."""
+        if len(values) != len(self.table.schema):
+            raise ValueError(
+                f"La tabla '{self.table.name}' espera {len(self.table.schema)} valores, recibió {len(values)}"
+            )
+
+        if self.check_primary_key and values[self.primary_key_index] is None:
+            raise IntegrityError(
+                f"Violación de integridad: La clave primaria (columna {self.primary_key_index}) no puede ser NULL."
+            )
+
+        for other_rid, existing in self.table.scan():
+            if other_rid == rid:
+                continue
+            if self.check_primary_key and existing[self.primary_key_index] == values[self.primary_key_index]:
+                raise IntegrityError(
+                    f"Violación de clave primaria: Ya existe un registro con la llave '{values[self.primary_key_index]}' en '{self.table.name}'."
+                )
+            for col_idx in self.unique_columns:
+                if values[col_idx] is not None and existing[col_idx] == values[col_idx]:
+                    raise IntegrityError(
+                        f"Violación UNIQUE: El valor '{values[col_idx]}' ya está registrado en la columna {col_idx}."
+                    )
+
+        for col_idx in self.not_null_columns:
+            if values[col_idx] is None:
+                raise IntegrityError(
+                    f"Violación NOT NULL: La columna en el índice {col_idx} es obligatoria y no puede ser nula."
+                )
+        for check_fn in self.check_constraints:
+            if not check_fn(values):
+                raise IntegrityError(
+                    "Violación CHECK: los datos modificados no cumplen la regla de la tabla."
+                )
+        return True

@@ -154,6 +154,46 @@ class Table:
 
         return ok
 
+    def update(self, rid: RID, values: list, mutation_logger=None) -> RID | None:
+        """Actualiza una fila y devuelve su RID resultante."""
+        old_values = self.get(rid)
+        if old_values is None:
+            return None
+        self.constraints_manager.validate_update(values, rid)
+        if mutation_logger is not None:
+            mutation_logger("update", self, list(old_values), rid, list(values))
+
+        if self.clustered_index:
+            old_key = old_values[self.key_index]
+            self.clustered_index.delete(old_key)
+            new_rid = self.clustered_index.insert(values[self.key_index], values)
+        else:
+            updated_in_place = (
+                hasattr(self.data_file, "update")
+                and self.data_file.update(rid, values)
+            )
+            if updated_in_place:
+                new_rid = rid
+            else:
+                self.data_file.delete(rid)
+                new_rid = self.data_file.insert(values)
+
+        for col_idx, indexes in self.secondary_indexes.items():
+            old_key = old_values[col_idx]
+            new_key = values[col_idx]
+            if old_key != new_key:
+                for idx in indexes:
+                    if hasattr(idx, "delete_ref"):
+                        idx.delete_ref(old_key, rid)
+                    else:
+                        idx.delete(old_key)
+                    idx._insert_ref(new_key, new_rid)
+            elif new_rid != rid:
+                for idx in indexes:
+                    idx.delete_ref(old_key, rid)
+                    idx._insert_ref(new_key, new_rid)
+        return new_rid
+
     def search_by_key(self, key_value) -> list[list]:
         """
         Busca por clave priorizando el Árbol B+ Clustered si está disponible.

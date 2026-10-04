@@ -9,6 +9,7 @@ from storage.log_manager import LogManager
 from storage.transaction_manager import TransactionManager
 from storage.lock_manager import LockManager
 from storage.recovery_manager import RecoveryManager
+from storage.rid import RID
 
 
 class StorageManager:
@@ -61,6 +62,14 @@ class StorageManager:
             table.delete_by_key(payload["key"])
         elif record.operation == "table_delete":
             table.insert(payload["values"])
+        elif record.operation == "table_update":
+            old_payload = json.loads(record.before.decode("utf-8"))
+            new_payload = json.loads(record.after.decode("utf-8"))
+            rid = new_payload.get("rid")
+            if rid is not None and table.update(RID(*rid), old_payload["values"]):
+                return
+            table.delete_by_key(new_payload["key"])
+            table.insert(old_payload["values"])
         else:
             raise RuntimeError(
                 f"no existe recovery para la operacion '{record.operation}'"
