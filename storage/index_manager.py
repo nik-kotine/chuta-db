@@ -1,6 +1,7 @@
 import os
 from indexes.b_plus_unclustered import BPlusTreeUnclustered
 from indexes.b_plus_clustered import BPlusTreeClustered
+from indexes.bitmap_index import BitmapIndex
 from indexes.extendible_hash import HashIndex
 from indexes.extendible_hash import PAGE_SIZE as HASH_PAGE_SIZE
 from storage.buffer_manager import BufferManager
@@ -17,11 +18,11 @@ HASH_DEFAULT_SEED = 0
 
 class IndexManager:
     """
-    Administra la creación, apertura y eliminación de índices B+ y hash en la base de datos.
+    Administra la creación, apertura y eliminación de índices B+, hash y bitmap en la base de datos.
     """
     def __init__(self, catalog: SchemaCatalog):
         self.catalog = catalog
-        self.open_indexes: dict[str, BPlusTreeUnclustered] = {}
+        self.open_indexes: dict[str, object] = {}
 
     def create_unclustered_index(
         self, 
@@ -177,6 +178,60 @@ class IndexManager:
         table.attach_index(column_index, index)
         return index
 
+    def create_bitmap_index(
+        self,
+        index_name: str,
+        table: Table,
+        column_index: int,
+        column_name: str = "col"
+    ) -> BitmapIndex:
+        """
+        Crea un índice de bitmap no agrupado sobre una columna. Solo tiene
+        sentido sobre tablas Heap (igual que el B+ no agrupado): el bitmap
+        apunta a filas del heap, no a un archivo ordenado. Si la tabla ya
+        tiene datos, se encarga de leerlos e indexarlos.
+        """
+        if table.file_type != "heap":
+            raise ValueError(
+                "Un índice BITMAP solo puede crearse sobre una tabla Heap."
+            )
+
+        self.catalog.register_index(
+            index_name=index_name,
+            table_name=table.name,
+            column_name=column_name,
+            column_index=column_index,
+            index_type="bitmap"
+        )
+        return self._build_bitmap_index(index_name, table, column_index, column_name)
+
+    def _build_bitmap_index(
+        self,
+        index_name: str,
+        table: Table,
+        column_index: int,
+        column_name: str
+    ) -> BitmapIndex:
+        """
+        Construye el índice de bitmap desde cero y lo enlaza a la tabla.
+
+        A diferencia del hash, el bitmap sí persiste sus páginas, pero al
+        crearlo de cero se descarta el archivo anterior para no arrastrar la
+        basura de una sesión vieja.
+        """
+        index_filename = f"{index_name}.idx"
+        if os.path.exists(index_filename):
+            os.remove(index_filename)
+
+        index = BitmapIndex(index_filename, table.name, column_name)
+
+        for rid, record_params in table.scan():
+            index._insert_ref(record_params[column_index], rid)
+
+        self.open_indexes[index_name] = index
+        table.attach_index(column_index, index)
+        return index
+
     def load_indexes_for_table(self, table: Table):
         """
         Carga los índices registrados en el catálogo para una tabla dada
@@ -209,6 +264,15 @@ class IndexManager:
                         col_idx,
                         meta["column_name"]
                     )
+
+                elif idx_type == "bitmap":
+                    # El bitmap sí persiste sus páginas: se reabre el archivo
+                    # y el directorio clave -> (pagina, slot) se rearma solo.
+                    idx = BitmapIndex(
+                        index_filename, table.name, meta["column_name"]
+                    )
+                    self.open_indexes[index_name] = idx
+                    table.attach_index(col_idx, idx)
 
     def drop_index(self, index_name: str):
         """Elimina un índice y su archivo físico .idx."""

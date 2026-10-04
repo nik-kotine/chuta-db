@@ -11,6 +11,7 @@ class FileOrg(Enum):
 class IndexKind(Enum):
     BTREE_IDX = auto()
     HASH_IDX = auto()
+    BITMAP_IDX = auto()
 
 
 # Tipos de dato del catalogo
@@ -240,7 +241,7 @@ class CreateTableStmt(Stmt):
         return visitor.visit_create_table_stmt(self)
 
 
-# CREATE INDEX ON t (col) USING (btree | hash) [CLUSTERED]
+# CREATE INDEX ON t (col) USING (btree | hash | bitmap) [CLUSTERED]
 class CreateIndexStmt(Stmt):
     def __init__(self):
         self.tabla = ""

@@ -34,6 +34,7 @@ PALABRAS_RESERVADAS = {
     # Tipos de indice (2.1.2)
     "BTREE": Token.Type.BTREE,
     "HASH": Token.Type.HASH,
+    "BITMAP": Token.Type.BITMAP,
 
     # Tipos de dato
     "INT": Token.Type.INT,

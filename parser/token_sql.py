@@ -22,6 +22,7 @@ class Token:
         # Tipos de indice
         BTREE = auto()
         HASH = auto()
+        BITMAP = auto()
 
         # Tipos de dato
         INT = auto()
