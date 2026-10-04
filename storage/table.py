@@ -57,8 +57,7 @@ class Table:
             self.data_file = HeapFile(self.filename, self.buffer_manager, self.schema,
                                       file_manager=self.file_manager)
         elif self.file_type == "sequential":
-            page_size = self.file_manager.page_size
-            self.data_file = SequentialFile(self.buffer_manager, page_size, self.schema,
+            self.data_file = SequentialFile(self.buffer_manager, self.schema,
                                             file_manager=self.file_manager)
             self.data_file.key_index = self.key_index
         else:

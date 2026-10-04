@@ -82,7 +82,7 @@ def test_sequential_file_cumple_record_file():
 
     fm = FileManager(filename, PAGE_SIZE, FILE_HEADER_SIZE)
     bm = BufferManager(fm, BUFFER_FRAMES)
-    rf = SequentialFile(bm, PAGE_SIZE, record_format=["integer","integer"])
+    rf = SequentialFile(bm, record_format=["integer","integer"])
 
     print("Probando SequentialFile bajo interfaz RecordFile...", end=" ")
     probar_contrato_record_file(rf)
