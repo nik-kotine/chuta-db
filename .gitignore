@@ -1,3 +1,6 @@
 Documentacion_Informe.typ
 __pycache__/
 *.bin
+*.dat
+*.idx
+chuta_wal.log

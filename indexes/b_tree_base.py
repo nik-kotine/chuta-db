@@ -290,3 +290,33 @@ class BPlusTreeBase:
             leaf = self._load_leaf(leaf.next_leaf_id) if leaf.next_leaf_id != NULL_LEAF else None
 
         return results
+
+    def iter_ordered(self, reverse=False):
+        """
+        Itera las entradas del B+ en orden de clave.
+        La iteración es lazy y no materializa todas las entradas.
+        """
+        yield from self._iter_ordered_page(self.root_page_id, self.height, reverse)
+
+
+    def _iter_ordered_page(self, page_id, depth, reverse):
+        """
+        Recorre un subárbol del B+ en orden.
+        depth == 0 significa que page_id es una hoja.
+        """
+        if depth == 0:
+            leaf = self._load_leaf(page_id)
+            if reverse:
+                indices = range(leaf.n_entries - 1, -1, -1)
+            else:
+                indices = range(leaf.n_entries)
+            for i in indices:
+                yield leaf._read_entry(i)
+            return
+        node = self._load_internal(page_id)
+        children = node._all_children()
+        if reverse:
+            children = reversed(children)
+        for child_page_id in children:
+            yield from self._iter_ordered_page(child_page_id, depth - 1, reverse)
+

@@ -164,7 +164,7 @@ class ExecuteVisitor(Visitor):
             )
             filas = self._filas_join(tabla, derecha, stm, resolver, serializador)
             if not self._tiene_agregados(stm) and stm.order_by is not None:
-                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort"})
+                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if stm.direccion == SortDir.DESC_DIR else "ASC"})
                 filas = self._ordenar_externo(
                     filas, resolver, stm.order_by,
                     stm.direccion == SortDir.DESC_DIR, serializador,
@@ -174,11 +174,12 @@ class ExecuteVisitor(Visitor):
             resolver = self._resolver_columnas(tablas)
             serializador = tabla.data_file.serializer
             if not self._tiene_agregados(stm) and stm.order_by is not None:
-                self.plan.append({"node": "EXTERNAL SORT", "operation": "sort"})
-                filas = self._select_ordenado(
-                    tabla, stm.condicion, resolver, stm.order_by,
-                    stm.direccion == SortDir.DESC_DIR,
-                )
+                reverse = stm.direccion == SortDir.DESC_DIR
+                if self._indice_para_order_by(tabla, stm.order_by) is not None:
+                    filas = self._scan_ordenado_por_indice(tabla, stm.condicion, resolver, stm.order_by, reverse)
+                else:
+                    self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": stm.order_by.columna, "direction": "DESC" if reverse else "ASC"})
+                    filas = self._select_ordenado(tabla, stm.condicion, resolver, stm.order_by, reverse)
             else:
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
 
@@ -796,6 +797,57 @@ class ExecuteVisitor(Visitor):
             return self._valor(cond.inferior) <= val <= self._valor(cond.superior)
 
         raise ExecutionError(f"Condicion no soportada: {cond}")
+
+    def _indice_para_order_by(self, tabla, colref):
+        """
+        Busca un índice B+ que permita recorrer la columna del ORDER BY de manera ordenada
+        (y no índices hash, ya que estos no mantienen el orden).
+        Retorna ("clustered" / "unclustered", indice, posicion) o None.
+        """
+        try:
+            pos = tabla.column_index(colref.columna)
+        except KeyError:
+            return None
+
+        if tabla.clustered_index is not None and pos == tabla.key_index:
+            return ("clustered", tabla.clustered_index, pos)
+
+        secundarios = tabla.secondary_indexes.get(pos)
+        if secundarios:
+            for indice in secundarios:
+                if not isinstance(indice, HashIndex):
+                    return ("unclustered", indice, pos)
+        return None
+
+    def _scan_ordenado_por_indice(self, tabla, condicion, resolver, colref, reverse=False):
+        """
+        Recorre un indice B+ en el orden de sus claves y aplica el WHERE.
+        El recorrido descendente es tan legitimo como el ascendente: se
+        desciende por los hijos de derecha a izquierda y dentro de cada hoja
+        se leen las entradas al reves, así que no hacen falta enlaces hacia
+        atras en las hojas.
+        """
+        info = self._indice_para_order_by(tabla, colref)
+
+        if info is None:
+            raise ExecutionError(f"No existe un indice B+ sobre '{colref.columna}'")
+
+        organizacion, indice, posicion = info
+
+        self.plan.append({"node": "INDEX SCAN", "table": tabla.name, "index": organizacion, "operation": "index_scan",
+            "column": tabla.column_names[posicion], "direction": "DESC" if reverse else "ASC"}) #tal vez "INDEX ORDERED SCAN" o similar en node y operation
+        for _, ref in indice.iter_ordered(reverse=reverse):
+            registro = indice._fetch_record(ref)
+
+            if registro is None:
+                continue
+
+            registro = list(registro)
+
+            if condicion is None or self._evaluar(
+                condicion, registro, resolver
+            ):
+                yield registro
 
     def visit_int_value(self, v): pass
     def visit_float_value(self, v): pass

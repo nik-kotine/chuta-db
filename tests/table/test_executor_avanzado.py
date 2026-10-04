@@ -15,8 +15,9 @@ from parser.executor import ExecuteVisitor, ExecutionError
 
 ARCHIVOS = [
     "sys_tables.dat", "sys_columns.dat", "sys_indexes.dat",
-    "ventas.dat", "emp.dat", "dept.dat",
+    "ventas.dat", "emp.dat", "dept.dat", "ref.dat",
     "idx_ventas_monto.idx", "idx_emp_id.idx", "idx_ventas_id.idx",
+    "idx_ref_monto.idx",
 ]
 
 
@@ -353,6 +354,126 @@ def test_indice_hash_persiste_y_mantiene_el_crud():
     print("test_indice_hash_persiste_y_mantiene_el_crud: OK")
 
 
+def test_order_by_usa_indice_en_asc_y_desc():
+    limpiar()
+    sm = StorageManager()
+
+    # ventas lleva indice B+ sobre monto; ref es el mismo dataset SIN indice,
+    # para comparar el recorrido del indice contra el ExternalSort.
+    # Los montos son todos distintos: con empates el orden no seria univoco.
+    datos = [(1, "Ana", 300.0), (2, "Beto", 100.0), (3, "Carlos", 250.0),
+             (4, "Dani", 200.0), (5, "Eva", 50.0)]
+
+    for nombre in ("ventas", "ref"):
+        correr(sm, f"CREATE TABLE {nombre} (id INT PRIMARY KEY, cliente VARCHAR(20), monto FLOAT) USING HEAP;")
+        for i, c, m in datos:
+            correr(sm, f"INSERT INTO {nombre} VALUES ({i}, '{c}', {m});")
+
+    correr(sm, "CREATE INDEX ON ventas (monto) USING BTREE;")
+
+    tabla = sm.open_table("ventas")
+    assert tabla.secondary_indexes.get(2), "el indice no quedo enlazado a la columna monto"
+
+    llamadas, original = _prohibir_scan(tabla)
+    try:
+        for direccion in ("ASC", "DESC"):
+            con_indice = correr(sm, f"SELECT cliente FROM ventas ORDER BY monto {direccion};")[0]
+            sin_indice = correr(sm, f"SELECT cliente FROM ref ORDER BY monto {direccion};")[0]
+
+            esperado = [c for _, c, _ in sorted(datos, key=lambda f: f[2],
+                                                reverse=direccion == "DESC")]
+
+            assert con_indice.filas == [[c] for c in esperado], \
+                f"{direccion} por indice: {con_indice.filas} != {esperado}"
+            assert [f[0] for f in sin_indice.filas] == esperado, \
+                f"{direccion} por ExternalSort: {sin_indice.filas} != {esperado}"
+
+            # el recorrido por indice tiene que ser equivalente al ExternalSort
+            assert con_indice.filas == sin_indice.filas, \
+                f"{direccion}: el indice y el ExternalSort discrepan"
+
+            nodos = [p["node"] for p in con_indice.plan]
+            assert "INDEX SCAN" in nodos, f"{direccion} no uso el indice: {con_indice.plan}"
+            assert "EXTERNAL SORT" not in nodos, f"{direccion} uso ExternalSort con indice: {con_indice.plan}"
+
+            # sin indice debe seguir cayendo en ExternalSort
+            assert "EXTERNAL SORT" in [p["node"] for p in sin_indice.plan], \
+                f"{direccion} sin indice no uso ExternalSort: {sin_indice.plan}"
+
+        # WHERE sobre el recorrido descendente: el filtro se aplica durante
+        # el recorrido, asi que no debe traer filas de la mitad alta del rango.
+        res = correr(sm, "SELECT cliente FROM ventas WHERE monto <= 250.0 ORDER BY monto DESC;")[0]
+        assert res.filas == [["Carlos"], ["Dani"], ["Beto"], ["Eva"]], res.filas
+    finally:
+        tabla.scan = original
+    assert llamadas["n"] == 0, f"el indice debia servir la consulta, el scan se llamo {llamadas['n']} veces"
+
+    # Una fila borrada no puede reaparecer en el recorrido por indice.
+    # (el DELETE si usa tabla.scan, asi que va fuera de la bomba)
+    # ref es la tabla de control y no se toca: debe seguir con sus 5 filas.
+    correr(sm, "DELETE FROM ventas WHERE id = 2;")
+    res = correr(sm, "SELECT cliente FROM ventas ORDER BY monto DESC;")[0]
+    assert res.filas == [["Ana"], ["Carlos"], ["Dani"], ["Eva"]], res.filas
+    res = correr(sm, "SELECT cliente FROM ref ORDER BY monto DESC;")[0]
+    assert res.filas == [["Ana"], ["Carlos"], ["Dani"], ["Beto"], ["Eva"]], res.filas
+
+    # El B+ AGRUPADO tambien debe recorrer en ambos sentidos: se inserta
+    # desordenado a proposito para que el orden venga del indice, no del heap.
+    correr(sm, "CREATE TABLE emp (id INT PRIMARY KEY, nombre VARCHAR(20)) USING SEQUENTIAL;")
+    for i, n in [(3, "Zoe"), (1, "Ana"), (2, "Bob"), (5, "Eve"), (4, "Dan")]:
+        correr(sm, f"INSERT INTO emp VALUES ({i}, '{n}');")
+    correr(sm, "CREATE INDEX ON emp (id) USING BTREE CLUSTERED;")
+    assert sm.open_table("emp").clustered_index is not None
+
+    for direccion, esperado in (("ASC", ["Ana", "Bob", "Zoe", "Dan", "Eve"]),
+                                ("DESC", ["Eve", "Dan", "Zoe", "Bob", "Ana"])):
+        res = correr(sm, f"SELECT nombre FROM emp ORDER BY id {direccion};")[0]
+        assert res.filas == [[n] for n in esperado], res.filas
+        nodos = [p["node"] for p in res.plan]
+        assert "INDEX SCAN" in nodos and "EXTERNAL SORT" not in nodos, \
+            f"el agrupado no recorrio el indice en {direccion}: {res.plan}"
+
+    res = correr(sm, "SELECT nombre FROM emp WHERE id >= 2 ORDER BY id DESC;")[0]
+    assert res.filas == [["Eve"], ["Dan"], ["Zoe"], ["Bob"]], res.filas
+
+    sm.close()
+    limpiar()
+    print("test_order_by_usa_indice_en_asc_y_desc: OK")
+
+
+def test_order_by_en_join_usa_external_sort():
+    """El ORDER BY de un JOIN no puede servirse desde un indice: siempre es
+    un ExternalSort sobre el registro combinado (regresion del UnboundLocalError
+    de 'reverse' en visit_select_stmt)."""
+    limpiar()
+    sm = StorageManager()
+
+    correr(sm, "CREATE TABLE ventas (id INT PRIMARY KEY, cliente VARCHAR(20), monto FLOAT) USING HEAP;")
+    correr(sm, "INSERT INTO ventas VALUES (1, 'Ana', 300.0);")
+    correr(sm, "INSERT INTO ventas VALUES (2, 'Beto', 100.0);")
+    correr(sm, "CREATE TABLE dept (id INT PRIMARY KEY, d VARCHAR(20)) USING HEAP;")
+    correr(sm, "INSERT INTO dept VALUES (1, 'IA');")
+    correr(sm, "INSERT INTO dept VALUES (2, 'DB');")
+
+    # Beto tiene monto 100 y Ana 300.
+    for direccion, esperado in (("ASC", [["Beto"], ["Ana"]]), ("DESC", [["Ana"], ["Beto"]])):
+        res = correr(sm, f"SELECT ventas.cliente FROM ventas JOIN dept ON ventas.id = dept.id "
+                         f"ORDER BY ventas.monto {direccion};")[0]
+        assert res.filas == esperado, f"JOIN ORDER BY {direccion}: {res.filas} != {esperado}"
+
+        nodos = [p["node"] for p in res.plan]
+        assert "HASH JOIN" in nodos and "EXTERNAL SORT" in nodos, res.plan
+        assert "INDEX SCAN" not in nodos, f"un JOIN no debe barrer un indice: {res.plan}"
+
+        # el plan debe declarar la columna y la direccion del sort
+        sort = next(p for p in res.plan if p["node"] == "EXTERNAL SORT")
+        assert sort["column"] == "monto" and sort["direction"] == direccion, sort
+
+    sm.close()
+    limpiar()
+    print("test_order_by_en_join_usa_external_sort: OK")
+
+
 if __name__ == "__main__":
     print("=== PROBANDO INDICES (B+ AGUPADO / NO AGUPADO / HASH) Y EXTERNAL ALGOS ===")
     test_select_usa_indice_unclustered()
@@ -364,4 +485,6 @@ if __name__ == "__main__":
     test_select_usa_indice_hash()
     test_indice_hash_poblado_con_registros_existentes()
     test_indice_hash_persiste_y_mantiene_el_crud()
+    test_order_by_usa_indice_en_asc_y_desc()
+    test_order_by_en_join_usa_external_sort()
     print("¡Todas las pruebas del executor avanzado pasaron con éxito!")
