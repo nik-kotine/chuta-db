@@ -28,7 +28,7 @@ from itertools import islice
 from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, ColRef, Cond,
                      CompareCond, DataType, DistanceExpr, FileOrg,
                      FloatValue, IndexKind, IntValue, Metrica, OrCond,
-                     PointValue,
+                     PointValue, PolygonValue, WithinExpr,
                      RelOp, SortDir, StrValue)
 from ast_sql import SelectStmt
 from visitor import Visitor
@@ -48,6 +48,7 @@ from indexes.external_sort import ExternalSorter
 from indexes.external_hash import ExternalHasher
 from indexes.extendible_hash import HashIndex
 from indexes.bitmap_index import BitmapIndex
+from storage.index_manager import RTreeSecondaryIndex
 from storage.formats.serializers.variable_length_serializer import VariableLengthRecordSerializer
 from storage.lock_manager import LockMode
 from storage.rid import RID
@@ -104,28 +105,13 @@ class Resultado:
 
 PAGE_SIZE_ESTIMADO = 4096
 
-# Radio medio de la Tierra en metros. Es el mismo valor que usa
-# ST_DistanceSphere de PostGIS.
-RADIO_TIERRA_M = 6371008.8
-
-
-def _haversine(lon1, lat1, lon2, lat2) -> float:
-    """
-    Distancia geodesica en metros entre dos puntos (longitud, latitud)
-    en grados, sobre una esfera.
-
-    Se usa Haversine y no la ley de cosenos esferica porque esta ultima
-    pierde precision en distancias cortas, que es justo el caso de una
-    consulta "tiendas a menos de 5 km".
-    """
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = (math.sin(dphi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
-    return 2 * RADIO_TIERRA_M * math.asin(math.sqrt(a))
+# Las metricas espaciales viven en spatial/geometry.py, que es tambien lo
+# que usa el R-Tree. Importarlas de ahi en vez de reimplementarlas evita
+# que la distancia que calcula el filtro difiera de la que usa el indice:
+# con dos radios terrestres distintos, una fila podia entrar por el indice
+# y quedar fuera del filtro posterior.
+from spatial.geometry import (Point as GeoPoint, Rectangle, euclidean,
+                              haversine, point_in_polygon)
 
 
 def _ancho_estimado(tipo: str) -> int:
@@ -275,7 +261,10 @@ class ExecuteVisitor(Visitor):
             serializador = tabla.data_file.serializer
             if not self._tiene_agregados(stm) and stm.order_by is not None:
                 reverse = stm.direccion == SortDir.DESC_DIR
-                if self._indice_para_order_by(tabla, stm.order_by) is not None:
+                plan_knn = self._plan_knn(tabla, stm, resolver, reverse)
+                if plan_knn is not None:
+                    filas = self._filas_knn(tabla, stm, resolver, plan_knn)
+                elif self._indice_para_order_by(tabla, stm.order_by) is not None:
                     filas = self._scan_ordenado_por_indice(tabla, stm.condicion, resolver, stm.order_by, reverse)
                 else:
                     self.plan.append({"node": "EXTERNAL SORT", "operation": "sort", "column": self._etiqueta_orden(stm.order_by), "direction": "DESC" if reverse else "ASC"})
@@ -371,6 +360,23 @@ class ExecuteVisitor(Visitor):
                 raise ExecutionError(
                     "un indice BITMAP exige una tabla USING HEAP"
                 )
+        elif stm.tipo == IndexKind.RTREE_IDX:
+            # El R-Tree no ordena totalmente: nunca es agrupado, y apunta a
+            # filas del heap igual que el bitmap.
+            if stm.clustered:
+                raise ExecutionError(
+                    "un indice RTREE no puede ser CLUSTERED: no define un "
+                    "orden total de los registros"
+                )
+            if tabla.file_type != "heap":
+                raise ExecutionError(
+                    "un indice RTREE exige una tabla USING HEAP"
+                )
+            if tabla.schema[pos].strip().lower() != "point":
+                raise ExecutionError(
+                    f"un indice RTREE exige una columna POINT; "
+                    f"'{stm.columna}' es de tipo '{tabla.schema[pos]}'"
+                )
         elif stm.clustered:
             if tabla.file_type != "sequential":
                 raise ExecutionError(
@@ -386,6 +392,8 @@ class ExecuteVisitor(Visitor):
             )
 
         nombre = f"idx_{stm.tabla}_{stm.columna}"
+        if stm.tipo == IndexKind.RTREE_IDX:
+            nombre = f"{nombre}_rtree"
         if stm.tipo == IndexKind.BITMAP_IDX:
             # El nombre base (idx_tabla_columna) es el del B+ y el del hash,
             # asi que un bitmap sobre la misma columna necesita el suyo: es
@@ -418,6 +426,12 @@ class ExecuteVisitor(Visitor):
             )
             tipo_nombre = "BITMAP"
             org = "no agrupado"
+        elif stm.tipo == IndexKind.RTREE_IDX:
+            self.sm.index_manager.create_rtree_index(
+                nombre, tabla, pos, stm.columna
+            )
+            tipo_nombre = "R-Tree"
+            org = "espacial"
         elif stm.clustered:
             self.sm.index_manager.create_clustered_index(
                 nombre, tabla, stm.columna
@@ -573,6 +587,8 @@ class ExecuteVisitor(Visitor):
         return self._texto_condicion(condicion)
 
     def _texto_condicion(self, cond) -> str:
+        if isinstance(cond, WithinExpr):
+            return cond.etiqueta()
         if isinstance(cond, OrCond):
             return " OR ".join(self._texto_condicion(c) for c in cond.condiciones)
         if isinstance(cond, AndCond):
@@ -593,6 +609,8 @@ class ExecuteVisitor(Visitor):
         return nodo.columna if not nodo.tabla else f"{nodo.tabla}.{nodo.columna}"
 
     def _texto_valor(self, nodo) -> str:
+        if isinstance(nodo, PolygonValue):
+            return nodo.etiqueta()
         if isinstance(nodo, PointValue):
             return f"POINT({nodo.x}, {nodo.y})"
         if isinstance(nodo, StrValue):
@@ -856,6 +874,31 @@ class ExecuteVisitor(Visitor):
         las paginas del heap que esa mascara senala. Si no hay bitmap
         util, se sigue con el plan del B+/hash y, si tampoco, el
         barrido secuencial."""
+        # El indice espacial va primero: un predicado de poligono o de
+        # radio no lo puede servir ningun otro indice.
+        _t_plan = time.perf_counter()
+        plan_esp = self._plan_espacial(tabla, condicion, resolver)
+        self._planning_ms += (time.perf_counter() - _t_plan) * 1000.0
+        if plan_esp is not None:
+            tipo, _indice, pos, _args = plan_esp
+            entrada = {
+                "node": "RTREE INDEX SCAN", "table": tabla.name,
+                "operation": "spatial_index_scan",
+                "access": tipo.lower(), "index": "rtree",
+                "column": tabla.column_names[pos],
+            }
+            self.plan.append(entrada)
+            with self._medir(entrada) as medida:
+                for registro in self._candidatos_espaciales(tabla, plan_esp):
+                    # El indice acota; la condicion completa se reevalua
+                    # igual, por si el AND traia mas predicados.
+                    if condicion is None or self._evaluar(condicion, registro, resolver):
+                        medida.emitida()
+                        yield registro
+                    else:
+                        medida.descartada()
+            return
+
         _t_plan = time.perf_counter()
         plan_bitmap = self._plan_bitmap(tabla, condicion, resolver)
         self._planning_ms += (time.perf_counter() - _t_plan) * 1000.0
@@ -958,6 +1001,8 @@ class ExecuteVisitor(Visitor):
                 total = total.intersect(bit) if es_and else total.union(bit)
             return (total, self._predicados_de(partes))
 
+        if isinstance(condicion, WithinExpr):
+            return None   # predicado espacial: no lo sirve un bitmap
         if not isinstance(getattr(condicion, "columna", None), ColRef):
             return None   # p.ej. distancia(...) < v: no lo sirve un bitmap
         try:
@@ -1083,6 +1128,8 @@ class ExecuteVisitor(Visitor):
             # para el KNN: hoy ORDER BY distancia(...) ordena todo
             # (ver _clave_orden); con el arbol seria una busqueda por
             # cercania sin leer toda la tabla.
+            if isinstance(cond, WithinExpr):
+                return None
             if isinstance(getattr(cond, "columna", None), DistanceExpr):
                 return None
 
@@ -1128,6 +1175,179 @@ class ExecuteVisitor(Visitor):
     def _es_numerico(self, tabla, pos) -> bool:
         return tabla.schema[pos] in ("integer", "float", "date")
 
+    def _plan_knn(self, tabla, stm, resolver, reverse):
+        """
+        Decide si un ORDER BY distancia(...) LIMIT k se puede resolver
+        como un k-NN sobre el R-Tree.
+
+        El arbol devuelve los k mas cercanos sin leer toda la tabla, pero
+        solo sirve si se piden los MAS cercanos (ASC) y hay un LIMIT: con
+        DESC harian falta los mas lejanos, que es justo lo que un R-Tree
+        no sabe podar.
+
+        Devuelve (indice, posicion, punto, metrica, k) o None.
+        """
+        order_by = stm.order_by
+        if not isinstance(order_by, DistanceExpr) or reverse or not stm.haylimite:
+            return None
+
+        punto, columna = self._lados_distancia(order_by)
+        if punto is None:
+            return None
+        try:
+            pos = resolver(columna)
+        except (ExecutionError, KeyError):
+            return None
+
+        indice = self._indice_rtree(tabla, pos)
+        if indice is None:
+            return None
+
+        metrica = ("haversine" if order_by.metrica == Metrica.GEODESICA
+                   else "euclidean")
+        return (indice, pos, punto, metrica, stm.limite)
+
+    def _filas_knn(self, tabla, stm, resolver, plan):
+        """
+        Recorre los k vecinos mas cercanos que devuelve el R-Tree.
+
+        Si la consulta ademas trae WHERE, se pide un k mas grande y se
+        filtra: de otro modo un vecino cercano que no cumple el filtro
+        dejaria el resultado corto. El multiplicador se amplia hasta
+        agotar la tabla antes de devolver menos filas de las pedidas.
+        """
+        indice, pos, (px, py), metrica, k = plan
+        entrada = {
+            "node": "RTREE KNN", "table": tabla.name, "operation": "knn",
+            "index": "rtree", "column": tabla.column_names[pos],
+            "k": k, "metric": metrica,
+        }
+        self.plan.append(entrada)
+
+        centro = GeoPoint(px, py)
+        with self._medir(entrada) as medida:
+            if stm.condicion is None:
+                vecinos = indice.knn(centro, k, metrica)
+                for _punto, rid in vecinos:
+                    registro = tabla.get(rid)
+                    if registro is not None:
+                        medida.emitida()
+                        yield registro
+                return
+
+            # Con filtro: se agranda el k hasta juntar las k filas que lo
+            # cumplen, o hasta que el arbol no tenga mas que ofrecer.
+            emitidas = 0
+            pedidos = k
+            vistos = set()
+            while emitidas < k:
+                vecinos = indice.knn(centro, pedidos, metrica)
+                for _punto, rid in vecinos:
+                    if rid in vistos:
+                        continue
+                    vistos.add(rid)
+                    registro = tabla.get(rid)
+                    if registro is None:
+                        continue
+                    if self._evaluar(stm.condicion, registro, resolver):
+                        medida.emitida()
+                        emitidas += 1
+                        yield registro
+                        if emitidas >= k:
+                            return
+                    else:
+                        medida.descartada()
+                if len(vecinos) < pedidos:
+                    return          # el arbol ya devolvio todo lo que tiene
+                pedidos *= 2
+
+    def _indice_rtree(self, tabla, pos):
+        """Devuelve el R-Tree sobre la columna pos, o None."""
+        for idx in tabla.secondary_indexes.get(pos, []):
+            if isinstance(idx, RTreeSecondaryIndex):
+                return idx
+        return None
+
+    def _plan_espacial(self, tabla, condicion, resolver):
+        """
+        Decide si un predicado espacial se puede resolver con el R-Tree.
+
+        Cubre los dos casos en que el arbol evita leer toda la tabla:
+          dentro_de(col, POLYGON(...))        -> polygon_search
+          distancia(col, POINT(...)) < radio  -> radius_search
+
+        Devuelve (tipo, indice, posicion, argumentos) o None. Igual que
+        con los demas indices, solo se mira en contexto conjuntivo: dentro
+        de un OR el indice dejaria fuera las filas de la otra rama.
+        """
+        if condicion is None or isinstance(condicion, OrCond):
+            return None
+
+        candidatos = (condicion.condiciones
+                      if isinstance(condicion, AndCond) else [condicion])
+
+        for cond in candidatos:
+            # dentro_de(col, POLYGON(...))
+            if isinstance(cond, WithinExpr):
+                try:
+                    pos = resolver(cond.columna)
+                except (ExecutionError, KeyError):
+                    continue
+                indice = self._indice_rtree(tabla, pos)
+                if indice is not None:
+                    return ("POLIGONO", indice, pos, cond.poligono.value)
+                continue
+
+            # distancia(col, POINT(...)) < radio   (o <=)
+            if (isinstance(cond, CompareCond)
+                    and isinstance(cond.columna, DistanceExpr)
+                    and cond.op in (RelOp.LT_OP, RelOp.LE_OP)):
+                expr = cond.columna
+                punto, columna = self._lados_distancia(expr)
+                if punto is None:
+                    continue
+                try:
+                    pos = resolver(columna)
+                except (ExecutionError, KeyError):
+                    continue
+                indice = self._indice_rtree(tabla, pos)
+                if indice is None:
+                    continue
+                radio = self._valor(cond.valor)
+                metrica = ("haversine" if expr.metrica == Metrica.GEODESICA
+                           else "euclidean")
+                return ("RADIO", indice, pos, (punto, radio, metrica))
+
+        return None
+
+    @staticmethod
+    def _lados_distancia(expr):
+        """
+        Separa distancia(a, b) en (punto literal, columna). Si los dos
+        lados son columnas no hay nada que el indice pueda acotar, porque
+        el centro de la busqueda cambia fila por fila.
+        """
+        if isinstance(expr.derecha, PointValue) and isinstance(expr.izquierda, ColRef):
+            return (expr.derecha.value, expr.izquierda)
+        if isinstance(expr.izquierda, PointValue) and isinstance(expr.derecha, ColRef):
+            return (expr.izquierda.value, expr.derecha)
+        return (None, None)
+
+    def _candidatos_espaciales(self, tabla, plan):
+        """Recorre los RID que devuelve el R-Tree para el plan dado."""
+        tipo, indice, _pos, args = plan
+        if tipo == "POLIGONO":
+            vertices = [GeoPoint(x, y) for x, y in args]
+            encontrados = indice.polygon_search(vertices)
+        else:
+            (px, py), radio, metrica = args
+            encontrados = indice.radius_search(GeoPoint(px, py), radio, metrica)
+
+        for _punto, rid in encontrados:
+            registro = tabla.get(rid)
+            if registro is not None:
+                yield registro
+
     def _indice_para(self, tabla, pos):
         """
         Devuelve ('clustered'|'unclustered'|'hash', indice) para la
@@ -1137,12 +1357,14 @@ class ExecuteVisitor(Visitor):
         (responde busquedas por punto Y por rango); el hash se usa como
         alternativa cuando es el unico indice postulante. Los de bitmap se
         dejan fuera: los maneja `_plan_bitmap`, que sabe combinar sus
-        mascaras entre si.
+        mascaras entre si. El R-Tree tambien queda fuera: indexa puntos,
+        no claves escalares, asi que no puede responder `col = v` ni un
+        rango; lo usa `_plan_espacial`.
         """
         if tabla.clustered_index is not None and pos == tabla.key_index:
             return ("clustered", tabla.clustered_index)
         secundarios = [idx for idx in tabla.secondary_indexes.get(pos, [])
-                       if not isinstance(idx, BitmapIndex)]
+                       if not isinstance(idx, (BitmapIndex, RTreeSecondaryIndex))]
         for idx in secundarios:
             if not isinstance(idx, HashIndex):
                 return ("unclustered", idx)
@@ -1433,7 +1655,7 @@ class ExecuteVisitor(Visitor):
 
     def _valor(self, nodo):
         """Extrae el valor Python de un nodo Value del parser."""
-        if isinstance(nodo, PointValue):
+        if isinstance(nodo, (PointValue, PolygonValue)):
             return nodo.value
         if isinstance(nodo, (IntValue, FloatValue, StrValue, BoolValue)):
             return nodo.value
@@ -1477,8 +1699,36 @@ class ExecuteVisitor(Visitor):
         x2, y2 = self._punto(expr.derecha, registro, resolver)
 
         if expr.metrica == Metrica.GEODESICA:
-            return _haversine(x1, y1, x2, y2)
-        return math.hypot(x1 - x2, y1 - y2)
+            # Solo la metrica geodesica interpreta las coordenadas como
+            # grados sobre la esfera, asi que es la unica que puede exigir
+            # que esten en rango. La euclidiana trata el punto como un par
+            # cualquiera del plano y no valida nada.
+            self._validar_grados(x1, y1)
+            self._validar_grados(x2, y2)
+            return haversine(GeoPoint(x1, y1), GeoPoint(x2, y2))
+        return euclidean(GeoPoint(x1, y1), GeoPoint(x2, y2))
+
+    @staticmethod
+    def _validar_grados(lon, lat):
+        if not -180.0 <= lon <= 180.0:
+            raise ExecutionError(
+                f"La longitud {lon} esta fuera de rango: debe estar entre "
+                f"-180 y 180 (el orden de POINT es (longitud, latitud))"
+            )
+        if not -90.0 <= lat <= 90.0:
+            raise ExecutionError(
+                f"La latitud {lat} esta fuera de rango: debe estar entre "
+                f"-90 y 90 (el orden de POINT es (longitud, latitud))"
+            )
+
+    def _dentro_de(self, expr, registro, resolver) -> bool:
+        """
+        Pertenencia de un punto a un poligono, por ray casting.
+        Equivale a ST_Contains(poligono, punto) de PostGIS.
+        """
+        x, y = self._punto(expr.columna, registro, resolver)
+        vertices = [GeoPoint(vx, vy) for vx, vy in expr.poligono.value]
+        return point_in_polygon(GeoPoint(x, y), vertices)
 
     def _operando(self, nodo, registro, resolver):
         """Valor de un lado del predicado: distancia(...) o una columna."""
@@ -1494,6 +1744,9 @@ class ExecuteVisitor(Visitor):
             return any(self._evaluar(c, registro, resolver) for c in cond.condiciones)
         if isinstance(cond, AndCond):
             return all(self._evaluar(c, registro, resolver) for c in cond.condiciones)
+
+        if isinstance(cond, WithinExpr):
+            return self._dentro_de(cond, registro, resolver)
 
         if isinstance(cond, CompareCond):
             izq = self._operando(cond.columna, registro, resolver)

@@ -1,0 +1,53 @@
+[
+  {
+    "tecnica": "Secuencial",
+    "n": 1000,
+    "pico_kb": 144.7734375,
+    "residente_kb": 144.703125,
+    "bytes_por_punto": 148.176
+  },
+  {
+    "tecnica": "R-Tree",
+    "n": 1000,
+    "pico_kb": 168.611328125,
+    "residente_kb": 95.3759765625,
+    "bytes_por_punto": 97.665,
+    "disco_kb": 36.005859375,
+    "altura": 1,
+    "paginas_en_buffer": 50
+  },
+  {
+    "tecnica": "Secuencial",
+    "n": 10000,
+    "pico_kb": 1409.0,
+    "residente_kb": 1408.9296875,
+    "bytes_por_punto": 144.2744
+  },
+  {
+    "tecnica": "R-Tree",
+    "n": 10000,
+    "pico_kb": 521.6982421875,
+    "residente_kb": 418.0,
+    "bytes_por_punto": 42.8032,
+    "disco_kb": 340.005859375,
+    "altura": 1,
+    "paginas_en_buffer": 50
+  },
+  {
+    "tecnica": "Secuencial",
+    "n": 100000,
+    "pico_kb": 14061.15625,
+    "residente_kb": 14061.0859375,
+    "bytes_por_punto": 143.98552
+  },
+  {
+    "tecnica": "R-Tree",
+    "n": 100000,
+    "pico_kb": 537.94921875,
+    "residente_kb": 417.19140625,
+    "bytes_por_punto": 4.27204,
+    "disco_kb": 3436.005859375,
+    "altura": 2,
+    "paginas_en_buffer": 50
+  }
+]

@@ -4,7 +4,8 @@ from ast_sql import (AggFun, AndCond, BetweenCond, BoolValue, ColRef,
                      CreateTableStmt, DataType, DeleteStmt, DistanceExpr,
                      DropTableStmt, ExplainStmt, FileOrg,
                      FloatValue, IndexKind, InsertStmt, IntValue,
-                     JoinClause, Metrica, OrCond, PointValue, Programa, RelOp,
+                     JoinClause, Metrica, OrCond, PointValue, PolygonValue,
+                     Programa, RelOp, WithinExpr,
                      SelectItem, SelectStmt, SortDir, StrValue,
                      TransactionStmt, UpdateStmt)
 
@@ -221,6 +222,8 @@ class Parser:
             ci.tipo = IndexKind.HASH_IDX
         elif self.match(Token.Type.BITMAP):
             ci.tipo = IndexKind.BITMAP_IDX
+        elif self.match(Token.Type.RTREE):
+            ci.tipo = IndexKind.RTREE_IDX
         else:
             self.error("se esperaba BTREE, HASH o BITMAP")
 
@@ -468,6 +471,11 @@ class Parser:
                 self.error("se esperaba )")
             return c
 
+        # Predicado espacial de pertenencia: dentro_de(col, POLYGON(...))
+        # No lleva operador: ya es verdadero o falso por si mismo.
+        if self.check(Token.Type.DENTRO_DE):
+            return self.parse_dentro_de()
+
         # Predicado espacial: distancia(a, b) <op> valor
         if self._es_distancia():
             expr = self.parse_distancia()
@@ -533,6 +541,40 @@ class Parser:
         if not self.match(Token.Type.RPAREN):
             self.error(f"se esperaba ) al cerrar {nombre}")
         return DistanceExpr(izquierda, derecha, metrica)
+
+    # DentroDe ::= DENTRO_DE ( ColRef , Polygon )
+    def parse_dentro_de(self):
+        self.match(Token.Type.DENTRO_DE)
+        if not self.match(Token.Type.LPAREN):
+            self.error("se esperaba ( despues de dentro_de")
+        columna = self.parse_col_ref()
+        if not self.match(Token.Type.COMA):
+            self.error("dentro_de espera dos argumentos separados por ,")
+        if not self.check(Token.Type.POLYGON):
+            self.error("el segundo argumento de dentro_de debe ser un POLYGON")
+        poligono = self.parse_polygon()
+        if not self.match(Token.Type.RPAREN):
+            self.error("se esperaba ) al cerrar dentro_de")
+        return WithinExpr(columna, poligono)
+
+    # Polygon ::= POLYGON ( Point {, Point}* )
+    #
+    # Hacen falta al menos tres vertices para delimitar un area. El anillo
+    # se cierra solo, no hay que repetir el primero al final.
+    def parse_polygon(self):
+        self.match(Token.Type.POLYGON)
+        if not self.match(Token.Type.LPAREN):
+            self.error("se esperaba ( despues de POLYGON")
+        vertices = [self.parse_point()]
+        while self.match(Token.Type.COMA):
+            vertices.append(self.parse_point())
+        if not self.match(Token.Type.RPAREN):
+            self.error("se esperaba ) al cerrar POLYGON")
+        if len(vertices) < 3:
+            self.error(
+                f"un POLYGON necesita al menos 3 vertices, se dieron {len(vertices)}"
+            )
+        return PolygonValue(vertices)
 
     def parse_operando_espacial(self):
         if self.check(Token.Type.POINT):

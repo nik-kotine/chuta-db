@@ -401,7 +401,6 @@ La capa más baja de E/S: leer y escribir páginas en un archivo binario.
 - **`_calc_page_offset(phys_page_id)`**: calcula el offset en bytes de una página desde el inicio del archivo.
 - **`read_page`**: lee una página completa como bytes. `write_page`: sobreescribe una página. `read_header` / `write_header`: leen/escriben el header del archivo (el header de los índices B+ guarda la ubicación de la raíz; el de sequential guarda contadores).
 - **`allocate_page`**: agrega una página vacía (ceros) al final del archivo y devuelve su índice.
-- **`grow_to_page(page_id)`**: completa el archivo con páginas vacías hasta que exista la página `page_id` (idempotente) y devuelve cuántos índices físicos tiene. A diferencia de `allocate_page`, que solo agrega al final, este método sirve para reserving páginas que no son contiguas con las anteriores: es lo que usa `SequentialFile` para mantener el área de datos en `1..n_pages` mientras las páginas de overflow se van reservando al final.
 - **`flush`**: vacía el buffer del sistema a disco. **`truncate`**: recorta el archivo a un tamaño. **`close`**: cierra el archivo.
 
 #### `buffer_manager.py`
@@ -466,14 +465,12 @@ Archivo plano sin orden (organización `HEAP`). Página 0 = **directorio persist
 #### `files/sequential_file.py`
 Archivo **ordenado por clave** (organización `SEQUENTIAL`). Los registros se mantienen enlazados por `next_rid` formando una lista ordenada; las páginas "principales" guardan el grueso de los datos y la **página 0 es una página de overflow** para registros que no entran en su lugar. Cuando el espacio desperdiciado supera el umbral (`WASTED_RATIO`), el archivo se reorganiza: ordena todo y lo reescribe compacto.
 
-- **`PAGE_SIZE = 4096`**: las páginas tienen siempre ese tamaño (igual que `HeapFile`), así que el constructor es `SequentialFile(buffer_manager, record_format, file_manager=None)` y no recibe `page_size`. Si el `FileManager` vino con otro tamaño se rechaza con `ValueError`, porque el buffer pool calcularía los offsets con el tamaño equivocado.
-- **Header del archivo** (`">i" + RID_FORMAT + "iiiii"`, 32 bytes): `n_pages`, `first_rid` (page_id y slot_id como **dos enteros**, igual que el `RID_FORMAT` que usan las páginas; `(-1, -1)` es un `first_rid` nulo), `n_records`, `n_deleted`, `n_overflow_pages`, `n_overflow_records` y `overflow_tail_page`. Helpers `_load_header`/`_write_header`.
-- **Reservas de página**: `_ensure_page` (crea la página si falta y la deja vacía, con `grow_to_page` para saltar huecos), `_append_page` (agrega una página de datos al final del área `1..n_pages`), `_reset_overflow_page` (limpia la página 0) e `_insert_into_overflow`, que escribe sobre `overflow_tail` y pide una página nueva al final del archivo cuando se llena. El puntero del header es la fuente de verdad: las páginas de overflow **no tienen por qué ser contiguas** con las de datos.
-- **Búsqueda por binaria + vecinos**: `_last_page_lt` (búsqueda binaria sobre las páginas para hallar dónde debería estar una clave), `_main_neighbors` (encuentra predecesor y sucesor de una clave en las páginas principales) y `_find_neighbors` (lo combina con un recorrido acotado de la lista enlazada).
-- **`insert(params)`**: halla los vecinos de la clave, inserta en overflow, encadena el `next_rid`; si el overflow crece demasiado (`OVERFLOW_RATIO` con al menos `MIN_RECORDS_FOR_OVERFLOW_CHECK` registros), reorganiza. El primer registro inicializa el archivo.
+- **Header del archivo** (`>iiii`): `n_pages`, `first_rid`, `n_records`, `n_deleted`. Helper `_load_header`/`_write_header`, y conversiones `_rid_to_int`/`_int_to_rid` (RID empaquetado con 16 bits por campo).
+- **Búsqueda por binaria + vecinos**: `_last_page_lt` (búsqueda binaria sobre las páginas para hallar dónde debería estar una clave), `_main_neighbors` y `_overflow_neighbors` (encuentran predecesor y sucesor de una clave, en las páginas principales y en overflow), `_find_neighbors` (combina ambos).
+- **`insert(params)`**: halla los vecinos de la clave, inserta en overflow, encadena el `next_rid`; si el overflow está lleno, reorganiza y reintenta. El primer registro inicializa el archivo.
 - **`fetch(rid)`**: lee un registro. **`search(key)`**: devuelve los registros con esa clave recorriendo la lista desde el vecino correcto.
 - **`delete(rid)` / `delete_by_key(key)`**: borrado lógico (flag `deleted`), que gatilla `reorganize` cuando el espacio desperdiciado pasa el umbral.
-- **`reorganize(track_rid=None)`**: reescribe el archivo ordenado usando `ExternalSorter` con `SORT_BUDGET` items en memoria, así que el costo es O(SORT_BUDGET) y no O(cantidad de registros). Primero recorre la lista enlazada y vuelca los registros a runs (el payload serializado lleva pegado el RID viejo para poder rastrear `track_rid`); recién cuando la fuente terminó de leerse empieza a escribir las páginas `1..m`, reutilizando las que ya existían y reservando las que falten, relinkeando los `next_rid` en el acto. Al final reinicia la página de overflow, trunca el archivo y actualiza el header. Claves no ordenables (`POINT`, `INTERVAL`, `UUID`, tuplas) dan un error explícito. `scan()`: recorre la lista enlazada saltando borrados. `_truncate`: recorta el archivo.
+- **`reorganize()`**: junta los registros vivos, los ordena por clave y los reescribe desde la página 1, encadenando los `next_rid`; trunca las páginas sobrantes. `scan()`: recorre la lista enlazada saltando borrados. `_truncate`: recorta el archivo.
 
 #### `storage_manager.py`
 El coordinador central del back-end.
@@ -621,10 +618,9 @@ B+ **agrupado**: las hojas guardan RIDs hacia un `SequentialFile`, que mantiene 
 - **`_ReverseKey`**: wrapper que invierte la comparación, para que el min-heap del merge entregue primero la clave *mayor* (orden descendente).
 - **`ExternalSorter`**: 
   - `__init__`: `budget` (items máximos en memoria por run), `reverse`, directorio de runs.
-  - `_nuevo_run` / `_write_entry` / `_write_run`: genera un archivo temporal con un run ordenado. `_iter_run`: lee un run perezosamente. Cada entrada guarda el **índice global de entrada** además de la clave, y el merge desempata por ese índice: el ordenamiento es **estable** (las claves repetidas salen en el orden en que entraron) tanto en el camino de RAM como al mezclar runs.
+  - `_nuevo_run` / `_write_entry` / `_write_run`: genera un archivo temporal con un run ordenado. `_iter_run`: lee un run perezosamente.
   - `_heap_key` / `_merge`: **k-way merge** manteniendo un min-heap con la cabeza de cada run.
-  - `spill(items)`: consume `items` **por completo** y recién después devuelve el iterador de pares `(clave, value_bytes)` ya ordenados. Esa separación en dos fases es lo que permite escribir el resultado sobre la misma estructura que se estaba leyendo (ver `SequentialFile.reorganize`). Si todo entra en `budget` no crea ningún archivo.
-  - `sort(items)`: sugar sobre `spill` (igual que antes) que además limpia los runs al terminar.
+  - `sort(items)`: si todo entra en `budget`, ordena en RAM (camino rápido); si no, genera runs y los mergea. Devuelve un iterador de pares `(clave, value_bytes)` ya ordenados.
   - `cleanup` / `_drop_runs`: cierran streams y borran los archivos temporales (idempotente).
 
 #### `external_hash.py`

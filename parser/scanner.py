@@ -81,6 +81,9 @@ PALABRAS_RESERVADAS = {
     "DISTANCIA": Token.Type.DISTANCIA,
     "DISTANCIA_EUCLIDIANA": Token.Type.DISTANCIA_EUCLIDIANA,
     "DISTANCIA_GEODESICA": Token.Type.DISTANCIA_GEODESICA,
+    "POLYGON": Token.Type.POLYGON,
+    "DENTRO_DE": Token.Type.DENTRO_DE,
+    "RTREE": Token.Type.RTREE,
 
     # Plan de ejecucion
     "EXPLAIN": Token.Type.EXPLAIN,

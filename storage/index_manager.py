@@ -2,6 +2,8 @@ import os
 from indexes.b_plus_unclustered import BPlusTreeUnclustered
 from indexes.b_plus_clustered import BPlusTreeClustered
 from indexes.bitmap_index import BitmapIndex
+from indexes.r_tree import RTree
+from spatial.geometry import Point as GeoPoint
 from indexes.extendible_hash import HashIndex
 from indexes.extendible_hash import PAGE_SIZE as HASH_PAGE_SIZE
 from storage.buffer_manager import BufferManager
@@ -232,6 +234,62 @@ class IndexManager:
         table.attach_index(column_index, index)
         return index
 
+    # ---------------- indice espacial (R-Tree) ----------------
+
+    def create_rtree_index(
+        self,
+        index_name: str,
+        table: Table,
+        column_index: int,
+        column_name: str = "col"
+    ) -> "RTreeSecondaryIndex":
+        """
+        Crea un índice espacial R-Tree sobre una columna de tipo point.
+
+        Es siempre no agrupado: a diferencia del B+, un R-Tree no define
+        un orden total de los registros, así que no puede imponer el orden
+        físico del archivo de datos.
+        """
+        col_type = table.schema[column_index].strip().lower()
+        if col_type != "point":
+            raise ValueError(
+                f"Un índice R-Tree solo aplica a columnas POINT; "
+                f"'{column_name}' es de tipo '{table.schema[column_index]}'"
+            )
+
+        self.catalog.register_index(
+            index_name=index_name,
+            table_name=table.name,
+            column_name=column_name,
+            column_index=column_index,
+            index_type="rtree"
+        )
+        return self._build_rtree_index(index_name, table, column_index, column_name)
+
+    def _build_rtree_index(
+        self,
+        index_name: str,
+        table: Table,
+        column_index: int,
+        column_name: str
+    ) -> "RTreeSecondaryIndex":
+        """
+        Construye el R-Tree desde cero y lo enlaza a la tabla. Se descarta
+        el archivo anterior para no arrastrar entradas de una sesión vieja.
+        """
+        index_filename = f"{index_name}.idx"
+        if os.path.exists(index_filename):
+            os.remove(index_filename)
+
+        index = RTreeSecondaryIndex(index_filename, table.data_file)
+
+        for rid, record_params in table.scan():
+            index._insert_ref(record_params[column_index], rid)
+
+        self.open_indexes[index_name] = index
+        table.attach_index(column_index, index)
+        return index
+
     def load_indexes_for_table(self, table: Table):
         """
         Carga los índices registrados en el catálogo para una tabla dada
@@ -265,6 +323,15 @@ class IndexManager:
                         meta["column_name"]
                     )
 
+                elif idx_type == "rtree":
+                    # El R-Tree persiste sus páginas, pero se reconstruye
+                    # igual que el hash: así el índice queda consistente
+                    # con la tabla aunque se hayan borrado filas con el
+                    # índice cerrado.
+                    self._build_rtree_index(
+                        index_name, table, col_idx, meta["column_name"]
+                    )
+
                 elif idx_type == "bitmap":
                     # El bitmap sí persiste sus páginas: se reabre el archivo
                     # y el directorio clave -> (pagina, slot) se rearma solo.
@@ -292,3 +359,89 @@ class IndexManager:
         for idx in self.open_indexes.values():
             idx.close()
         self.open_indexes.clear()
+
+class RTreeSecondaryIndex(RTree):
+    """
+    Adaptador del R-Tree para usarlo como índice secundario de una Table.
+
+    RTree.insert(point, params) escribe el registro en el heap y después
+    lo indexa: sirve para un índice primario. Como índice secundario el
+    registro ya existe, así que hay que indexar el RID que la tabla
+    acaba de obtener, sin volver a escribir nada. Eso es exactamente lo
+    que hace _insert_entry_into_tree.
+
+    Table llama a _insert_ref / delete_ref sobre todos sus índices
+    secundarios, igual que al bitmap o al hash.
+    """
+
+    @staticmethod
+    def _a_punto(key) -> GeoPoint:
+        if isinstance(key, GeoPoint):
+            return key
+        if isinstance(key, (tuple, list)) and len(key) == 2:
+            return GeoPoint(key[0], key[1])
+        raise TypeError(
+            f"El índice R-Tree espera un punto (x, y); se recibió {key!r}"
+        )
+
+    def _delete_record(self, point, ref) -> bool:
+        """
+        Como índice secundario NO se toca el archivo de datos.
+
+        RTree._delete_record borra el registro del heap, porque el R-Tree
+        primario es dueño de la fila. Acá la fila es de la Table, que ya
+        la borró antes de avisarle a sus índices: volver a borrarla
+        eliminaría una fila ajena.
+        """
+        return True
+
+    def _insert_ref(self, key, rid):
+        self._insert_entry_into_tree(self._a_punto(key), rid)
+
+    def delete_ref(self, key, rid):
+        """
+        Quita del árbol la entrada (punto, rid), no la primera que tenga
+        ese punto.
+
+        RTreeBase.delete busca solo por punto, así que con coordenadas
+        repetidas podía sacar la entrada de otra fila y dejar el índice
+        apuntando a un RID ya borrado.
+        """
+        punto = self._a_punto(key)
+        path = self._buscar_hoja_con_ref(punto, rid)
+        if path is None:
+            return False
+
+        hoja = path[-1]
+        idx = next(i for i, e in enumerate(hoja.entries)
+                   if e.point == punto and e.ref == rid)
+        hoja.delete_at(idx)
+        self._save_node(hoja)
+        self._condense_tree(path)
+        return True
+
+    def _buscar_hoja_con_ref(self, point, ref, path=None):
+        """
+        Camino hasta la hoja que contiene exactamente (point, ref).
+
+        A diferencia de _search_leaf_for_point, no se detiene en la
+        primera hoja que tenga el punto: con duplicados, las entradas
+        pueden haber quedado repartidas en varias hojas.
+        """
+        if path is None:
+            path = [self._load_node(self.root_page_id)]
+
+        nodo = path[-1]
+        if nodo.is_leaf:
+            for entry in nodo.entries:
+                if entry.point == point and entry.ref == ref:
+                    return path
+            return None
+
+        for entry in nodo.entries:
+            if entry.mbr.contains_point(point):
+                hijo = self._load_node(entry.ref)
+                encontrado = self._buscar_hoja_con_ref(point, ref, path + [hijo])
+                if encontrado is not None:
+                    return encontrado
+        return None
