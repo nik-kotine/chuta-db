@@ -21,6 +21,7 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
 - **Transacciones**
   - `BEGIN TRANSACTION`, `END TRANSACTION` y `ROLLBACK`.
   - Undo y redo lógico idempotente de `INSERT`, `DELETE` y `UPDATE` mediante WAL.
+  - Undo y redo transaccional de `CREATE TABLE` y `CREATE INDEX`.
   - Locks `SHARED`, `UREAD` y `EXCLUSIVE` por tabla, con timeout y limpieza al finalizar.
 - **Detalles del lenguaje**
   - Palabras reservadas insensibles a mayúsculas (`select` = `SELECT`).
@@ -253,9 +254,18 @@ los índices secundarios se actualizan normalmente:
 
 Si el motor se reabre, `RecoveryManager` reaplica primero el redo lógico de las
 transacciones confirmadas y luego aplica undo lógico a las transacciones sin
-`COMMIT`. El redo es idempotente: no duplica inserts ni falla si un delete ya
-fue aplicado. Esto garantiza consistencia observable de las filas y de los
-índices mantenidos por `Table`, pero no es todavía recovery físico ARIES.
+`COMMIT`. El redo lógico es idempotente: no duplica inserts ni falla si un
+delete ya fue aplicado. También puede reaplicar un registro físico explícito
+de página (`resource_type = "page"`) usando sus imágenes `before`/`after`.
+
+La recuperación física ya se integra con `mark_dirty` del buffer pool cuando
+existe una transacción activa: el frame conserva su imagen original y el WAL
+recibe el `before`/`after` de la página antes de que pueda escribirse. Si una
+página tiene varios cambios consecutivos, recovery reproduce la cadena en
+orden y no pisa una modificación posterior que no pertenece al registro.
+Todavía quedan fuera operaciones DDL no expuestas por el parser, como `DROP
+TABLE` y `DROP INDEX`, además de algunos cambios de metadata internos que se
+realizan fuera de estas rutas de logging.
 
 El límite es importante: si una actualización cambia el tamaño de un registro,
 puede ser necesario borrar y volver a insertar la fila, por lo que su RID puede
@@ -264,11 +274,11 @@ de las páginas, la creación de páginas ni las operaciones internas de splits 
 los índices. El catálogo y las operaciones DDL tampoco forman parte del undo
 transaccional SQL.
 
-Para completar el recovery físico habría que añadir logging de páginas con
-imágenes `before`/`after`, `page_lsn`, protocolo WAL también para el buffer pool,
-undo/redo de asignación de páginas y headers, logging o reconstrucción segura de
-los índices y pruebas de crash en cada punto de escritura. Ese trabajo es una
-fase posterior y no debe confundirse con el undo lógico implementado aquí.
+Para completar el recovery físico habría que persistir `page_lsn`, aplicar el
+protocolo WAL a la metadata restante, registrar undo/redo de operaciones DDL,
+registrar o reconstruir de forma segura los índices y probar crashes en cada
+punto de escritura. Ese trabajo es una fase posterior y no debe confundirse
+con el redo físico de registros de página explícitos implementado aquí.
 
 ---
 

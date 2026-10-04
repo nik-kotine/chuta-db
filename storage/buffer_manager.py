@@ -6,6 +6,7 @@ class Frame:
         self.file_manager: FileManager | None = None
         self.phys_page_id: int          = -1
         self.page_bin: bytearray | None = None
+        self.original_page: bytes | None = None
         self.pin_count: int             = 0
         self.dirty: bool                = False
         self.reference: bool            = False
@@ -31,6 +32,8 @@ class BufferManager:
         self.page_table = {}
         self.clock_hand = 0
         self._known_files = []
+        self._wal_logger = None
+        self._transaction_id_provider = None
 
         self._register_file(file_manager)
 
@@ -45,6 +48,10 @@ class BufferManager:
             self.active_file = file_manager
             if not any(fm is file_manager for fm in self._known_files):
                 self._known_files.append(file_manager)
+
+    def configure_wal(self, wal_logger, transaction_id_provider):
+        self._wal_logger = wal_logger
+        self._transaction_id_provider = transaction_id_provider
 
     def _resolve_file(self, file_manager) -> FileManager:
         return file_manager if file_manager is not None else self.active_file
@@ -78,6 +85,7 @@ class BufferManager:
             if frame.dirty == True and frame.page_bin is not None:
                 frame.file_manager.write_page(frame.phys_page_id, frame.page_bin)
                 frame.dirty = False
+                frame.original_page = bytes(frame.page_bin)
             
             victim = self.clock_hand
             self._update_clock_hand()
@@ -110,6 +118,7 @@ class BufferManager:
         frame.file_manager = file_manager
         frame.phys_page_id = phys_page_id
         frame.page_bin = bytearray(file_manager.read_page(phys_page_id))
+        frame.original_page = bytes(frame.page_bin)
         frame.pin_count = 1
         frame.dirty = False
         frame.reference = True
@@ -138,8 +147,43 @@ class BufferManager:
         if key not in self.page_table:
             return False
 
-        self.frames[self.page_table[key]].dirty = True
+        frame = self.frames[self.page_table[key]]
+        frame.dirty = True
+        transaction_id = (
+            self._transaction_id_provider()
+            if self._transaction_id_provider is not None
+            else None
+        )
+        if (
+            transaction_id is not None
+            and self._wal_logger is not None
+            and frame.original_page is not None
+            and bytes(frame.page_bin) != frame.original_page
+        ):
+            self._wal_logger(
+                transaction_id,
+                frame.file_manager,
+                frame.phys_page_id,
+                frame.original_page,
+                bytes(frame.page_bin),
+            )
+            frame.original_page = bytes(frame.page_bin)
+        elif transaction_id is None:
+            frame.original_page = bytes(frame.page_bin)
         return True
+
+    def restore_page(self, phys_page_id: int, page_bin, file_manager=None):
+        """Restaura una página en disco y sincroniza su frame si está cargado."""
+        file_manager = self._resolve_file(file_manager)
+        key = (file_manager, phys_page_id)
+        if key in self.page_table:
+            frame = self.frames[self.page_table[key]]
+            frame.page_bin[:] = page_bin
+            frame.original_page = bytes(page_bin)
+            frame.dirty = False
+        else:
+            file_manager.write_page(phys_page_id, page_bin)
+        file_manager.force()
 
     def flush_page(self, phys_page_id: int, file_manager: FileManager = None) -> bool:
         file_manager = self._resolve_file(file_manager)
@@ -152,6 +196,7 @@ class BufferManager:
         if frame.dirty == True:
             file_manager.write_page(phys_page_id, frame.page_bin)
             frame.dirty = False
+            frame.original_page = bytes(frame.page_bin)
 
         return True
     
@@ -168,6 +213,7 @@ class BufferManager:
             ):
                 file_manager.write_page(frame.phys_page_id, frame.page_bin)
                 frame.dirty = False
+                frame.original_page = bytes(frame.page_bin)
 
         file_manager.flush()
     
@@ -184,6 +230,7 @@ class BufferManager:
                     frame.page_bin
                 )
                 frame.dirty = False
+                frame.original_page = bytes(frame.page_bin)
 
         for fm in self._known_files:
             if not self._is_closed(fm):
@@ -200,6 +247,7 @@ class BufferManager:
                 frame.file_manager = None
                 frame.phys_page_id = -1
                 frame.page_bin = None
+                frame.original_page = None
                 frame.pin_count = 0
                 frame.dirty = False
                 frame.reference = False
@@ -216,6 +264,7 @@ class BufferManager:
                 frame.file_manager = None
                 frame.phys_page_id = -1
                 frame.page_bin = None
+                frame.original_page = None
                 frame.pin_count = 0
                 frame.dirty = False
                 frame.reference = False
@@ -227,6 +276,7 @@ class BufferManager:
         def _drop(frame):
             frame.phys_page_id = -1
             frame.page_bin = None
+            frame.original_page = None
             frame.pin_count = 0
             frame.dirty = False
             frame.reference = False

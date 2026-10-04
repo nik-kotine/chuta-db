@@ -118,6 +118,17 @@ class ExecuteVisitor(Visitor):
 
         file_type = "heap" if stm.org == FileOrg.HEAP_ORG else "sequential"
 
+        self._log_ddl(
+            "create_table",
+            stm.tabla,
+            {
+                "schema": schema,
+                "file_type": file_type,
+                "key_index": key_index,
+                "column_names": column_names,
+            },
+        )
+
         self.sm.create_table(
             name=stm.tabla,
             schema=schema,
@@ -280,6 +291,17 @@ class ExecuteVisitor(Visitor):
             )
 
         nombre = f"idx_{stm.tabla}_{stm.columna}"
+        self._log_ddl(
+            "create_index",
+            stm.tabla,
+            {
+                "index_name": nombre,
+                "column_name": stm.columna,
+                "column_index": pos,
+                "index_kind": stm.tipo.name,
+                "clustered": stm.clustered,
+            },
+        )
         if stm.tipo == IndexKind.HASH_IDX:
             self.sm.index_manager.create_hash_index(
                 nombre, tabla, pos, stm.columna
@@ -307,11 +329,13 @@ class ExecuteVisitor(Visitor):
             if self.transaction_id is None:
                 raise ExecutionError("ROLLBACK requiere una transaccion activa")
             transaction_id = self.transaction_id
+            self.sm.current_transaction_id = None
             self.sm.transaction_manager.rollback(
                 transaction_id, self._undo_record
             )
             self.sm.lock_manager.release_all(transaction_id)
             self.transaction_id = None
+            self.sm.current_transaction_id = None
             self.resultado = Resultado("ROLLBACK")
             return
 
@@ -320,6 +344,7 @@ class ExecuteVisitor(Visitor):
                 raise ExecutionError("ya existe una transaccion activa")
             transaction = self.sm.transaction_manager.begin()
             self.transaction_id = transaction.transaction_id
+            self.sm.current_transaction_id = self.transaction_id
             self.resultado = Resultado("BEGIN TRANSACTION")
             return
 
@@ -329,6 +354,7 @@ class ExecuteVisitor(Visitor):
         self.sm.transaction_manager.commit(transaction_id)
         self.sm.lock_manager.release_all(transaction_id)
         self.transaction_id = None
+        self.sm.current_transaction_id = None
         self.resultado = Resultado("END TRANSACTION")
 
     def _abort_active_transaction(self):
@@ -336,11 +362,13 @@ class ExecuteVisitor(Visitor):
         if self.transaction_id is None:
             return
         transaction_id = self.transaction_id
+        self.sm.current_transaction_id = None
         try:
             self.sm.transaction_manager.abort(transaction_id, self._undo_record)
         finally:
             self.sm.lock_manager.release_all(transaction_id)
             self.transaction_id = None
+            self.sm.current_transaction_id = None
 
     def _mutation_logger(self):
         """Devuelve el hook WAL solo para transacciones explicitas."""
@@ -382,8 +410,30 @@ class ExecuteVisitor(Visitor):
 
         return log_mutation
 
+    def _log_ddl(self, operation, table_name, payload):
+        if self.transaction_id is None:
+            return
+        self.sm.transaction_manager.log_update(
+            self.transaction_id,
+            operation=f"ddl_{operation}",
+            file_name=table_name,
+            resource_type="ddl",
+            after=json.dumps(payload).encode("utf-8"),
+        )
+        self.sm.log_manager.force()
+
     def _undo_record(self, record):
         """Aplica undo logico y deja que Table actualice sus indices."""
+        if record.resource_type in ("page", "header", "allocation", "truncate"):
+            self.sm._undo_physical_record(record)
+            return
+        if record.resource_type == "ddl":
+            payload = json.loads(record.after.decode("utf-8"))
+            if record.operation == "ddl_create_table":
+                self.sm.drop_table(record.file_name)
+            elif record.operation == "ddl_create_index":
+                self.sm.index_manager.drop_index(payload["index_name"])
+            return
         payload_bytes = record.before or record.after
         payload = json.loads(payload_bytes.decode("utf-8"))
         table = self._abrir(record.file_name)
