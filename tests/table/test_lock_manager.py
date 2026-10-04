@@ -60,6 +60,37 @@ def test_shared_to_exclusive_upgrade_waits_for_other_reader():
     manager.release(RESOURCE, 1)
 
 
+def test_update_lock_is_compatible_with_shared_but_unique():
+    manager = LockManager()
+    manager.acquire(RESOURCE, 1, LockMode.SHARED)
+    manager.acquire(RESOURCE, 2, LockMode.UREAD)
+
+    try:
+        manager.acquire(RESOURCE, 3, LockMode.UREAD, timeout=0.01)
+        assert False, "solo una transaccion puede poseer UREAD"
+    except LockTimeoutError:
+        pass
+
+    manager.release(RESOURCE, 1)
+    manager.release(RESOURCE, 2)
+
+
+def test_update_lock_can_be_promoted_to_exclusive():
+    manager = LockManager()
+    manager.acquire(RESOURCE, 1, LockMode.UREAD)
+    manager.acquire(RESOURCE, 2, LockMode.SHARED)
+
+    try:
+        manager.acquire(RESOURCE, 1, LockMode.EXCLUSIVE, timeout=0.01)
+        assert False, "la promocion debia esperar al lector"
+    except LockTimeoutError:
+        pass
+
+    manager.release(RESOURCE, 2)
+    manager.acquire(RESOURCE, 1, LockMode.EXCLUSIVE)
+    manager.release(RESOURCE, 1)
+
+
 def test_timeout_does_not_leave_waiting_or_owned_lock():
     manager = LockManager()
     manager.acquire(RESOURCE, 1, LockMode.EXCLUSIVE)
@@ -105,6 +136,8 @@ if __name__ == "__main__":
     test_readers_can_share_and_writer_waits()
     test_exclusive_lock_is_reentrant()
     test_shared_to_exclusive_upgrade_waits_for_other_reader()
+    test_update_lock_is_compatible_with_shared_but_unique()
+    test_update_lock_can_be_promoted_to_exclusive()
     test_timeout_does_not_leave_waiting_or_owned_lock()
     test_release_all_releases_every_resource()
     test_releasing_foreign_lock_fails()

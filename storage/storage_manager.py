@@ -41,7 +41,9 @@ class StorageManager:
         self.index_manager = IndexManager(self.catalog)
         self.tables: dict[str, Table] = {}  # Caché de tablas abiertas en memoria
         self.recovery_manager = RecoveryManager(
-            self.transaction_manager, self._undo_log_record
+            self.transaction_manager,
+            self._undo_log_record,
+            self._redo_log_record,
         )
         self.recovered_transactions = self.recovery_manager.recover()
 
@@ -74,6 +76,38 @@ class StorageManager:
             raise RuntimeError(
                 f"no existe recovery para la operacion '{record.operation}'"
             )
+
+    def _redo_log_record(self, record):
+        """Reaplica una mutacion confirmada sin duplicar su efecto."""
+        import json
+
+        table = self.open_table(record.file_name)
+        if record.operation == "table_insert":
+            payload = json.loads(record.after.decode("utf-8"))
+            if not table.search_by_key(payload["key"]):
+                table.insert(payload["values"])
+            return
+
+        if record.operation == "table_delete":
+            payload = json.loads(record.before.decode("utf-8"))
+            table.delete_by_key(payload["key"])
+            return
+
+        if record.operation == "table_update":
+            before = json.loads(record.before.decode("utf-8"))
+            after = json.loads(record.after.decode("utf-8"))
+            if table.search_by_key(after["key"]):
+                return
+            for rid, values in table.scan():
+                if values[table.key_index] == before["key"]:
+                    if table.update(rid, after["values"]):
+                        return
+            table.insert(after["values"])
+            return
+
+        raise RuntimeError(
+            f"no existe redo para la operacion '{record.operation}'"
+        )
 
     def create_table(
         self, 

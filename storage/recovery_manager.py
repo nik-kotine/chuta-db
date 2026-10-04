@@ -1,29 +1,36 @@
-"""Recovery logico de transacciones incompletas.
-
-La Fase 5 registra operaciones CRUD con suficiente informacion para deshacer
-un insert o delete. Este manager usa esos registros durante el arranque; el
-redo fisico de paginas quedara para cuando el almacenamiento tenga page_lsn.
-"""
-
 from storage.log_manager import LogManager, LogRecordType
 from storage.transaction_manager import TransactionManager
 
 
 class RecoveryManager:
-    """Revisa el WAL y revierte transacciones sin COMMIT."""
+    """Reaplica commits y revierte transacciones sin COMMIT."""
 
-    def __init__(self, transaction_manager: TransactionManager, undo_handler):
-        """Recibe el manager y una funcion que restaura un ``LogRecord``."""
+    def __init__(self, transaction_manager: TransactionManager, undo_handler,
+                 redo_handler=None):
+        """Recibe callbacks para aplicar redo y restaurar undo lógico."""
         self.transaction_manager = transaction_manager
         self.log_manager: LogManager = transaction_manager.log_manager
         self.undo_handler = undo_handler
+        self.redo_handler = redo_handler
 
     def recover(self) -> list[int]:
-        """Aborta y deshace transacciones activas encontradas en el WAL.
+        """Reaplica commits y deshace transacciones activas encontradas en el WAL.
 
-        Devuelve los IDs recuperados. Las transacciones ya confirmadas no se
-        tocan: sus cambios son el estado durable que debe conservarse.
+        Devuelve los IDs recuperados. El redo lógico es idempotente, por lo que
+        puede ejecutarse aunque parte del estado confirmado ya esté en disco.
         """
+        if self.redo_handler is not None:
+            committed_ids = {
+                transaction.transaction_id
+                for transaction in self.transaction_manager.committed_transactions()
+            }
+            for record in self.log_manager.iter_records():
+                if (
+                    record.record_type == LogRecordType.UPDATE
+                    and record.transaction_id in committed_ids
+                ):
+                    self.redo_handler(record)
+
         recovered = []
         for transaction in self.transaction_manager.active_transactions():
             self.transaction_manager.rollback(

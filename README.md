@@ -20,8 +20,8 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
   - `DELETE FROM tabla WHERE ...` — el `WHERE` es **obligatorio**, para no borrar la tabla completa por accidente.
 - **Transacciones**
   - `BEGIN TRANSACTION`, `END TRANSACTION` y `ROLLBACK`.
-  - Undo lógico y recovery de `INSERT`, `DELETE` y `UPDATE` mediante WAL.
-  - Locks compartidos y exclusivos por tabla, con timeout y limpieza al finalizar.
+  - Undo y redo lógico idempotente de `INSERT`, `DELETE` y `UPDATE` mediante WAL.
+  - Locks `SHARED`, `UREAD` y `EXCLUSIVE` por tabla, con timeout y limpieza al finalizar.
 - **Detalles del lenguaje**
   - Palabras reservadas insensibles a mayúsculas (`select` = `SELECT`).
   - Comentarios de línea con `--`.
@@ -251,9 +251,11 @@ los índices secundarios se actualizan normalmente:
   se conserva el RID original.
 - Las operaciones se deshacen en orden inverso y generan registros `CLR`.
 
-Si el motor se reabre con transacciones sin `COMMIT`, `RecoveryManager` aplica
-el mismo undo lógico. Esto garantiza consistencia observable de las filas y de
-los índices mantenidos por `Table`, pero no es todavía recovery físico ARIES.
+Si el motor se reabre, `RecoveryManager` reaplica primero el redo lógico de las
+transacciones confirmadas y luego aplica undo lógico a las transacciones sin
+`COMMIT`. El redo es idempotente: no duplica inserts ni falla si un delete ya
+fue aplicado. Esto garantiza consistencia observable de las filas y de los
+índices mantenidos por `Table`, pero no es todavía recovery físico ARIES.
 
 El límite es importante: si una actualización cambia el tamaño de un registro,
 puede ser necesario borrar y volver a insertar la fila, por lo que su RID puede

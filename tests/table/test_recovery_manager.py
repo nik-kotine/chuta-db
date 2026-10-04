@@ -89,8 +89,33 @@ def test_recovery_rolls_back_uncommitted_update_after_reopen():
             os.chdir(old_directory)
 
 
+def test_recovery_redoes_committed_insert_if_data_page_is_missing():
+    with tempfile.TemporaryDirectory() as directory:
+        old_directory = os.getcwd()
+        os.chdir(directory)
+        try:
+            wal_path = os.path.join(directory, "wal.log")
+            sm = StorageManager(wal_path=wal_path)
+            visitor = ExecuteVisitor(sm)
+            execute(visitor, "CREATE TABLE ventas (id INT PRIMARY KEY, nombre VARCHAR(20)) USING HEAP;")
+            execute(visitor, "BEGIN TRANSACTION; INSERT INTO ventas VALUES (4, 'Dina'); END TRANSACTION;")
+            sm.tables["ventas"].delete_by_key(4)
+            sm.tables["ventas"].close()
+            sm.catalog.close()
+            sm.index_manager.close()
+            sm.log_manager.close()
+
+            reopened = StorageManager(wal_path=wal_path)
+            reader = ExecuteVisitor(reopened)
+            assert execute(reader, "SELECT * FROM ventas;")[0].filas == [[4, "Dina"]]
+            reopened.close()
+        finally:
+            os.chdir(old_directory)
+
+
 if __name__ == "__main__":
     test_recovery_rolls_back_uncommitted_insert_after_reopen()
     test_recovery_preserves_committed_insert()
     test_recovery_rolls_back_uncommitted_update_after_reopen()
+    test_recovery_redoes_committed_insert_if_data_page_is_missing()
     print("test_recovery_manager: OK")

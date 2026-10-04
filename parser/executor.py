@@ -227,7 +227,7 @@ class ExecuteVisitor(Visitor):
         self.resultado = Resultado(f"{borrados} fila(s) eliminada(s)")
 
     def visit_update_stmt(self, stm):
-        with self._table_locks([stm.tabla], LockMode.EXCLUSIVE):
+        with self._table_locks([stm.tabla], LockMode.UREAD):
             tabla = self._abrir(stm.tabla)
             resolver = self._resolver_columnas([(stm.tabla, tabla)])
             posiciones = {}
@@ -236,13 +236,20 @@ class ExecuteVisitor(Visitor):
                     raise ExecutionError(f"la columna '{columna}' aparece mas de una vez en SET")
                 posiciones[columna] = tabla.column_index(columna)
 
-            actualizadas = 0
+            pendientes = []
             for rid, registro in list(tabla.scan()):
                 if not self._evaluar(stm.condicion, registro, resolver):
                     continue
                 nuevos = list(registro)
                 for columna, valor in stm.asignaciones:
                     nuevos[posiciones[columna]] = self._valor(valor)
+                pendientes.append((rid, nuevos))
+
+            if pendientes:
+                self._promote_table_locks([stm.tabla])
+
+            actualizadas = 0
+            for rid, nuevos in pendientes:
                 if tabla.update(rid, nuevos, mutation_logger=self._mutation_logger()):
                     actualizadas += 1
         self.resultado = Resultado(f"{actualizadas} fila(s) actualizada(s)")
@@ -414,6 +421,15 @@ class ExecuteVisitor(Visitor):
             if not explicit:
                 for resource in reversed(acquired):
                     self.sm.lock_manager.release(resource, transaction_id)
+
+    def _promote_table_locks(self, table_names):
+        """Promueve locks UREAD ya adquiridos a EXCLUSIVE en orden estable."""
+        transaction_id = self.transaction_id or self.session_id
+        for table_name in sorted(set(table_names)):
+            resource = ("table", table_name)
+            self.sm.lock_manager.acquire(
+                resource, transaction_id, LockMode.EXCLUSIVE, timeout=5
+            )
 
     def _abrir(self, nombre):
         try:

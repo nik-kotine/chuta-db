@@ -1,10 +1,3 @@
-"""Administrador de locks para la fase de concurrencia.
-
-Esta fase trabaja con locks logicos sobre recursos identificables, por ejemplo
-``("table", "ventas")``. La integracion con Table y el executor se hara en
-una fase posterior; aqui solo se garantiza la coordinacion entre hilos.
-"""
-
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import threading
@@ -13,16 +6,13 @@ import time
 
 class LockError(RuntimeError):
     """Error de ownership, modo o estado de un lock."""
-
-
 class LockTimeoutError(LockError):
     """La transaccion no pudo adquirir el lock antes del timeout."""
-
-
 class LockMode(Enum):
     """Modos soportados por el lock manager."""
 
     SHARED = auto()
+    UREAD = auto()
     EXCLUSIVE = auto()
 
 
@@ -31,13 +21,15 @@ class _LockEntry:
     """Estado interno de un recurso protegido."""
 
     shared: dict[int, int] = field(default_factory=dict)
+    update_owner: int | None = None
+    update_count: int = 0
     exclusive_owner: int | None = None
     exclusive_count: int = 0
     waiting_writers: int = 0
 
 
 class LockManager:
-    """Coordina locks shared/exclusive con espera y timeout.
+    """Coordina locks shared, UREAD y exclusive con espera y timeout.
 
     Un mismo transaction ID puede adquirir repetidamente el mismo lock. Cada
     adquisicion incrementa un contador y cada ``release`` decrementa uno, lo
@@ -53,7 +45,9 @@ class LockManager:
     @staticmethod
     def _validate_mode(mode: LockMode) -> None:
         if not isinstance(mode, LockMode):
-            raise TypeError("mode debe ser LockMode.SHARED o LockMode.EXCLUSIVE")
+            raise TypeError(
+                "mode debe ser LockMode.SHARED, LockMode.UREAD o LockMode.EXCLUSIVE"
+            )
 
     @staticmethod
     def _validate_transaction(transaction_id: int) -> None:
@@ -72,7 +66,15 @@ class LockManager:
         other_shared = any(owner != transaction_id for owner in entry.shared)
         return (
             entry.exclusive_owner in (None, transaction_id)
+            and entry.update_owner in (None, transaction_id)
             and not other_shared
+        )
+
+    @staticmethod
+    def _can_update(entry: _LockEntry, transaction_id: int) -> bool:
+        return (
+            entry.exclusive_owner in (None, transaction_id)
+            and entry.update_owner in (None, transaction_id)
         )
 
     def acquire(
@@ -97,22 +99,23 @@ class LockManager:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             entry = self._entry(resource)
-            if mode == LockMode.EXCLUSIVE:
+            if mode in (LockMode.UREAD, LockMode.EXCLUSIVE):
                 entry.waiting_writers += 1
             try:
                 while True:
                     can_acquire = (
-                        self._can_share(entry, transaction_id)
+                        mode == LockMode.SHARED
+                        and self._can_share(entry, transaction_id)
                         and (
-                            mode == LockMode.SHARED
-                            and (
-                                entry.waiting_writers == 0
-                                or transaction_id in entry.shared
-                                or entry.exclusive_owner == transaction_id
-                            )
-                            or mode == LockMode.EXCLUSIVE
-                            and self._can_exclude(entry, transaction_id)
+                            entry.waiting_writers == 0
+                            or transaction_id in entry.shared
+                            or transaction_id == entry.update_owner
+                            or entry.exclusive_owner == transaction_id
                         )
+                        or mode == LockMode.UREAD
+                        and self._can_update(entry, transaction_id)
+                        or mode == LockMode.EXCLUSIVE
+                        and self._can_exclude(entry, transaction_id)
                     )
                     if can_acquire:
                         self._grant(entry, resource, transaction_id, mode)
@@ -125,7 +128,7 @@ class LockManager:
                         )
                     self._condition.wait(remaining)
             finally:
-                if mode == LockMode.EXCLUSIVE:
+                if mode in (LockMode.UREAD, LockMode.EXCLUSIVE):
                     entry.waiting_writers -= 1
 
     def _grant(
@@ -139,6 +142,12 @@ class LockManager:
         if mode == LockMode.SHARED:
             if entry.exclusive_owner != transaction_id:
                 entry.shared[transaction_id] = entry.shared.get(transaction_id, 0) + 1
+        elif mode == LockMode.UREAD:
+            if entry.update_owner == transaction_id:
+                entry.update_count += 1
+            else:
+                entry.update_owner = transaction_id
+                entry.update_count = 1
         else:
             # Un upgrade elimina el contador shared propio antes de promover.
             entry.shared.pop(transaction_id, None)
@@ -162,6 +171,10 @@ class LockManager:
                 entry.exclusive_count -= 1
                 if entry.exclusive_count == 0:
                     entry.exclusive_owner = None
+            elif entry.update_owner == transaction_id:
+                entry.update_count -= 1
+                if entry.update_count == 0:
+                    entry.update_owner = None
             elif transaction_id in entry.shared:
                 entry.shared[transaction_id] -= 1
                 if entry.shared[transaction_id] == 0:
@@ -195,6 +208,7 @@ class LockManager:
                             entry is not None
                             and (
                                 entry.exclusive_owner == transaction_id
+                                or entry.update_owner == transaction_id
                                 or transaction_id in entry.shared
                             )
                         )
@@ -208,6 +222,7 @@ class LockManager:
         entry = self._locks.get(resource)
         if entry is None or (
             entry.exclusive_owner != transaction_id
+            and entry.update_owner != transaction_id
             and transaction_id not in entry.shared
         ):
             held.pop(resource, None)
@@ -217,6 +232,7 @@ class LockManager:
     def _cleanup(self, resource: object, entry: _LockEntry) -> None:
         if (
             not entry.shared
+            and entry.update_owner is None
             and entry.exclusive_owner is None
             and entry.waiting_writers == 0
         ):
