@@ -61,6 +61,7 @@ PALABRAS_RESERVADAS = {
     # Transacciones (2.1.4)
     "BEGIN": Token.Type.BEGIN,
     "END": Token.Type.END_KW,
+    "ROLLBACK": Token.Type.ROLLBACK,
     "TRANSACTION": Token.Type.TRANSACTION,
 
     # Condiciones

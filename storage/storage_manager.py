@@ -5,6 +5,10 @@ from storage.table import Table
 from storage.schema_catalog import SchemaCatalog
 from storage.index_manager import IndexManager
 from storage.files.sequential_file import FILE_HEADER_SIZE
+from storage.log_manager import LogManager
+from storage.transaction_manager import TransactionManager
+from storage.lock_manager import LockManager
+from storage.recovery_manager import RecoveryManager
 
 
 class StorageManager:
@@ -16,11 +20,16 @@ class StorageManager:
         self,
         page_size: int = 4096,
         buffer_frames: int = 10,
-        header_size: int = FILE_HEADER_SIZE
+        header_size: int = FILE_HEADER_SIZE,
+        wal_path: str = "chuta_wal.log"
     ):
         self.page_size = page_size
         self.buffer_frames = buffer_frames
         self.header_size = header_size
+        self.log_manager = LogManager(wal_path)
+        self.transaction_manager = TransactionManager(self.log_manager)
+        self.lock_manager = LockManager()
+        self._next_session_id = 1 << 62
 
         # Inicializamos el catálogo en disco basado en HeapFiles
         self.catalog = SchemaCatalog(
@@ -30,6 +39,32 @@ class StorageManager:
         )
         self.index_manager = IndexManager(self.catalog)
         self.tables: dict[str, Table] = {}  # Caché de tablas abiertas en memoria
+        self.recovery_manager = RecoveryManager(
+            self.transaction_manager, self._undo_log_record
+        )
+        self.recovered_transactions = self.recovery_manager.recover()
+
+    def allocate_session_id(self) -> int:
+        """Entrega un ID separado de los IDs persistidos de transacciones."""
+        session_id = self._next_session_id
+        self._next_session_id += 1
+        return session_id
+
+    def _undo_log_record(self, record):
+        """Restaura una mutacion CRUD durante recovery, sin volver a loguearla."""
+        import json
+
+        payload_bytes = record.before or record.after
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        table = self.open_table(record.file_name)
+        if record.operation == "table_insert":
+            table.delete_by_key(payload["key"])
+        elif record.operation == "table_delete":
+            table.insert(payload["values"])
+        else:
+            raise RuntimeError(
+                f"no existe recovery para la operacion '{record.operation}'"
+            )
 
     def create_table(
         self, 
@@ -103,6 +138,12 @@ class StorageManager:
         """
         Guarda los cambios y cierra todas las tablas y el catálogo.
         """
+        # El undo necesita que el catalogo y las tablas sigan disponibles.
+        for transaction in self.transaction_manager.active_transactions():
+            self.transaction_manager.rollback(
+                transaction.transaction_id, self._undo_log_record
+            )
+
         for name, table in list(self.tables.items()):
             table.close()
         self.tables.clear()
@@ -110,6 +151,8 @@ class StorageManager:
         self.catalog.close()
 
         self.index_manager.close()
+        self.recovery_manager.checkpoint()
+        self.transaction_manager.close()
 
     def __enter__(self):
         return self

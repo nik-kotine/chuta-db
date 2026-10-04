@@ -290,10 +290,11 @@ class DeleteStmt(Stmt):
         return visitor.visit_delete_stmt(self)
 
 
-# BEGIN TRANSACTION | END TRANSACTION
+# BEGIN TRANSACTION | END TRANSACTION | ROLLBACK
 class TransactionStmt(Stmt):
-    def __init__(self, es_begin):
+    def __init__(self, es_begin=None, es_rollback=False):
         self.es_begin = es_begin
+        self.es_rollback = es_rollback
 
     def accept(self, visitor):
         return visitor.visit_transaction_stmt(self)
