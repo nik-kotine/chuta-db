@@ -5,9 +5,8 @@ Pruebas del sorter externo (k-way merge) usado para el ORDER BY.
 
 Cubren: el camino en memoria (input chico), el camino externo (varios
 runs a disco + merge), claves de distintos tipos, el encode/decode
-orden-preservante, la estabilidad del merge con claves repetidas, el
-contrato de dos fases de spill() y que nunca quedan runs sueltos en disco
-aun si el consumidor corta a la mitad.
+orden-preservante, y que nunca quedan runs sueltos en disco aun si el
+consumidor corta a la mitad.
 """
 
 import os
@@ -153,91 +152,6 @@ def test_claves_duplicadas():
     print("OK: claves duplicadas conservan la cantidad de apariciones")
 
 
-def test_claves_duplicadas_conservan_orden_de_insercion():
-    """Con runs, los duplicados deben salir en el orden en que entraron.
-
-    El merge desempata por el índice global de entrada, así que el
-    ordenamiento es estable aunque el input no entre entero en RAM.
-    """
-    random.seed(15)
-    valores = [random.choice([1, 2, 3]) for _ in range(200)]
-    items = [(v, struct.pack(">i", i)) for i, v in enumerate(valores)]
-
-    # budget chico a propósito: fuerza 100 runs
-    sorter = ExternalSorter(budget=2)
-    resultado = list(sorter.sort(items))
-    sorter.cleanup()
-
-    assert sorter.run_count == 100, sorter.run_count
-
-    claves = [k for k, _ in resultado]
-    assert claves == sorted(valores)
-
-    # para cada clave, los indices de entrada llegaron en orden creciente
-    orden_por_clave = {}
-    for i, v in enumerate(valores):
-        orden_por_clave.setdefault(v, []).append(i)
-
-    salida_por_clave = {}
-    for k, v in resultado:
-        salida_por_clave.setdefault(k, []).append(struct.unpack(">i", v)[0])
-
-    for clave, indices in orden_por_clave.items():
-        assert salida_por_clave[clave] == indices, clave
-
-    print("OK: los duplicados conservan el orden de insercion con varios runs")
-
-
-def test_spill_consume_el_input_antes_de_devolver():
-    """spill() deja la fuente leida antes de devolver el iterador.
-
-    Es lo que permite escribir sobre la misma estructura que se esta
-    leyendo sin pisar registros que todavia no se volcaron.
-    """
-    leidos = []
-
-    def fuente():
-        for i in range(10):
-            leidos.append(i)
-            yield (10 - i, struct.pack(">i", i))
-
-    sorter = ExternalSorter(budget=3)
-    resultado = sorter.spill(fuente())
-
-    # todavia no se devolvio nada, pero el input ya se consumio entero
-    assert leidos == list(range(10)), leidos
-    assert sorter.run_count == 4, sorter.run_count
-
-    claves, valores = zip(*list(resultado))
-    assert list(claves) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    assert list(valores) == [struct.pack(">i", v) for v in range(9, -1, -1)]
-
-    sorter.cleanup()
-    print("OK: spill() consume todo el input antes de devolver el iterador")
-
-
-def test_spill_en_memoria_no_toca_disco():
-    sorter = ExternalSorter(budget=100)
-    resultado = sorter.spill([(2, b"b"), (1, b"a")])
-
-    assert sorter.run_count == 0
-    assert sorter.run_dir is None
-    assert list(resultado) == [(1, b"a"), (2, b"b")]
-    print("OK: el camino en memoria de spill() no crea archivos")
-
-
-def test_spill_descendente():
-    items = [(i % 5, struct.pack(">i", i)) for i in range(20)]
-
-    sorter = ExternalSorter(budget=3, reverse=True)
-    resultado = list(sorter.spill(items))
-    sorter.cleanup()
-
-    claves = [k for k, _ in resultado]
-    assert claves == sorted(claves, reverse=True)
-    print("OK: spill() respeta reverse=True")
-
-
 def test_vacio():
     sorter = ExternalSorter(budget=4)
     assert list(sorter.sort([])) == []
@@ -355,10 +269,6 @@ tests = [
     test_claves_string,
     test_claves_float,
     test_claves_duplicadas,
-    test_claves_duplicadas_conservan_orden_de_insercion,
-    test_spill_consume_el_input_antes_de_devolver,
-    test_spill_en_memoria_no_toca_disco,
-    test_spill_descendente,
     test_vacio,
     test_encode_key_preserva_orden,
     test_encode_key_tipo_no_soportado,

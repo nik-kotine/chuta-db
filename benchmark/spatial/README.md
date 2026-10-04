@@ -146,3 +146,181 @@ señalada a N=1,000/k=100 (ver nota abajo).
   ambos modelos es de uso práctico despreciable (menos del 0.5%) a las
   distancias medidas acá, de 1 a 10km, y no afecta las conclusiones de
   rendimiento.
+
+## Benchmark de memoria: Secuencial vs R-Tree vs PostgreSQL/GiST
+
+Este benchmark compara el uso de memoria/huella observable de las tres
+alternativas:
+
+- **Búsqueda secuencial:** memoria del arreglo de puntos dentro del proceso
+  Python.
+- **R-Tree propio:** memoria residente del proceso asociada al índice y al
+  `BufferManager`, usando el almacenamiento falso del benchmark para no
+  contar como memoria del índice los registros del archivo de datos.
+- **PostgreSQL/GiST:** páginas del índice GiST que están actualmente
+  presentes en `shared_buffers`, obtenidas desde PostgreSQL. Esta medición
+  **no representa el RSS total del servidor PostgreSQL**; mide la parte del
+  índice que está cacheada en `shared_buffers`.
+
+La secuencial y el R-Tree se miden con `tracemalloc`. En el R-Tree, los
+puntos se generan antes de iniciar `tracemalloc` y `_store_record()` solo
+devuelve un `RID`, por lo que la memoria del diccionario que simularía el
+archivo de datos no se atribuye al índice.
+
+### Cómo ejecutar el benchmark de memoria
+
+Desde la raíz del repositorio:
+
+```bash
+rm -f bench_*.bin
+PYTHONPATH=. python3 benchmark/spatial/memory_benchmark.py
+```
+
+El benchmark mide por defecto:
+
+```text
+N = 1,000
+N = 10,000
+N = 100,000
+```
+
+Para PostgreSQL/GiST se necesita PostgreSQL con PostGIS instalado. El
+script crea la base `chuta_spatial_bench`, la tabla `points` y el índice
+`USING GIST (geog)`.
+
+Las credenciales se leen de las variables estándar de libpq:
+
+```text
+PGHOST
+PGPORT
+PGUSER
+PGPASSWORD
+```
+
+Por ejemplo, si PostgreSQL está escuchando en el puerto `5433`:
+
+```bash
+PGPORT=5433 PGPASSWORD='TU_CONTRASEÑA' PYTHONPATH=. python3 benchmark/spatial/postgis_memory_benchmark.py
+```
+
+No se debe guardar la contraseña dentro del repositorio, README ni código.
+Es preferible pasar `PGPASSWORD` únicamente al ejecutar el comando o
+exportarla temporalmente en la sesión.
+
+Finalmente, para generar las gráficas:
+
+```bash
+PYTHONPATH=. python3 benchmark/spatial/plot_memory_benchmark.py
+```
+
+Se generan:
+
+```text
+memoria_comparacion_kb.png
+bytes_por_punto_memoria.png
+huella_secuencial_rtree_gist.png
+```
+
+### Resultados de memoria
+
+#### Secuencial vs R-Tree
+
+Resultados obtenidos con `memory_benchmark.py`:
+
+| técnica    | N       | pico (KB) | residente (KB) | bytes/punto | disco (KB) | altura |
+|------------|--------:|----------:|---------------:|------------:|-----------:|-------:|
+| Secuencial | 1,000   | 144.8     | 144.7          | 148.2       | —          | —      |
+| R-Tree     | 1,000   | 168.6     | 95.4           | 97.7        | 36.0       | 1      |
+| Secuencial | 10,000  | 1,409.0   | 1,408.9        | 144.3       | —          | —      |
+| R-Tree     | 10,000  | 521.7     | 418.0          | 42.8        | 340.0      | 1      |
+| Secuencial | 100,000 | 14,061.2  | 14,061.1       | 144.0       | —          | —      |
+| R-Tree     | 100,000 | 537.9     | 417.2          | 4.3         | 3,436.0    | 2      |
+
+La búsqueda secuencial mantiene un costo de aproximadamente **144 bytes por
+punto**, por lo que su memoria crece aproximadamente de forma lineal con
+`N`.
+
+El R-Tree presenta un comportamiento diferente: su memoria residente crece
+mucho más lentamente que `N`. El `BufferManager` mantiene 50 páginas en
+buffer y el árbol agrega sus propios metadatos y páginas necesarias. Por
+eso, aunque la memoria no es estrictamente constante, el **costo por punto
+cae fuertemente** al aumentar el tamaño del dataset:
+
+```text
+N=1,000    → 97.7 bytes/punto
+N=10,000   → 42.8 bytes/punto
+N=100,000  → 4.3 bytes/punto
+```
+
+Por tanto, la conclusión correcta no es que la memoria del R-Tree esté
+completamente acotada por el buffer. Los datos muestran que **su memoria
+crece sublinealmente respecto de N**, haciendo que el costo por punto
+disminuya conforme aumenta el dataset.
+
+![Memoria residente: Secuencial vs R-Tree](memoria_comparacion_kb.png)
+
+![Bytes por punto: Secuencial vs R-Tree](bytes_por_punto_memoria.png)
+
+#### PostgreSQL/GiST
+
+Resultados obtenidos con `postgis_memory_benchmark.py`:
+
+| N       | GiST en `shared_buffers` (KB) | índice en disco (KB) | páginas GiST en buffer |
+|--------:|------------------------------:|----------------------:|-----------------------:|
+| 1,000   | 72.0                          | 72.0                  | 9                     |
+| 10,000  | 632.0                         | 632.0                 | 79                    |
+| 100,000 | 7,416.0                       | 7,416.0               | 927                   |
+
+En este benchmark, el índice GiST cabe completamente en la porción de
+`shared_buffers` observada por la medición para los tres tamaños, por lo
+que la cantidad de páginas del índice presentes en el buffer coincide con
+su tamaño de disco.
+
+Esta cifra **no debe interpretarse como la RAM total utilizada por
+PostgreSQL**. PostgreSQL mantiene otros datos y estructuras en memoria,
+incluyendo las páginas de las tablas, catálogos, conexiones y otros
+componentes del servidor.
+
+### Interpretación de la comparación
+
+La comparación de memoria debe interpretarse teniendo en cuenta que las
+tres técnicas no se miden exactamente con el mismo mecanismo:
+
+| Técnica | Métrica medida |
+|---------|----------------|
+| Secuencial | memoria del proceso Python mediante `tracemalloc` |
+| R-Tree | memoria residente del proceso Python mediante `tracemalloc`, aislando el almacenamiento de registros |
+| PostgreSQL/GiST | páginas del índice presentes en `shared_buffers` |
+
+Por eso, las gráficas sirven principalmente para estudiar **cómo escala la
+huella asociada a cada estructura** y no para afirmar que las tres cifras
+sean mediciones idénticas de RAM total del sistema.
+
+La tendencia más importante es que la búsqueda secuencial escala
+linealmente con `N`, mientras que el R-Tree amortiza su estructura y el
+costo por punto cae de forma marcada. GiST mantiene una huella de índice
+mayor que el R-Tree propio en estos tamaños, aunque la medición de GiST
+corresponde a páginas cacheadas del servidor PostgreSQL y no al RSS completo.
+
+![Huella de Secuencial, R-Tree y GiST](huella_secuencial_rtree_gist.png)
+
+### Archivos generados
+
+Los resultados crudos quedan almacenados en:
+
+```text
+resultados_memoria.json
+resultados_memoria_postgis.json
+```
+
+Las gráficas quedan en:
+
+```text
+memoria_comparacion_kb.png
+bytes_por_punto_memoria.png
+huella_secuencial_rtree_gist.png
+```
+
+Los JSON permiten reproducir las gráficas sin volver a ejecutar el
+benchmark, siempre que se mantenga el mismo formato de resultados.
+

@@ -137,6 +137,35 @@ def _nodo_scan(entrada, stats, filtro):
         costo_inicial = 0.29
         costo_total = costo_inicial + filas * (RANDOM_PAGE_COST + CPU_TUPLE_COST)
 
+    elif tipo == "RTREE KNN":
+        columna = entrada.get("column", "")
+        k = int(entrada.get("k", 1))
+        etiqueta = f"Index Scan using rtree_{tabla}_{columna} on {tabla}"
+        costo_inicial = 0.29
+        costo_total = costo_inicial + k * (RANDOM_PAGE_COST + CPU_TUPLE_COST)
+        nodo = NodoPlan(etiqueta, costo_inicial, costo_total, k, ancho,
+                        medicion=entrada)
+        nodo.detalles.append(
+            f"Order By: k-NN (k={k}, metrica={entrada.get('metric', 'euclidean')})")
+        if filtro:
+            nodo.detalles.append(f"Filter: ({filtro})")
+        return nodo
+
+    elif tipo == "RTREE INDEX SCAN":
+        columna = entrada.get("column", "")
+        etiqueta = f"Index Scan using rtree_{tabla}_{columna} on {tabla}"
+        acceso = entrada.get("access", "radio")
+        # un poligono suele devolver mas filas que un radio chico
+        selectividad = 0.02 if acceso == "poligono" else SELECTIVIDAD_IGUALDAD
+        filas = max(1, int(filas_tabla * selectividad))
+        costo_inicial = 0.29
+        costo_total = costo_inicial + filas * (RANDOM_PAGE_COST + CPU_TUPLE_COST)
+        nodo = NodoPlan(etiqueta, costo_inicial, costo_total, filas, ancho,
+                        medicion=entrada)
+        if filtro:
+            nodo.detalles.append(f"Index Cond: ({filtro})")
+        return nodo
+
     elif tipo == "BITMAP INDEX SCAN":
         columnas = ", ".join(entrada.get("columns", []))
         etiqueta = f"Bitmap Heap Scan on {tabla}"
@@ -172,7 +201,8 @@ def construir(entradas, stats, filtro=None, limite=None, total_ms=0.0):
     """
     paginas, filas_tabla, ancho = stats
 
-    scan = _buscar(entradas, "SEQUENTIAL SCAN", "INDEX SCAN", "BITMAP INDEX SCAN")
+    scan = _buscar(entradas, "SEQUENTIAL SCAN", "INDEX SCAN", "BITMAP INDEX SCAN",
+                   "RTREE INDEX SCAN", "RTREE KNN")
     if scan is not None:
         raiz = _nodo_scan(scan, stats, filtro)
     else:

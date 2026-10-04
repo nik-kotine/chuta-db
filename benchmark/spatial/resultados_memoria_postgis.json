@@ -1,0 +1,26 @@
+[
+  {
+    "tecnica": "PostgreSQL/GiST",
+    "n": 1000,
+    "cache_gist_kb": 72.0,
+    "indice_disco_kb": 72.0,
+    "tabla_disco_kb": 72.0,
+    "paginas_gist_en_buffer": 9
+  },
+  {
+    "tecnica": "PostgreSQL/GiST",
+    "n": 10000,
+    "cache_gist_kb": 632.0,
+    "indice_disco_kb": 632.0,
+    "tabla_disco_kb": 672.0,
+    "paginas_gist_en_buffer": 79
+  },
+  {
+    "tecnica": "PostgreSQL/GiST",
+    "n": 100000,
+    "cache_gist_kb": 7416.0,
+    "indice_disco_kb": 7416.0,
+    "tabla_disco_kb": 6672.0,
+    "paginas_gist_en_buffer": 927
+  }
+]

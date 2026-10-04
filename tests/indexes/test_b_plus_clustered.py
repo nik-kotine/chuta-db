@@ -6,7 +6,6 @@ from storage.buffer_manager import BufferManager
 from storage.files.sequential_file import (
     FILE_HEADER_FORMAT,
     FILE_HEADER_SIZE,
-    PAGE_SIZE,
     SequentialFile,
 )
 from indexes.b_plus_clustered import BPlusTreeClustered
@@ -22,17 +21,17 @@ def limpiar():
             os.remove(f)
 
 
-def crear_arbol(buffer_frames=20):
+def crear_arbol(page_size=4096, buffer_frames=20):
     # prepara el archivo de datos con su header + página de overflow,
     # igual que lo hace Table al crear una tabla sequential
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "wb") as f:
-            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, -1, 0, 0, 1, 0, 0))
-            f.write(b"\x00" * PAGE_SIZE)
+            f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
+            f.write(b"\x00" * page_size)
 
-    fm = FileManager(DATA_FILE, PAGE_SIZE, FILE_HEADER_SIZE)
+    fm = FileManager(DATA_FILE, page_size, FILE_HEADER_SIZE)
     bm = BufferManager(fm, buffer_frames)
-    sf = SequentialFile(bm, SCHEMA)
+    sf = SequentialFile(bm, page_size, SCHEMA)
     tree = BPlusTreeClustered(INDEX_FILE, sf, buffer_frames=buffer_frames)
     return tree, bm
 
@@ -142,13 +141,13 @@ def test_persistencia():
 
 
 def test_reindex_automatico_tras_reorganize():
-    # suficientes inserts para que el overflow crezca y dispare
-    # SequentialFile.reorganize() durante la carga
+    # page_size chico para que el overflow se llene rapido y dispare
+    # SequentialFile.reorganize() varias veces durante los inserts
     limpiar()
-    tree, bm = crear_arbol(buffer_frames=100)
+    tree, bm = crear_arbol(page_size=128, buffer_frames=100)
 
     veces_antes = tree.sequential_file.reorganize_count
-    claves = list(range(1, 2000))
+    claves = list(range(1, 300))
     for key in claves:
         tree.insert(key, (key, key * 2))
 

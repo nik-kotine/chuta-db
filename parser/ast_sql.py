@@ -12,6 +12,7 @@ class IndexKind(Enum):
     BTREE_IDX = auto()
     HASH_IDX = auto()
     BITMAP_IDX = auto()
+    RTREE_IDX = auto()
 
 
 # Tipos de dato del catalogo
@@ -130,6 +131,26 @@ class ColRef:
         return visitor.visit_col_ref(self)
 
 
+# Literal espacial POLYGON(POINT(x1, y1), POINT(x2, y2), ...)
+#
+# El anillo se cierra solo: no hace falta repetir el primer vertice al
+# final. Los vertices van en orden PostGIS (longitud, latitud).
+class PolygonValue(Value):
+    def __init__(self, vertices):
+        self.vertices = list(vertices)
+
+    @property
+    def value(self):
+        return [(v.x, v.y) for v in self.vertices]
+
+    def etiqueta(self) -> str:
+        cuerpo = ", ".join(f"({v.x} {v.y})" for v in self.vertices)
+        return f"POLYGON({cuerpo})"
+
+    def accept(self, visitor):
+        return visitor.visit_polygon_value(self)
+
+
 # Metricas de distancia soportadas
 class Metrica(Enum):
     EUCLIDIANA = auto()   # plano; devuelve grados (como ST_Distance)
@@ -167,6 +188,28 @@ class DistanceExpr:
 
     def accept(self, visitor):
         return visitor.visit_distance_expr(self)
+
+
+# -----------------------------
+# Predicado espacial: dentro_de(columna, POLYGON(...))
+#
+# Es un predicado completo por si mismo (devuelve verdadero o falso), a
+# diferencia de distancia(), que necesita un operador de comparacion.
+# Equivale a ST_Contains(poligono, punto) de PostGIS.
+# -----------------------------
+
+class WithinExpr:
+    def __init__(self, columna, poligono):
+        self.columna = columna
+        self.poligono = poligono
+
+    def etiqueta(self) -> str:
+        col = (self.columna.columna if self.columna.tabla == ""
+               else f"{self.columna.tabla}.{self.columna.columna}")
+        return f"dentro_de({col}, {self.poligono.etiqueta()})"
+
+    def accept(self, visitor):
+        return visitor.visit_within_expr(self)
 
 
 # -----------------------------

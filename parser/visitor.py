@@ -5,6 +5,7 @@ NOMBRE_INDICE = {
     IndexKind.BTREE_IDX: "BTREE",
     IndexKind.HASH_IDX: "HASH",
     IndexKind.BITMAP_IDX: "BITMAP",
+    IndexKind.RTREE_IDX: "RTREE",
 }
 
 
@@ -28,6 +29,12 @@ class Visitor:
         raise NotImplementedError
 
     def visit_distance_expr(self, e):
+        raise NotImplementedError
+
+    def visit_polygon_value(self, v):
+        raise NotImplementedError
+
+    def visit_within_expr(self, e):
         raise NotImplementedError
 
     def visit_col_ref(self, c):
@@ -107,8 +114,18 @@ class PrintVisitor(Visitor):
     def visit_point_value(self, v):
         print(f"POINT({v.x}, {v.y})", end="")
 
+    def visit_polygon_value(self, v):
+        print(v.etiqueta(), end="")
+
+    def visit_within_expr(self, e):
+        print("dentro_de(", end="")
+        e.columna.accept(self)
+        print(", ", end="")
+        e.poligono.accept(self)
+        print(")", end="")
+
     def visit_distance_expr(self, e):
-        print("distancia(", end="")
+        print(f"{e.nombre_funcion()}(", end="")
         e.izquierda.accept(self)
         print(", ", end="")
         e.derecha.accept(self)

@@ -134,12 +134,12 @@ class SeqAdapter:
         # mismo setup que hace Table para una tabla "sequential": header
         # del archivo + una pagina de overflow inicial
         with open(SEQ_FILE, "wb") as fh:
-            fh.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, -1, 0, 0, 1, 0, 0))
+            fh.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
             fh.write(b"\x00" * PAGE_SIZE)
 
         fm = FileManager(SEQ_FILE, PAGE_SIZE, FILE_HEADER_SIZE)
         self.bm = BufferManager(fm, BUFFER_FRAMES)
-        self.f = SequentialFile(self.bm, SCHEMA)
+        self.f = SequentialFile(self.bm, PAGE_SIZE, SCHEMA)
         self.filename = SEQ_FILE
 
     def insert(self, params):
