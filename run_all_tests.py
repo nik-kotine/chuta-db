@@ -7,6 +7,11 @@ Cada test del repo esta escrito como un script ejecutable (con un bloque
 runner los lanza como subprocesos: eso soporta ambos estilos, aisla el
 estado entre archivos y no hay que mantener ninguna lista de tests.
 
+Cada subproceso corre con `cwd` en un directorio temporal propio, asi que los
+archivos que el motor escribe (chuta_wal.log, *.dat, *.idx) no quedan en el
+repo. Si un test falla se imprime el path de ese directorio para poder mirar
+lo que dejo.
+
 Uso:
     python run_all_tests.py              # corre todo lo que haya en tests/
     python run_all_tests.py heap seq     # corre solo los que matcheen
@@ -14,8 +19,10 @@ Uso:
 """
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -40,14 +47,25 @@ def run_file(path):
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + existing if existing else "")
 
     start = time.perf_counter()
-    proc = subprocess.run(
-        [sys.executable, str(path)],
-        cwd=str(ROOT),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    # Cada test corre en un directorio propio: los archivos que el motor
+    # escribe (chuta_wal.log, *.dat, *.idx) quedan en el scratch y no tocan
+    # el repo, que puede estar en una carpeta sincronizada por OneDrive.
+    workdir = tempfile.mkdtemp(prefix="chuta-tests-")
+    proc = None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(path)],
+            cwd=workdir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        if proc is not None and proc.returncode != 0:
+            print(f"  (archivos del test en {workdir})")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
     return proc.returncode, proc.stdout, time.perf_counter() - start
 
 
