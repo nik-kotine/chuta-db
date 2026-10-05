@@ -69,6 +69,9 @@ class Token:
         DISTANCIA = auto()
         DISTANCIA_EUCLIDIANA = auto()
         DISTANCIA_GEODESICA = auto()
+        POLYGON = auto()
+        DENTRO_DE = auto()
+        RTREE = auto()
 
         # Plan de ejecucion
         EXPLAIN = auto()

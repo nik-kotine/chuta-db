@@ -20,7 +20,10 @@ sys.path.insert(0, os.path.join(RAIZ, "parser"))
 from scanner import Scanner
 from parser import Parser
 from storage.storage_manager import StorageManager
-from executor import ExecuteVisitor, ExecutionError, _haversine
+from executor import ExecuteVisitor, ExecutionError
+# El Haversine vive en spatial/geometry.py: es el mismo que usa el R-Tree,
+# asi que el filtro y el indice nunca pueden discrepar.
+from spatial.geometry import Point, haversine
 
 
 ARCHIVOS = ["sys_tables.dat", "sys_columns.dat", "sys_indexes.dat",
@@ -179,9 +182,10 @@ def test_distancia_geodesica():
     arequipa = (-71.5375, -16.4090)
 
     # tolerancia del 1%: la Tierra no es una esfera perfecta
-    assert abs(_haversine(*lima, *cusco) / 1000 - 574) < 6, _haversine(*lima, *cusco)
-    assert abs(_haversine(*lima, *arequipa) / 1000 - 766) < 8
-    assert _haversine(*lima, *lima) == 0.0
+    p_lima, p_cusco, p_arequipa = Point(*lima), Point(*cusco), Point(*arequipa)
+    assert abs(haversine(p_lima, p_cusco) / 1000 - 574) < 6, haversine(p_lima, p_cusco)
+    assert abs(haversine(p_lima, p_arequipa) / 1000 - 766) < 8
+    assert haversine(p_lima, p_lima) == 0.0
 
     limpiar()
     sm = StorageManager()
