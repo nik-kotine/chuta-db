@@ -25,7 +25,12 @@ SIZES = sorted(set(r["n"] for r in resultados))
 
 # paleta fija (dataviz skill): color = identidad del indice, nunca cambia
 # de chart a chart
-COLOR = {"B+ clustered": "#2a78d6", "B+ unclustered": "#1baf7a", "Hash extensible": "#eda100"}
+COLOR = {
+    "B+ clustered": "#2a78d6",
+    "B+ unclustered": "#1baf7a",
+    "B+ unclustered (seq)": "#8a63d2",
+    "Hash extensible": "#eda100",
+}
 INK = "#0b0b0b"
 MUTED = "#898781"
 GRID = "#e1e0d9"

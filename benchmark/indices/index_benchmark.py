@@ -14,6 +14,7 @@ from storage.files.sequential_file import FILE_HEADER_FORMAT, FILE_HEADER_SIZE, 
 from storage.files.heap_file import HeapFile
 from indexes.b_plus_clustered import BPlusTreeClustered
 from indexes.b_plus_unclustered import BPlusTreeUnclustered
+from indexes.b_plus_unclustered_sequential import BPlusTreeUnclusteredSequential
 from indexes.extendible_hash import HashIndex, PAGE_SIZE as HASH_PAGE_SIZE
 
 PAGE_SIZE = 4096
@@ -43,12 +44,15 @@ CLUSTERED_INDEX_FILE = "bench_clustered.idx"
 CLUSTERED_DATA_FILE = "bench_clustered_data.bin"
 UNCLUSTERED_INDEX_FILE = "bench_unclustered.idx"
 UNCLUSTERED_DATA_FILE = "bench_unclustered_heap.bin"
+UNCLUSTERED_SEQ_INDEX_FILE = "bench_unclustered_seq.idx"
+UNCLUSTERED_SEQ_DATA_FILE = "bench_unclustered_seq_data.bin"
 HASH_INDEX_FILE = "bench_hash.idx"
 HASH_DATA_FILE = "bench_hash_heap.bin"
 
 ARCHIVOS = [
     CLUSTERED_INDEX_FILE, CLUSTERED_DATA_FILE,
     UNCLUSTERED_INDEX_FILE, UNCLUSTERED_DATA_FILE,
+    UNCLUSTERED_SEQ_INDEX_FILE, UNCLUSTERED_SEQ_DATA_FILE,
     HASH_INDEX_FILE, HASH_DATA_FILE,
 ]
 
@@ -79,6 +83,24 @@ def crear_unclustered():
     heap = HeapFile(UNCLUSTERED_DATA_FILE, bm, record_format=SCHEMA)
     tree = BPlusTreeUnclustered(UNCLUSTERED_INDEX_FILE, heap, schema=SCHEMA)
     return tree, bm, UNCLUSTERED_DATA_FILE
+
+
+def crear_unclustered_seq():
+    # mismo bootstrap de SequentialFile que crear_clustered (header + pagina de
+    # overflow); el indice secundario se construye sobre la columna 0, la misma
+    # clave por la que el SequentialFile ordena, para que sea comparable
+    with open(UNCLUSTERED_SEQ_DATA_FILE, "wb") as f:
+        f.write(struct.pack(FILE_HEADER_FORMAT, 0, -1, 0, 0, 1, 0))
+        f.write(b"\x00" * PAGE_SIZE)
+
+    fm = FileManager(UNCLUSTERED_SEQ_DATA_FILE, PAGE_SIZE, FILE_HEADER_SIZE)
+    bm = BufferManager(fm, BUFFER_FRAMES)
+    sf = SequentialFile(bm, PAGE_SIZE, SCHEMA)
+    tree = BPlusTreeUnclusteredSequential(
+        UNCLUSTERED_SEQ_INDEX_FILE, sf, schema=SCHEMA, column_index=0,
+        buffer_frames=BUFFER_FRAMES,
+    )
+    return tree, bm, UNCLUSTERED_SEQ_DATA_FILE
 
 
 class HashIndexAdapter:
@@ -150,6 +172,7 @@ def crear_hash():
 INDICES = {
     "B+ clustered": crear_clustered,
     "B+ unclustered": crear_unclustered,
+    "B+ unclustered (seq)": crear_unclustered_seq,
     "Hash extensible": crear_hash,
 }
 
@@ -302,23 +325,23 @@ for n in SIZES:
         print("OK")
 
 print("\n--- Construccion y espacio adicional ---")
-print(f"{'indice':<16} | {'N':>8} | {'constr. (ms)':>12} | {'ms/insert':>10} | {'datos (KB)':>10} | {'indice (KB)':>11}")
-print("-" * 82)
+print(f"{'indice':<20} | {'N':>8} | {'constr. (ms)':>12} | {'ms/insert':>10} | {'datos (KB)':>10} | {'indice (KB)':>11}")
+print("-" * 86)
 for r in resultados:
-    print(f"{r['nombre']:<16} | {r['n']:>8} | {r['tiempo_construccion_ms']:>12.2f} | "
+    print(f"{r['nombre']:<20} | {r['n']:>8} | {r['tiempo_construccion_ms']:>12.2f} | "
           f"{r['ms_por_insert']:>10.4f} | {r['espacio_datos_kb']:>10.1f} | {r['espacio_indice_kb']:>11.1f}")
 
 print("\n--- Tiempo de consulta ---")
-print(f"{'indice':<16} | {'N':>8} | {'us/exacta':>10} | {'us/rango':>10} | {'ms/orden completo':>18}")
-print("-" * 78)
-for r in resultados:
-    print(f"{r['nombre']:<16} | {r['n']:>8} | {r['us_exacta']:>10.2f} | {r['us_rango']:>10.2f} | {r['ms_orden']:>18.2f}")
-
-print("\n--- Rendimiento con inserciones/eliminaciones frecuentes ---")
-print(f"{'indice':<16} | {'N':>8} | {'churn ops':>9} | {'ops/seg':>10} | {'us/exacta post-churn':>20}")
+print(f"{'indice':<20} | {'N':>8} | {'us/exacta':>10} | {'us/rango':>10} | {'ms/orden completo':>18}")
 print("-" * 82)
 for r in resultados:
-    print(f"{r['nombre']:<16} | {r['n']:>8} | {r['churn_ops']:>9} | {r['ops_por_seg']:>10.1f} | {r['us_exacta_post_churn']:>20.2f}")
+    print(f"{r['nombre']:<20} | {r['n']:>8} | {r['us_exacta']:>10.2f} | {r['us_rango']:>10.2f} | {r['ms_orden']:>18.2f}")
+
+print("\n--- Rendimiento con inserciones/eliminaciones frecuentes ---")
+print(f"{'indice':<20} | {'N':>8} | {'churn ops':>9} | {'ops/seg':>10} | {'us/exacta post-churn':>20}")
+print("-" * 86)
+for r in resultados:
+    print(f"{r['nombre']:<20} | {r['n']:>8} | {r['churn_ops']:>9} | {r['ops_por_seg']:>10.1f} | {r['us_exacta_post_churn']:>20.2f}")
 
 # sanity check: el churn no deberia degradar la busqueda mas de un orden
 # de magnitud -- si lo hiciera, indicaria que el rebalanceo (o, en el

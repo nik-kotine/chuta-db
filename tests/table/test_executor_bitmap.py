@@ -482,13 +482,19 @@ def test_create_index_bitmap_rechaza_usos_invalidos():
     else:
         raise AssertionError("un bitmap sobre una tabla Sequential deberia rechazarse")
 
-    # el B+ no agrupado y el hash siguen exigiendo Heap
+    # el hash sigue exigiendo Heap (apunta a filas del heap, no a un
+    # archivo ordenado)
     try:
-        correr(sm, "CREATE INDEX ON emp (nombre) USING BTREE;")
+        correr(sm, "CREATE INDEX ON emp (nombre) USING HASH;")
     except ExecutionError as e:
         assert "HEAP" in str(e), e
     else:
-        raise AssertionError("un B+ no agrupado sobre Sequential deberia rechazarse")
+        raise AssertionError("un hash sobre Sequential deberia rechazarse")
+
+    # en cambio el B+ no agrupado SI se acepta sobre Sequential
+    # (BPlusTreeUnclusteredSequential se reconstruye tras cada reorganize)
+    res = correr(sm, "CREATE INDEX ON emp (nombre) USING BTREE;")[0]
+    assert "no agrupado" in res.mensaje, res.mensaje
 
     # un tipo de indice desconocido sigue siendo un error de sintaxis
     try:

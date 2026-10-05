@@ -1,5 +1,6 @@
 import os
 from indexes.b_plus_unclustered import BPlusTreeUnclustered
+from indexes.b_plus_unclustered_sequential import BPlusTreeUnclusteredSequential
 from indexes.b_plus_clustered import BPlusTreeClustered
 from indexes.bitmap_index import BitmapIndex
 from indexes.r_tree import RTree
@@ -27,24 +28,38 @@ class IndexManager:
         self.open_indexes: dict[str, object] = {}
 
     def create_unclustered_index(
-        self, 
-        index_name: str, 
-        table: Table, 
-        column_index: int, 
+        self,
+        index_name: str,
+        table: Table,
+        column_index: int,
         column_name: str = "col"
-    ) -> BPlusTreeUnclustered:
+    ) -> BPlusTreeUnclustered | BPlusTreeUnclusteredSequential:
         """
-        Crea un índice secundario no agrupado (BPlusTreeUnclustered) sobre una columna.
+        Crea un índice secundario no agrupado sobre una columna.
         Si la tabla ya tiene datos, se encarga de leerlos e indexarlos.
+
+        Sobre una tabla Heap usa BPlusTreeUnclustered (los RID del heap son
+        estables). Sobre una tabla Sequential usa BPlusTreeUnclusteredSequential,
+        que se reconstruye solo cuando el archivo se reorganiza (ver su
+        docstring): un SequentialFile reubica filas vivas al reorganizarse,
+        asi que sus RID no son estables.
         """
         index_filename = f"{index_name}.idx"
 
-        index = BPlusTreeUnclustered(
-            index_filename=index_filename,
-            heap_file=table.data_file,
-            schema=table.schema
-        )
-    
+        if table.file_type == "sequential":
+            index = BPlusTreeUnclusteredSequential(
+                index_filename=index_filename,
+                sequential_file=table.data_file,
+                schema=table.schema,
+                column_index=column_index,
+            )
+        else:
+            index = BPlusTreeUnclustered(
+                index_filename=index_filename,
+                heap_file=table.data_file,
+                schema=table.schema
+            )
+
         for rid, record_params in table.scan():
             key = record_params[column_index]
             index._insert_ref(key, rid)
@@ -304,10 +319,15 @@ class IndexManager:
 
             if index_name not in self.open_indexes:
                 if idx_type == "unclustered":
-                    idx = BPlusTreeUnclustered(index_filename, table.data_file, table.schema)
+                    if table.file_type == "sequential":
+                        idx = BPlusTreeUnclusteredSequential(
+                            index_filename, table.data_file, table.schema, col_idx
+                        )
+                    else:
+                        idx = BPlusTreeUnclustered(index_filename, table.data_file, table.schema)
                     self.open_indexes[index_name] = idx
                     table.attach_index(col_idx, idx)
-                    
+
                 elif idx_type == "clustered":
                     idx = BPlusTreeClustered(index_filename, table.data_file)
                     self.open_indexes[index_name] = idx
