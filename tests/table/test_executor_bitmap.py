@@ -16,9 +16,17 @@ from indexes.bitmap_index import BitmapIndex
 ARCHIVOS = [
     "sys_tables.dat", "sys_columns.dat", "sys_indexes.dat",
     "ventas.dat", "emp.dat", "dept.dat",
-    "idx_ventas_pais.idx", "idx_ventas_cliente.idx", "idx_ventas_id.idx",
-    "idx_ventas_monto.idx", "idx_emp_nombre.idx",
-    "idx_ventas_pais_bitmap.idx", "idx_ventas_cliente_bitmap.idx",
+
+    "idx_ventas_pais_unclustered.idx",
+    "idx_ventas_cliente_unclustered.idx",
+    "idx_ventas_id_unclustered.idx",
+    "idx_ventas_monto_unclustered.idx",
+    "idx_emp_nombre_unclustered.idx",
+
+    "idx_ventas_pais_hash.idx",
+
+    "idx_ventas_pais_bitmap.idx",
+    "idx_ventas_cliente_bitmap.idx",
     "idx_ventas_id_bitmap.idx",
 ]
 

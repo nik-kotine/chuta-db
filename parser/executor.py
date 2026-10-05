@@ -273,11 +273,26 @@ class ExecuteVisitor(Visitor):
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
 
         if self._tiene_agregados(stm):
-            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            #self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            columnas_agregacion = []
+            for item in stm.proyeccion:
+                if item.agg != AggFun.NONE_AGG:
+                    if item.agg == AggFun.COUNT_AGG:
+                        columnas_agregacion.append(tabla.column_names[tabla.key_index])
+                    else:
+                        columnas_agregacion.append(item.columna.columna)
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate", "column": columnas_agregacion})
             nombres, filas = self._proyeccion_agregada(
                 stm, filas, resolver, serializador
             )
             if stm.order_by is not None:
+                self.plan.append({
+                    "node": "IN-MEMORY SORT", 
+                    "operation": "sort", 
+                    "column": self._etiqueta_orden(stm.order_by), 
+                    "direction": "DESC" if stm.direccion == SortDir.DESC_DIR else "ASC"
+                })
+                # ----------------------------------------------------------------------
                 filas = self._ordenar_resultado(
                     filas, nombres, self._etiqueta_orden(stm.order_by),
                     stm.direccion == SortDir.DESC_DIR,
@@ -390,14 +405,22 @@ class ExecuteVisitor(Visitor):
         # IndexManager.create_unclustered_index elige la clase correcta
         # segun tabla.file_type (ver BPlusTreeUnclusteredSequential).
 
+        # Cada tipo lleva su sufijo porque sobre una misma columna pueden
+        # convivir los cuatro: B+ no agrupado, hash, bitmap y R-Tree. Es UNA
+        # sola cadena if/elif: con dos `if` seguidos el R-Tree caia en el
+        # `else` de abajo (y salia "..._rtree_unclustered") y el hash se
+        # quedaba sin sufijo, compartiendo nombre y .idx con el B+.
         nombre = f"idx_{stm.tabla}_{stm.columna}"
         if stm.tipo == IndexKind.RTREE_IDX:
             nombre = f"{nombre}_rtree"
-        if stm.tipo == IndexKind.BITMAP_IDX:
-            # El nombre base (idx_tabla_columna) es el del B+ y el del hash,
-            # asi que un bitmap sobre la misma columna necesita el suyo: es
-            # justamente el caso en que los tres conviven.
+        elif stm.tipo == IndexKind.BITMAP_IDX:
             nombre = f"{nombre}_bitmap"
+        elif stm.tipo == IndexKind.HASH_IDX:
+            nombre = f"{nombre}_hash"
+        elif stm.clustered:
+            nombre = f"{nombre}_clustered"
+        else:
+            nombre = f"{nombre}_unclustered"
 
         # El sufijo va antes del log: el rollback de ddl_create_index hace
         # drop_index(payload["index_name"]), asi que el log tiene que llevar
@@ -576,7 +599,16 @@ class ExecuteVisitor(Visitor):
             })
 
         if self._tiene_agregados(interna):
-            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            #self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            columnas_agregacion = []
+            for item in interna.proyeccion:
+                if item.agg != AggFun.NONE_AGG:
+                    if item.agg == AggFun.COUNT_AGG:
+                        columnas_agregacion.append(tabla.column_names[tabla.key_index])
+                    else:
+                        columnas_agregacion.append(item.columna.columna)
+
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate", "column": columnas_agregacion})
 
     def _texto_filtro(self, interna) -> str:
         """Reconstruye el WHERE tal como lo muestra el plan de PostgreSQL."""
