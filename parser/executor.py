@@ -273,7 +273,15 @@ class ExecuteVisitor(Visitor):
                 filas = self._scan_filtrado(tabla, stm.condicion, resolver)
 
         if self._tiene_agregados(stm):
-            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            #self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            columnas_agregacion = []
+            for item in stm.proyeccion:
+                if item.agg != AggFun.NONE_AGG:
+                    if item.agg == AggFun.COUNT_AGG:
+                        columnas_agregacion.append(tabla.column_names[tabla.key_index])
+                    else:
+                        columnas_agregacion.append(item.columna.columna)
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate", "column": columnas_agregacion})
             nombres, filas = self._proyeccion_agregada(
                 stm, filas, resolver, serializador
             )
@@ -406,6 +414,10 @@ class ExecuteVisitor(Visitor):
             # asi que un bitmap sobre la misma columna necesita el suyo: es
             # justamente el caso en que los tres conviven.
             nombre = f"{nombre}_bitmap"
+        elif stm.clustered:
+            nombre = f"{nombre}_clustered"
+        else:
+            nombre = f"{nombre}_unclustered"
 
         # El sufijo va antes del log: el rollback de ddl_create_index hace
         # drop_index(payload["index_name"]), asi que el log tiene que llevar
@@ -584,7 +596,16 @@ class ExecuteVisitor(Visitor):
             })
 
         if self._tiene_agregados(interna):
-            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            #self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate"})
+            columnas_agregacion = []
+            for item in interna.proyeccion:
+                if item.agg != AggFun.NONE_AGG:
+                    if item.agg == AggFun.COUNT_AGG:
+                        columnas_agregacion.append(tabla.column_names[tabla.key_index])
+                    else:
+                        columnas_agregacion.append(item.columna.columna)
+
+            self.plan.append({"node": "HASH AGGREGATE", "operation": "aggregate", "column": columnas_agregacion})
 
     def _texto_filtro(self, interna) -> str:
         """Reconstruye el WHERE tal como lo muestra el plan de PostgreSQL."""
