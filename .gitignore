@@ -5,3 +5,4 @@ __pycache__/
 *.idx
 chuta_wal.log
 typst/
+.idea
