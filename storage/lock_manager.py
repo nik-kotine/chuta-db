@@ -243,3 +243,23 @@ class LockManager:
         self._validate_transaction(transaction_id)
         with self._condition:
             return dict(self._held_by_transaction.get(transaction_id, {}))
+
+    def snapshot(self) -> list[dict]:
+        """Devuelve una vista serializable de los locks actuales."""
+        def display_resource(resource: object) -> str:
+            if isinstance(resource, tuple) and len(resource) == 2:
+                return f"{resource[0]}: {resource[1]}"
+            return str(resource)
+
+        with self._condition:
+            locks = []
+            for resource, entry in self._locks.items():
+                for transaction_id, count in entry.shared.items():
+                    locks.append({"resource": display_resource(resource), "transaction_id": transaction_id, "mode": "SHARED", "count": count})
+                if entry.update_owner is not None:
+                    locks.append({"resource": display_resource(resource), "transaction_id": entry.update_owner, "mode": "UREAD", "count": entry.update_count})
+                if entry.exclusive_owner is not None:
+                    locks.append({"resource": display_resource(resource), "transaction_id": entry.exclusive_owner, "mode": "EXCLUSIVE", "count": entry.exclusive_count})
+                if entry.waiting_writers:
+                    locks.append({"resource": display_resource(resource), "transaction_id": None, "mode": "WAITING", "count": entry.waiting_writers})
+            return locks

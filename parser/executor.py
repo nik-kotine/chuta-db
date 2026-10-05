@@ -278,6 +278,13 @@ class ExecuteVisitor(Visitor):
                 stm, filas, resolver, serializador
             )
             if stm.order_by is not None:
+                self.plan.append({
+                    "node": "IN-MEMORY SORT", 
+                    "operation": "sort", 
+                    "column": self._etiqueta_orden(stm.order_by), 
+                    "direction": "DESC" if stm.direccion == SortDir.DESC_DIR else "ASC"
+                })
+                # ----------------------------------------------------------------------
                 filas = self._ordenar_resultado(
                     filas, nombres, self._etiqueta_orden(stm.order_by),
                     stm.direccion == SortDir.DESC_DIR,
