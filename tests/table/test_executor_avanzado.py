@@ -15,9 +15,9 @@ from parser.executor import ExecuteVisitor, ExecutionError
 
 ARCHIVOS = [
     "sys_tables.dat", "sys_columns.dat", "sys_indexes.dat",
-    "ventas.dat", "emp.dat", "dept.dat", "ref.dat",
+    "ventas.dat", "emp.dat", "dept.dat", "ref.dat", "ventas_seq.dat",
     "idx_ventas_monto.idx", "idx_emp_id.idx", "idx_ventas_id.idx",
-    "idx_ref_monto.idx",
+    "idx_ref_monto.idx", "idx_ventas_seq_monto.idx",
 ]
 
 
@@ -245,15 +245,52 @@ def test_create_index_rechaza_usos_invalidos():
     except ExecutionError as e:
         assert "SEQUENTIAL" in str(e)
 
-    try:
-        correr(sm, "CREATE INDEX ON emp (nombre) USING BTREE;")
-        assert False, "un indice no agrupado sobre una tabla sequential debia fallar"
-    except ExecutionError as e:
-        assert "HEAP" in str(e)
+    # Un B+ no agrupado SI se acepta sobre una tabla sequential: lo respalda
+    # BPlusTreeUnclusteredSequential, que se reconstruye cuando el archivo se
+    # reorganiza. Antes esta combinacion se rechazaba.
+    res = correr(sm, "CREATE INDEX ON emp (nombre) USING BTREE;")[0]
+    assert "no agrupado" in res.mensaje
 
     sm.close()
     limpiar()
     print("test_create_index_rechaza_usos_invalidos: OK")
+
+
+def test_select_usa_indice_unclustered_sobre_sequential():
+    # Mismo contrato que test_select_usa_indice_unclustered, pero la tabla es
+    # SEQUENTIAL: el B+ no agrupado debe servir igual la igualdad y el rango,
+    # apoyandose en BPlusTreeUnclusteredSequential.
+    limpiar()
+    sm = StorageManager()
+
+    correr(sm, "CREATE TABLE ventas_seq (id INT PRIMARY KEY, cliente VARCHAR(20), monto FLOAT) USING SEQUENTIAL;")
+    for i, (cli, monto) in enumerate(
+        [("Ana", 100.0), ("Beto", 250.0), ("Carlos", 300.0)], start=1
+    ):
+        correr(sm, f"INSERT INTO ventas_seq VALUES ({i}, '{cli}', {monto});")
+    correr(sm, "CREATE INDEX ON ventas_seq (monto) USING BTREE;")
+
+    tabla = sm.open_table("ventas_seq")
+    assert tabla.secondary_indexes.get(2), "el indice no quedo enlazado a la columna monto"
+    assert tabla.clustered_index is None
+
+    llamadas, original = _prohibir_scan(tabla)
+    try:
+        res = correr(sm, "SELECT cliente FROM ventas_seq WHERE monto = 250.0;")[0]
+        assert res.filas == [["Beto"]]
+
+        res = correr(sm, "SELECT cliente FROM ventas_seq WHERE monto BETWEEN 100 AND 300;")[0]
+        assert sorted(f[0] for f in res.filas) == ["Ana", "Beto", "Carlos"]
+
+        res = correr(sm, "SELECT cliente FROM ventas_seq WHERE monto >= 300;")[0]
+        assert res.filas == [["Carlos"]]
+    finally:
+        tabla.scan = original
+    assert llamadas["n"] == 0, f"el indice debia servir la consulta, el scan se llamo {llamadas['n']} veces"
+
+    sm.close()
+    limpiar()
+    print("test_select_usa_indice_unclustered_sobre_sequential: OK")
 
 
 def test_select_usa_indice_hash():
@@ -477,6 +514,7 @@ def test_order_by_en_join_usa_external_sort():
 if __name__ == "__main__":
     print("=== PROBANDO INDICES (B+ AGUPADO / NO AGUPADO / HASH) Y EXTERNAL ALGOS ===")
     test_select_usa_indice_unclustered()
+    test_select_usa_indice_unclustered_sobre_sequential()
     test_select_usa_indice_clustered()
     test_indice_poblado_con_registros_existentes()
     test_indices_persisten_y_mantienen_el_crud()

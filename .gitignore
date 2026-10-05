@@ -4,3 +4,4 @@ __pycache__/
 *.dat
 *.idx
 chuta_wal.log
+typst/

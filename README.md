@@ -45,11 +45,11 @@ Aunque es un juguete ("toy DBMS"), cada componente está inspirado en los mecani
 ### Índices
 
 - **B+ árbol agrupado** (`CLUSTERED`): solo sobre tablas `USING SEQUENTIAL` y sobre la columna `PRIMARY KEY`; el orden del índice coincide con el orden físico de los datos.
-- **B+ árbol no agrupado**: sobre tablas `USING HEAP`; guarda referencias (RID) a las filas del heap.
+- **B+ árbol no agrupado**: sobre tablas `USING HEAP` o `USING SEQUENTIAL`; guarda referencias (RID) a las filas. Sobre un heap los RID son estables; sobre un archivo secuencial, que reubica sus filas al reorganizarse, el índice se reconstruye solo cuando detecta que el archivo se reorganizó.
 - **Hash extensible** no agrupado: sobre tablas `USING HEAP`; resuelve búsquedas por igualdad.
 - **Bitmap (bitmap index) no agrupado**: sobre tablas `USING HEAP`; una máscara de bits por valor sobre el espacio de RIDs del heap. Resuelve igualdades, `BETWEEN`, rangos en columnas numéricas, y combina varios valores con `AND` (intersección) y `OR` (unión).
 - Los índices **se registran en el catálogo** y **se recalgan automáticamente** al reabrir la base; el CRUD (`INSERT`/`DELETE`) los mantiene al día.
-- El parser/ejecutor **rechaza combinaciones inválidas** (p. ej. `HASH CLUSTERED`, `BITMAP CLUSTERED`, índice B+ no agrupado sobre tabla sequential).
+- El parser/ejecutor **rechaza combinaciones inválidas** (p. ej. `HASH CLUSTERED`, `BITMAP CLUSTERED`, `CLUSTERED` sobre una tabla heap, hash o bitmap sobre tabla sequential).
 
 ### Procesamiento de consultas
 
@@ -378,7 +378,7 @@ El **puente** entre el parser y el motor (ver §2).
   - `visit_insert_stmt`: valida la cantidad de valores y delega en `Table.insert`.
   - `visit_select_stmt`: orquesta la consulta completa (ver abajo).
   - `visit_delete_stmt`: recorre las filas, evalúa la condición y borra las que coincidan.
-  - `visit_create_index_stmt`: valida las reglas de uso del índice (HASH→HEAP, BITMAP→HEAP, CLUSTERED→SEQUENTIAL + columna PK, B+ no agrupado→HEAP) y crea el índice correspondiente. El bitmap se registra en un archivo propio (`idx_tabla_columna_bitmap.idx`) para poder convivir con un B+ o un hash sobre la misma columna.
+  - `visit_create_index_stmt`: valida las reglas de uso del índice (HASH→HEAP, BITMAP→HEAP, CLUSTERED→SEQUENTIAL + columna PK; el B+ no agrupado se acepta sobre HEAP y sobre SEQUENTIAL) y crea el índice correspondiente. El bitmap se registra en un archivo propio (`idx_tabla_columna_bitmap.idx`) para poder convivir con un B+ o un hash sobre la misma columna.
   - `visit_transaction_stmt`: responde `BEGIN/END TRANSACTION` (sin semántica de transacción).
   - **Ayudantes de consultas**: `_abrir` (abre una tabla), `_resolver_columnas` (traduce `ColRef` → posición dentro del registro combinado, rechazando columnas ambiguas), `_tiene_agregados`, `_nombre_item` (nombre de columna de salida, p. ej. `count(*)`), `_scan_filtrado` (elige primero un plan de bitmap; si no hay, barre la tabla o usa un plan de índice clásico), los ayudantes de bitmap `_plan_bitmap` (recurre el `WHERE` y devuelve `(mascara, predicados_que_faltan_evaluar)` o `None` si algún predicado no lo cubre), `_combinar_bitmaps` (intersección para `AND`, unión para `OR`, búsqueda por punto y por rango en las hojas), `_scan_con_bitmap` (recorre los RIDs de la máscara trayendo solo esas páginas del heap y re-evaluando la condición original), `_indice_bitmap` (localiza el `BitmapIndex` de una columna), `_plan_indice` (busca un predicado que un B+ pueda servir: punto `EQ` o `RANGO`, solo en contexto conjuntivo), `_candidatos_con_indice` (trae las filas que postula el índice), `_indice_para`/`_indice_para_order_by` (eligen el índice clásico de una columna **ignorando** el bitmap, para que conviva con el plan de máscaras), `_select_ordenado` y `_ordenar_externo` (ORDER BY con External Sorter), `_filas_join` (Grace Hash Join), `_proyeccion_agregada` (GROUP BY + agregados con hash externo), `_ordenar_resultado` (ORDER BY sobre resultado agregado ya materializado), `_valor` (extrae el valor Python de un literal), `_evaluar` (evalúa recursivamente una condición sobre un registro).
   - El resto de `visit_*` son no-operaciones, porque esos nodos son *piezas* (columnas, condiciones, valores) y no sentencias.
@@ -514,7 +514,7 @@ Maneja el ciclo de vida de los índices.
 - **`_hash_key_config`**: traduce el tipo de la columna a la configuración del serializador del hash (`struct format`, variable o fijo).
 - **`_build_hash_index`**: como el hash **no persiste páginas**, descarta la caché antigua, trunca el archivo `.idx`, construye el `HashIndex` desde cero y lo puebla con la tabla.
 - **`_build_bitmap_index`**: trunca el `.idx`, construye el `BitmapIndex` y lo puebla con un `insert_ref` por fila del heap (el bitmap sí persiste sus páginas, así que no se reconstruye al reabrir).
-- **`load_indexes_for_table`**: al abrir una tabla, recarga del catálogo sus índices: B+ no agrupado, B+ agrupado, hash (que se reconstruye) y bitmap (que se reabre tal cual, con su directorio de claves en RAM).
+- **`load_indexes_for_table`**: al abrir una tabla, recarga del catálogo sus índices: B+ no agrupado (la clase depende del tipo de tabla: `BPlusTreeUnclustered` sobre heap, `BPlusTreeUnclusteredSequential` sobre sequential), B+ agrupado, hash (que se reconstruye) y bitmap (que se reabre tal cual, con su directorio de claves en RAM).
 - **`drop_index`**: cierra el índice, lo quita del catálogo y borra su archivo `.idx`. **`close`**: cierra todos los índices abiertos.
 
 #### `constraints_manager.py`
@@ -569,6 +569,13 @@ B+ **no agrupado**: las hojas guardan RIDs hacia un `HeapFile` compartido.
 - **`_insert_ref`**: registra el ref y recuerda si la clave ya existía (para los duplicados).
 - **`search(key)`**: recorredesde la hoja más a la izquierda y junta **todas** las referencias con esa clave (a diferencia del B+ base que devuelve una sola); por compatibilidad devuelve un RID único si nunca hubo duplicados.
 - **`delete_ref(key, ref)`**: borra una referencia específica (para no eliminar otras filas duplicadas). `close()` cierra solo el archivo del índice, no el heap compartido.
+
+#### `b_plus_unclustered_sequential.py`
+B+ **no agrupado sobre una tabla `SequentialFile`**: misma idea que el no agrupado sobre heap (las hojas guardan RIDs), pero los RID de un archivo secuencial no son estables, porque al reorganizarse (overflow o desperdicio > 30%) reubica cada fila viva.
+
+- **`BPlusTreeUnclusteredSequential`**: guarda el `SequentialFile`, la columna indexada y una copia de `sequential_file.reorganize_count` (igual que el B+ **agrupado**).
+- **`_sync`**: antes de cada `search` / `range_search` / `_insert_ref` / `delete_ref` compara el `reorganize_count`; si cambió, reconstruye todo el índice desde un recorrido de la tabla (`_reindex`) y así los RID vuelven a ser válidos. Es la misma estrategia que usa el B+ agrupado, aplicada perezosamente porque el reorganize lo puede disparar la propia `Table` sin avisarle al índice secundario.
+- El detalle del diseño (por qué un rebuild y no actualizar RID uno por uno) está en `indexes/B_TREE_README.md`.
 
 #### `b_plus_clustered.py`
 B+ **agrupado**: las hojas guardan RIDs hacia un `SequentialFile`, que mantiene los datos físicamente ordenados por la misma clave.

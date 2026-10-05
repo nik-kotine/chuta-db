@@ -386,10 +386,9 @@ class ExecuteVisitor(Visitor):
                 raise ExecutionError(
                     "un indice CLUSTERED debe indexar la PRIMARY KEY"
                 )
-        elif tabla.file_type != "heap":
-            raise ExecutionError(
-                "un indice no agrupado exige una tabla USING HEAP"
-            )
+        # un B+ no agrupado funciona tanto sobre HEAP como sobre SEQUENTIAL:
+        # IndexManager.create_unclustered_index elige la clase correcta
+        # segun tabla.file_type (ver BPlusTreeUnclusteredSequential).
 
         nombre = f"idx_{stm.tabla}_{stm.columna}"
         if stm.tipo == IndexKind.RTREE_IDX:
