@@ -338,6 +338,49 @@ def test_convive_con_indice_clustered():
     limpiar()
 
 
+def test_iter_ordered_asc_y_desc_tras_reorganize():
+    # iter_ordered() es lo que usa el ORDER BY por indice (ASC y DESC). Tras
+    # varios reorganizes, los RID de las hojas quedan viejos; el override de
+    # iter_ordered debe reindexar antes de recorrer, si no _fetch_record
+    # devolveria filas equivocadas. Se verifica contra un scan de la tabla.
+    limpiar()
+    table, bm = nueva_tabla()
+    idx = nuevo_indice(table, col=1)
+
+    # categoria = (id*7)%100 -> hay duplicados y el orden por categoria NO
+    # coincide con el orden de insercion
+    for id_ in range(1, 151):
+        table.insert([id_, (id_ * 7) % 100, id_])
+
+    assert table.data_file.reorganize_count > 0, "el test no forzo ningun reorganize"
+
+    esperado = sorted(tuple(params) for _rid, params in table.scan())
+
+    # ascendente: las claves (col 1) no decrecen, y las filas resueltas por RID
+    # coinciden (como multiconjunto) con las de la tabla
+    asc = [(key, table.data_file.fetch(ref)) for key, ref in idx.iter_ordered()]
+    claves_asc = [key for key, _ in asc]
+    assert claves_asc == sorted(claves_asc), "iter_ordered() no vino ascendente por clave"
+    filas_asc = sorted(tuple(fila) for _key, fila in asc if fila is not None)
+    assert filas_asc == esperado, "iter_ordered() ascendente no resolvio las filas correctas"
+
+    # descendente: mismas entradas al reves (claves no crecientes)
+    desc = [(key, table.data_file.fetch(ref)) for key, ref in idx.iter_ordered(reverse=True)]
+    claves_desc = [key for key, _ in desc]
+    assert claves_desc == sorted(claves_desc, reverse=True), "iter_ordered(reverse=True) no vino descendente"
+    filas_desc = sorted(tuple(fila) for _key, fila in desc if fila is not None)
+    assert filas_desc == esperado, "iter_ordered() descendente no resolvio las filas correctas"
+
+    # asc y desc tienen que ser exactamente el mismo conjunto, invertido
+    assert claves_desc == claves_asc[::-1], "asc y desc no son espejos"
+
+    print("test_iter_ordered_asc_y_desc_tras_reorganize: OK")
+
+    idx.close()
+    bm.close()
+    limpiar()
+
+
 tests = [
     test_insert_y_search_basico,
     test_reindex_tras_reorganize_en_insert,
@@ -347,6 +390,7 @@ tests = [
     test_persistencia,
     test_dos_indices_misma_tabla,
     test_convive_con_indice_clustered,
+    test_iter_ordered_asc_y_desc_tras_reorganize,
 ]
 
 for test in tests:

@@ -144,6 +144,14 @@ class BPlusTreeUnclusteredSequential(BPlusTreeBase):
         self._sync()
         return super().range_search(start_key, end_key)
 
+    def iter_ordered(self, reverse=False):
+        # Lo usa el ORDER BY por indice (ascendente y descendente). Igual que
+        # search/range_search: si el archivo se reorganizo, los RID guardados
+        # en las hojas quedaron viejos, asi que hay que reindexar antes de
+        # recorrer en orden; si no, _fetch_record traeria filas equivocadas.
+        self._sync()
+        yield from super().iter_ordered(reverse)
+
     def delete(self, key) -> bool:
         # El delete generico de BPlusTreeBase desciende por el arbol y borra el
         # dato apuntado por el RID guardado en la hoja, pero no sincroniza
