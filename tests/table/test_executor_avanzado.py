@@ -12,12 +12,12 @@ from parser import Parser
 from storage.storage_manager import StorageManager
 from parser.executor import ExecuteVisitor, ExecutionError
 
-
 ARCHIVOS = [
     "sys_tables.dat", "sys_columns.dat", "sys_indexes.dat",
-    "ventas.dat", "emp.dat", "dept.dat", "ref.dat", "ventas_seq.dat",
-    "idx_ventas_monto.idx", "idx_emp_id.idx", "idx_ventas_id.idx",
-    "idx_ref_monto.idx", "idx_ventas_seq_monto.idx",
+    "ventas.dat", "emp.dat", "dept.dat", "ref.dat",
+
+    "idx_ventas_monto_unclustered.idx", "idx_emp_id_clustered.idx", "idx_ventas_id_unclustered.idx",
+    "idx_ref_monto_unclustered.idx",
 ]
 
 
