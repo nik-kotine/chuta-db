@@ -57,6 +57,8 @@ _sessions: dict[str, ExecuteVisitor] = {}
 def json_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, (tuple, list)):
+        return [json_value(v) for v in value]
     return str(value)
 
 
@@ -104,7 +106,7 @@ def list_tables() -> dict[str, list[dict[str, Any]]]:
 
 @app.get("/api/spatial/points")
 def spatial_points(table: str | None = None) -> dict[str, Any]:
-    """Returns rows that expose longitude/latitude columns for map rendering."""
+    """Returns rows that expose longitude/latitude or POINT columns for map rendering."""
     points = []
     metadata_items = []
     for record in _storage.catalog.sys_tables.scan():
@@ -117,17 +119,31 @@ def spatial_points(table: str | None = None) -> dict[str, Any]:
 
     for name, metadata in metadata_items:
         names = [column.lower() for column in metadata["column_names"]]
+        types = [t.lower() for t in metadata["schema"]]
+        
+        # Buscar columna de tipo POINT nativo
+        point_index = next((i for i, t in enumerate(types) if t == "point"), None)
+        # O fallback a columnas lon/lat separadas
         lon_index = next((names.index(column) for column in ("longitude", "lon", "lng", "x") if column in names), None)
         lat_index = next((names.index(column) for column in ("latitude", "lat", "y") if column in names), None)
-        if lon_index is None or lat_index is None:
+        
+        if point_index is None and (lon_index is None or lat_index is None):
             continue
+            
         table_obj = _storage.open_table(name)
         for rid, values in table_obj.scan():
             try:
-                longitude = float(values[lon_index])
-                latitude = float(values[lat_index])
-            except (TypeError, ValueError):
+                if point_index is not None:
+                    pt = values[point_index]
+                    if not isinstance(pt, (tuple, list)) or len(pt) != 2:
+                        continue
+                    longitude, latitude = float(pt[0]), float(pt[1])
+                else:
+                    longitude = float(values[lon_index])
+                    latitude = float(values[lat_index])
+            except (TypeError, ValueError, IndexError):
                 continue
+                
             points.append({
                 "table": name,
                 "rid": [rid[0], rid[1]],

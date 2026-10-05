@@ -114,12 +114,58 @@ export default function Home() {
     window.sessionStorage.setItem("chuta-session-id", nextSession);
   }, []);
   useEffect(() => { window.localStorage.setItem("chuta-query-history", JSON.stringify(history)); }, [history]);
+  
   useEffect(() => {
+    // Si la consulta actual tiene resultados, intentamos extraer los puntos directamente del resultado
+    if (result.columns.length > 0 && result.rows.length > 0) {
+      const lonIdx = result.columns.findIndex(c => ["longitude", "lon", "lng", "x"].includes(c.toLowerCase()));
+      const latIdx = result.columns.findIndex(c => ["latitude", "lat", "y"].includes(c.toLowerCase()));
+      
+      let points: SpatialPoint[] = [];
+      // Usar la tabla seleccionada para que MapPanel no oculte los puntos
+      const currentTable = selected ?? "Resultado de consulta";
+
+      if (lonIdx !== -1 && latIdx !== -1) {
+        points = result.rows.map((row, i) => ({
+          table: currentTable,
+          rid: [0, i] as [number, number],
+          longitude: Number(row[lonIdx]),
+          latitude: Number(row[latIdx]),
+          label: String(row[1] ?? row[0] ?? `Punto ${i + 1}`), // Intenta usar la columna de nombre
+          values: row
+        })).filter(p => !isNaN(p.longitude) && !isNaN(p.latitude));
+      } else {
+        // Buscar la columna nativa POINT (un arreglo [lon, lat] en JSON)
+        const pointIdx = result.rows[0].findIndex(val => Array.isArray(val) && val.length === 2 && typeof val[0] === "number");
+        if (pointIdx !== -1) {
+          points = result.rows.map((row, i) => {
+            const pt = row[pointIdx] as [number, number];
+            return {
+              table: currentTable,
+              rid: [0, i] as [number, number],
+              longitude: pt[0], // Longitud
+              latitude: pt[1],  // Latitud
+              label: String(row[1] ?? row[0] ?? `Punto ${i + 1}`), // Intenta usar la columna de nombre
+              values: row
+            };
+          });
+        }
+      }
+
+      // Si encontramos puntos en la query actual, actualizar mapa e ignorar el endpoint global
+      if (points.length > 0) {
+        setSpatialPoints(points);
+        return; 
+      }
+    }
+
     fetch(`${API}/api/spatial/points${selected ? `?table=${encodeURIComponent(selected)}` : ""}`)
       .then((response) => response.ok ? response.json() : { points: [] })
       .then((data) => setSpatialPoints(data.points ?? []))
       .catch(() => setSpatialPoints([]));
   }, [selected, result]);
+  
+
   useEffect(() => { if (!demoPlaying) return; const timer = window.setInterval(() => setDemoStep((step) => step + 1), 1100); return () => window.clearInterval(timer); }, [demoPlaying]);
   useEffect(() => {
     if (view !== "transactions") return;

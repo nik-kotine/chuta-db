@@ -40,13 +40,24 @@ export default function MapPanel({ points, selectedTable }: MapPanelProps) {
     layer.clearLayers();
     const visiblePoints = selectedTable ? points.filter((point) => point.table === selectedTable) : points;
     const bounds: L.LatLngExpression[] = [];
-    visiblePoints.forEach((point) => {
-      const position: L.LatLngExpression = [point.latitude, point.longitude];
-      bounds.push(position);
-      L.circleMarker(position, { radius: 7, color: "#b47a32", weight: 2, fillColor: "#58745e", fillOpacity: 0.85 })
-        .bindPopup(`<strong>${point.label}</strong><br>${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}<br><small>${point.table}</small>`)
-        .addTo(layer);
-    });
+    visiblePoints.forEach((point, index) => {
+        const position: L.LatLngExpression = [point.latitude, point.longitude];
+        bounds.push(position);
+        
+        // El primero (más cercano) es un poco más grande y de color dorado/naranja. 
+        // Los demás son estándar.
+        const isClosest = index === 0; 
+        
+        L.circleMarker(position, { 
+          radius: isClosest ? 9 : 6, 
+          color: isClosest ? "#ffb84d" : "#b47a32", // Borde
+          weight: isClosest ? 3 : 2, 
+          fillColor: isClosest ? "#e69500" : "#58745e", 
+          fillOpacity: 0.85 
+        })
+          .bindPopup(`<strong>${index + 1}º - ${point.label}</strong><br>${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}<br><small>${point.table}</small>`)
+          .addTo(layer);
+      });
     if (bounds.length) map.fitBounds(L.latLngBounds(bounds), { padding: [25, 25], maxZoom: 15 });
   }, [points, selectedTable]);
 
