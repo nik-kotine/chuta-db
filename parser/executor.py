@@ -406,14 +406,18 @@ class ExecuteVisitor(Visitor):
                 "un indice no agrupado exige una tabla USING HEAP"
             )
 
+        # Cada tipo lleva su sufijo porque sobre una misma columna pueden
+        # convivir los cuatro: B+ no agrupado, hash, bitmap y R-Tree. Es UNA
+        # sola cadena if/elif: con dos `if` seguidos el R-Tree caia en el
+        # `else` de abajo (y salia "..._rtree_unclustered") y el hash se
+        # quedaba sin sufijo, compartiendo nombre y .idx con el B+.
         nombre = f"idx_{stm.tabla}_{stm.columna}"
         if stm.tipo == IndexKind.RTREE_IDX:
             nombre = f"{nombre}_rtree"
-        if stm.tipo == IndexKind.BITMAP_IDX:
-            # El nombre base (idx_tabla_columna) es el del B+ y el del hash,
-            # asi que un bitmap sobre la misma columna necesita el suyo: es
-            # justamente el caso en que los tres conviven.
+        elif stm.tipo == IndexKind.BITMAP_IDX:
             nombre = f"{nombre}_bitmap"
+        elif stm.tipo == IndexKind.HASH_IDX:
+            nombre = f"{nombre}_hash"
         elif stm.clustered:
             nombre = f"{nombre}_clustered"
         else:
